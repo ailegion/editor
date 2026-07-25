@@ -19,9 +19,11 @@ struct App {
     file_path: Option<PathBuf>,
     content: String,
     dirty: bool,
-    new_name: String,
     renaming: Option<(PathBuf, String)>,
     rename_focus_pending: bool,
+    creating: Option<(PathBuf, bool, String)>,
+    create_focus_pending: bool,
+    pending_expand: Option<PathBuf>,
     tree_cursor: Option<PathBuf>,
     visible_paths: Vec<PathBuf>,
     syntax_set: SyntaxSet,
@@ -38,9 +40,11 @@ impl App {
             file_path: None,
             content: String::new(),
             dirty: false,
-            new_name: String::new(),
             renaming: None,
             rename_focus_pending: false,
+            creating: None,
+            create_focus_pending: false,
+            pending_expand: None,
             tree_cursor: None,
             visible_paths: Vec::new(),
             syntax_set: SyntaxSet::load_defaults_newlines(),
@@ -153,30 +157,6 @@ impl App {
             return;
         };
 
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.new_name).desired_width(100.0));
-            if ui
-                .button("📄")
-                .on_hover_text("New File")
-                .clicked()
-                && !self.new_name.is_empty()
-            {
-                let _ = std::fs::write(root.join(&self.new_name), "");
-                self.new_name.clear();
-            }
-            if ui
-                .button("📁")
-                .on_hover_text("New Folder")
-                .clicked()
-                && !self.new_name.is_empty()
-            {
-                let _ = std::fs::create_dir(root.join(&self.new_name));
-                self.new_name.clear();
-            }
-        });
-
-        ui.separator();
-
         let no_widget_focused = ui.ctx().memory(|m| m.focused().is_none());
         let move_delta = if !no_widget_focused {
             0
@@ -197,15 +177,7 @@ impl App {
         let is_root_cursor = self.tree_cursor.as_deref() == Some(root.as_path());
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            let open_override = if !is_root_cursor {
-                None
-            } else if left_pressed {
-                Some(false)
-            } else if right_pressed {
-                Some(true)
-            } else {
-                None
-            };
+            let open_override = self.expand_override(&root, is_root_cursor, left_pressed, right_pressed);
             let root_name = root.file_name().map_or_else(
                 || root.to_string_lossy().to_string(),
                 |n| n.to_string_lossy().to_string(),
@@ -223,6 +195,9 @@ impl App {
             if response.header_response.clicked() {
                 self.tree_cursor = Some(root.clone());
             }
+            response
+                .header_response
+                .context_menu(|ui| self.entry_context_menu(ui, &root, true, false));
         });
 
         if move_delta != 0 {
@@ -250,12 +225,49 @@ impl App {
         }
     }
 
+    fn expand_override(
+        &mut self,
+        path: &Path,
+        is_cursor: bool,
+        left_pressed: bool,
+        right_pressed: bool,
+    ) -> Option<bool> {
+        if self.pending_expand.as_deref() == Some(path) {
+            self.pending_expand = None;
+            return Some(true);
+        }
+        if is_cursor && left_pressed {
+            return Some(false);
+        }
+        if is_cursor && right_pressed {
+            return Some(true);
+        }
+        None
+    }
+
     fn render_dir(&mut self, ui: &mut egui::Ui, dir: &Path, left_pressed: bool, right_pressed: bool) {
         let Ok(read_dir) = std::fs::read_dir(dir) else {
             return;
         };
         let mut entries: Vec<PathBuf> = read_dir.flatten().map(|e| e.path()).collect();
         entries.sort_by_key(|p| (!p.is_dir(), p.file_name().map(|n| n.to_owned())));
+
+        if self.creating.as_ref().map(|(p, _, _)| p.as_path()) == Some(dir) {
+            let (_, is_dir, buf) = self.creating.as_mut().unwrap();
+            let hint = if *is_dir { "new folder name" } else { "new file name" };
+            let response = ui.add(egui::TextEdit::singleline(buf).hint_text(hint));
+            if self.create_focus_pending {
+                response.request_focus();
+                self.create_focus_pending = false;
+            }
+            if response.lost_focus() {
+                if ui.ctx().input(|i| i.key_pressed(egui::Key::Enter)) {
+                    self.commit_create();
+                } else {
+                    self.creating = None;
+                }
+            }
+        }
 
         for path in entries {
             let name = path
@@ -283,15 +295,7 @@ impl App {
             }
 
             if path.is_dir() {
-                let open_override = if !is_cursor {
-                    None
-                } else if left_pressed {
-                    Some(false)
-                } else if right_pressed {
-                    Some(true)
-                } else {
-                    None
-                };
+                let open_override = self.expand_override(&path, is_cursor, left_pressed, right_pressed);
                 let mut response = egui::CollapsingHeader::new(name)
                     .id_salt(&path)
                     .default_open(false)
@@ -307,7 +311,7 @@ impl App {
                 }
                 response
                     .header_response
-                    .context_menu(|ui| self.entry_context_menu(ui, &path));
+                    .context_menu(|ui| self.entry_context_menu(ui, &path, true, true));
             } else {
                 let is_selected = self.file_path.as_deref() == Some(path.as_path());
                 let mut response = ui.selectable_label(is_selected, name);
@@ -318,24 +322,89 @@ impl App {
                     self.tree_cursor = Some(path.clone());
                     self.open_path(path.clone());
                 }
-                response.context_menu(|ui| self.entry_context_menu(ui, &path));
+                response.context_menu(|ui| self.entry_context_menu(ui, &path, false, true));
             }
         }
     }
 
-    fn entry_context_menu(&mut self, ui: &mut egui::Ui, path: &Path) {
-        if ui.button("Rename").clicked() {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            self.renaming = Some((path.to_path_buf(), name));
-            self.rename_focus_pending = true;
+    fn entry_context_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        path: &Path,
+        is_dir: bool,
+        allow_rename_delete: bool,
+    ) {
+        let target_dir = if is_dir {
+            path.to_path_buf()
+        } else {
+            path.parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."))
+        };
+
+        if ui.button("New File").clicked() {
+            self.creating = Some((target_dir.clone(), false, String::new()));
+            self.create_focus_pending = true;
+            self.pending_expand = Some(target_dir.clone());
             ui.close();
         }
-        if ui.button("Delete").clicked() {
-            self.delete_path(path);
+        if ui.button("New Folder").clicked() {
+            self.creating = Some((target_dir.clone(), true, String::new()));
+            self.create_focus_pending = true;
+            self.pending_expand = Some(target_dir);
             ui.close();
+        }
+
+        ui.separator();
+
+        if ui.button("Copy Path").clicked() {
+            ui.ctx().copy_text(path.display().to_string());
+            ui.close();
+        }
+        if ui.button("Copy Relative Path").clicked() {
+            let relative = self
+                .root
+                .as_ref()
+                .and_then(|root| path.strip_prefix(root).ok())
+                .unwrap_or(path);
+            ui.ctx().copy_text(relative.display().to_string());
+            ui.close();
+        }
+        if ui.button(reveal_label()).clicked() {
+            reveal_in_file_manager(path);
+            ui.close();
+        }
+
+        if allow_rename_delete {
+            ui.separator();
+            if ui.button("Rename").clicked() {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                self.renaming = Some((path.to_path_buf(), name));
+                self.rename_focus_pending = true;
+                ui.close();
+            }
+            if ui.button("Delete").clicked() {
+                self.delete_path(path);
+                ui.close();
+            }
+        }
+    }
+
+    fn commit_create(&mut self) {
+        let Some((dir, is_dir, name)) = self.creating.take() else {
+            return;
+        };
+        if name.is_empty() {
+            return;
+        }
+        let target = dir.join(&name);
+        if is_dir {
+            let _ = std::fs::create_dir(target);
+        } else {
+            let _ = std::fs::write(target, "");
         }
     }
 
@@ -430,6 +499,38 @@ fn load_ai_visible() -> bool {
         .and_then(|path| std::fs::read_to_string(path).ok())
         .map(|text| text.trim() == "true")
         .unwrap_or(false)
+}
+
+fn reveal_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Reveal in Finder"
+    } else if cfg!(target_os = "windows") {
+        "Show in Explorer"
+    } else {
+        "Open Containing Folder"
+    }
+}
+
+fn reveal_in_file_manager(path: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut arg = std::ffi::OsString::from("/select,");
+        arg.push(path.as_os_str());
+        let _ = std::process::Command::new("explorer").arg(arg).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let target = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        let _ = std::process::Command::new("xdg-open").arg(target).spawn();
+    }
 }
 
 fn confirm(title: &str, description: &str) -> bool {
