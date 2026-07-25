@@ -25,7 +25,8 @@ struct App {
     tree_cursor: Option<PathBuf>,
     visible_paths: Vec<PathBuf>,
     syntax_set: SyntaxSet,
-    theme: Theme,
+    themes: Vec<(String, Theme)>,
+    theme_index: usize,
     chat: chat::Chat,
     ai_visible: bool,
 }
@@ -43,7 +44,8 @@ impl App {
             tree_cursor: None,
             visible_paths: Vec::new(),
             syntax_set: SyntaxSet::load_defaults_newlines(),
-            theme: ThemeSet::load_defaults().themes["base16-ocean.dark"].clone(),
+            themes: load_themes(),
+            theme_index: 0,
             chat: chat::Chat::default(),
             ai_visible: true,
         }
@@ -147,24 +149,9 @@ impl App {
 
     fn sidebar_ui(&mut self, ui: &mut egui::Ui) {
         let Some(root) = self.root.clone() else {
-            if ui.button("Open Folder").clicked() {
-                self.open_folder();
-            }
+            ui.weak("No folder open (File > Open Folder)");
             return;
         };
-
-        ui.horizontal(|ui| {
-            ui.strong(root.file_name().map_or_else(
-                || root.to_string_lossy().to_string(),
-                |n| n.to_string_lossy().to_string(),
-            ));
-            if ui.small_button("Open Folder").clicked() {
-                self.open_folder();
-            }
-            if ui.small_button("Close").clicked() {
-                self.close_project();
-            }
-        });
 
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.new_name).desired_width(100.0));
@@ -206,8 +193,36 @@ impl App {
             no_widget_focused && ui.ctx().input(|i| i.key_pressed(egui::Key::ArrowRight));
 
         self.visible_paths.clear();
+        self.visible_paths.push(root.clone());
+        let is_root_cursor = self.tree_cursor.as_deref() == Some(root.as_path());
+
         egui::ScrollArea::vertical().show(ui, |ui| {
-            self.render_dir(ui, &root, left_pressed, right_pressed);
+            let open_override = if !is_root_cursor {
+                None
+            } else if left_pressed {
+                Some(false)
+            } else if right_pressed {
+                Some(true)
+            } else {
+                None
+            };
+            let root_name = root.file_name().map_or_else(
+                || root.to_string_lossy().to_string(),
+                |n| n.to_string_lossy().to_string(),
+            );
+            let mut response = egui::CollapsingHeader::new(root_name)
+                .id_salt(&root)
+                .default_open(true)
+                .open(open_override)
+                .show(ui, |ui| {
+                    self.render_dir(ui, &root, left_pressed, right_pressed);
+                });
+            if is_root_cursor {
+                response.header_response = response.header_response.highlight();
+            }
+            if response.header_response.clicked() {
+                self.tree_cursor = Some(root.clone());
+            }
         });
 
         if move_delta != 0 {
@@ -360,6 +375,21 @@ impl App {
     }
 }
 
+fn load_themes() -> Vec<(String, Theme)> {
+    let mut themes = Vec::new();
+
+    let catppuccin = ThemeSet::load_from_reader(&mut std::io::Cursor::new(
+        include_bytes!("themes/catppuccin_mocha.tmTheme").as_slice(),
+    ))
+    .expect("bundled catppuccin_mocha.tmTheme should parse");
+    themes.push(("Catppuccin Mocha".to_string(), catppuccin));
+
+    for (name, theme) in ThemeSet::load_defaults().themes {
+        themes.push((name, theme));
+    }
+    themes
+}
+
 fn last_project_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".config").join("editor").join("last_project"))
@@ -416,9 +446,26 @@ impl eframe::App for App {
                         self.open_folder();
                         ui.close();
                     }
+                    if ui
+                        .add_enabled(self.root.is_some(), egui::Button::new("Close Folder"))
+                        .clicked()
+                    {
+                        self.close_project();
+                        ui.close();
+                    }
                     if ui.button("Save (Cmd+S)").clicked() {
                         self.save();
                         ui.close();
+                    }
+                });
+                ui.menu_button("Theme", |ui| {
+                    let names: Vec<String> =
+                        self.themes.iter().map(|(name, _)| name.clone()).collect();
+                    for (i, name) in names.into_iter().enumerate() {
+                        if ui.button(name).clicked() {
+                            self.theme_index = i;
+                            ui.close();
+                        }
                     }
                 });
                 ui.label(self.title());
@@ -463,7 +510,8 @@ impl eframe::App for App {
                     .as_ref()
                     .and_then(|p| p.extension())
                     .and_then(|e| e.to_str());
-                let mut job = App::highlight(&self.syntax_set, &self.theme, extension, buf.as_str());
+                let theme = &self.themes[self.theme_index].1;
+                let mut job = App::highlight(&self.syntax_set, theme, extension, buf.as_str());
                 job.wrap.max_width = wrap_width;
                 ui.fonts_mut(|f| f.layout_job(job))
             };
