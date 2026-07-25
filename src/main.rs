@@ -570,27 +570,31 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
-                let extension = self
-                    .file_path
-                    .as_ref()
-                    .and_then(|p| p.extension())
-                    .and_then(|e| e.to_str());
-                let theme = &self.themes[self.theme_index].1;
-                let mut job = App::highlight(&self.syntax_set, theme, extension, buf.as_str());
-                job.wrap.max_width = wrap_width;
-                ui.fonts_mut(|f| f.layout_job(job))
-            };
-            let response = ui.add_sized(
-                ui.available_size(),
-                egui::TextEdit::multiline(&mut self.content)
-                    .font(egui::TextStyle::Monospace)
-                    .code_editor()
-                    .layouter(&mut layouter),
-            );
-            if response.changed() {
-                self.dirty = true;
-            }
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap_width: f32| {
+                        let extension = self
+                            .file_path
+                            .as_ref()
+                            .and_then(|p| p.extension())
+                            .and_then(|e| e.to_str());
+                        let theme = &self.themes[self.theme_index].1;
+                        let mut job = App::highlight(&self.syntax_set, theme, extension, buf.as_str());
+                        job.wrap.max_width = f32::INFINITY;
+                        ui.fonts_mut(|f| f.layout_job(job))
+                    };
+                    let response = ui.add(
+                        egui::TextEdit::multiline(&mut self.content)
+                            .font(egui::TextStyle::Monospace)
+                            .code_editor()
+                            .desired_width(f32::INFINITY)
+                            .layouter(&mut layouter),
+                    );
+                    if response.changed() {
+                        self.dirty = true;
+                    }
+                });
         });
     }
 }
