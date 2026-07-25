@@ -47,7 +47,7 @@ impl App {
             themes: load_themes(),
             theme_index: 0,
             chat: chat::Chat::default(),
-            ai_visible: true,
+            ai_visible: load_ai_visible(),
         }
     }
 
@@ -390,9 +390,13 @@ fn load_themes() -> Vec<(String, Theme)> {
     themes
 }
 
-fn last_project_path() -> Option<PathBuf> {
+fn config_path(name: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config").join("editor").join("last_project"))
+    Some(PathBuf::from(home).join(".config").join("editor").join(name))
+}
+
+fn last_project_path() -> Option<PathBuf> {
+    config_path("last_project")
 }
 
 fn save_last_project(root: &Path) {
@@ -409,6 +413,23 @@ fn load_last_project() -> Option<PathBuf> {
     let text = std::fs::read_to_string(last_project_path()?).ok()?;
     let path = PathBuf::from(text.trim());
     path.is_dir().then_some(path)
+}
+
+fn save_ai_visible(visible: bool) {
+    let Some(path) = config_path("ai_visible") else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, if visible { "true" } else { "false" });
+}
+
+fn load_ai_visible() -> bool {
+    config_path("ai_visible")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| text.trim() == "true")
+        .unwrap_or(false)
 }
 
 fn confirm(title: &str, description: &str) -> bool {
@@ -528,6 +549,7 @@ impl eframe::App for App {
                     let label = if self.ai_visible { "Hide AI" } else { "Show AI" };
                     if ui.button(label).clicked() {
                         self.ai_visible = !self.ai_visible;
+                        save_ai_visible(self.ai_visible);
                     }
                 });
             });
