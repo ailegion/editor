@@ -732,18 +732,22 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ui, |ui| {
             let mut close_index = None;
-            ui.horizontal_wrapped(|ui| {
-                for (i, tab) in self.tabs.iter().enumerate() {
+            egui::ScrollArea::horizontal()
+                .id_salt("tab_strip")
+                .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        if ui.selectable_label(i == self.active_tab, tab.title()).clicked() {
-                            self.active_tab = i;
-                        }
-                        if ui.small_button("×").clicked() {
-                            close_index = Some(i);
+                        for (i, tab) in self.tabs.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(i == self.active_tab, tab.title()).clicked() {
+                                    self.active_tab = i;
+                                }
+                                if ui.small_button("×").clicked() {
+                                    close_index = Some(i);
+                                }
+                            });
                         }
                     });
-                }
-            });
+                });
             if let Some(index) = close_index {
                 self.close_tab(index);
             }
