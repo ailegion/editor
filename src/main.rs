@@ -14,11 +14,33 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-struct App {
-    root: Option<PathBuf>,
-    file_path: Option<PathBuf>,
+#[derive(Default)]
+struct Tab {
+    path: Option<PathBuf>,
     content: String,
     dirty: bool,
+}
+
+impl Tab {
+    fn title(&self) -> String {
+        let name = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "untitled".to_string());
+        if self.dirty {
+            format!("{name} *")
+        } else {
+            name
+        }
+    }
+}
+
+struct App {
+    root: Option<PathBuf>,
+    tabs: Vec<Tab>,
+    active_tab: usize,
     renaming: Option<(PathBuf, String)>,
     rename_focus_pending: bool,
     creating: Option<(PathBuf, bool, String)>,
@@ -37,9 +59,8 @@ impl App {
     fn new() -> Self {
         Self {
             root: load_last_project(),
-            file_path: None,
-            content: String::new(),
-            dirty: false,
+            tabs: Vec::new(),
+            active_tab: 0,
             renaming: None,
             rename_focus_pending: false,
             creating: None,
@@ -55,9 +76,6 @@ impl App {
         }
     }
 
-    /// Free function (not a `&self` method) so callers can borrow only the
-    /// fields they need, keeping this disjoint from a simultaneous
-    /// `&mut self.content` borrow in the `TextEdit` layouter closure.
     fn highlight(
         syntax_set: &SyntaxSet,
         theme: &Theme,
@@ -93,20 +111,49 @@ impl App {
         job
     }
 
+    fn active_path(&self) -> Option<PathBuf> {
+        self.tabs.get(self.active_tab).and_then(|t| t.path.clone())
+    }
+
     fn open_file_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new().pick_file() {
             self.open_path(path);
         }
     }
 
+    /// Switches to the tab already showing `path`, or opens it in a new tab.
     fn open_path(&mut self, path: PathBuf) {
-        if self.dirty && !confirm("Unsaved changes", "Discard unsaved changes?") {
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|t| t.path.as_deref() == Some(path.as_path()))
+        {
+            self.active_tab = index;
             return;
         }
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            self.content = text;
-            self.file_path = Some(path);
-            self.dirty = false;
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        self.tabs.push(Tab {
+            path: Some(path),
+            content,
+            dirty: false,
+        });
+        self.active_tab = self.tabs.len() - 1;
+    }
+
+    fn close_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        if self.tabs[index].dirty && !confirm("Unsaved changes", "Discard unsaved changes?") {
+            return;
+        }
+        self.tabs.remove(index);
+        if self.tabs.is_empty() {
+            self.active_tab = 0;
+        } else if self.active_tab > index || self.active_tab >= self.tabs.len() {
+            self.active_tab = self.active_tab.saturating_sub(1).min(self.tabs.len() - 1);
         }
     }
 
@@ -118,13 +165,7 @@ impl App {
     }
 
     fn close_project(&mut self) {
-        if self.dirty && !confirm("Unsaved changes", "Discard unsaved changes?") {
-            return;
-        }
         self.root = None;
-        self.file_path = None;
-        self.content.clear();
-        self.dirty = false;
         self.tree_cursor = None;
         if let Some(path) = last_project_path() {
             let _ = std::fs::remove_file(path);
@@ -132,29 +173,18 @@ impl App {
     }
 
     fn save(&mut self) {
-        let path = match &self.file_path {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        let path = match &tab.path {
             Some(p) => Some(p.clone()),
             None => rfd::FileDialog::new().save_file(),
         };
         if let Some(path) = path {
-            if std::fs::write(&path, &self.content).is_ok() {
-                self.file_path = Some(path);
-                self.dirty = false;
+            if std::fs::write(&path, &tab.content).is_ok() {
+                tab.path = Some(path);
+                tab.dirty = false;
             }
-        }
-    }
-
-    fn title(&self) -> String {
-        let name = self
-            .file_path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "untitled".to_string());
-        if self.dirty {
-            format!("{name} *")
-        } else {
-            name
         }
     }
 
@@ -235,7 +265,7 @@ impl App {
         };
         let path = self.visible_paths[next_index].clone();
         self.tree_cursor = Some(path.clone());
-        if path.is_file() && self.file_path.as_deref() != Some(path.as_path()) {
+        if path.is_file() {
             self.open_path(path);
         }
     }
@@ -336,7 +366,7 @@ impl App {
                     .header_response
                     .context_menu(|ui| self.entry_context_menu(ui, &path, true, true));
             } else {
-                let is_selected = self.file_path.as_deref() == Some(path.as_path());
+                let is_selected = self.active_path().as_deref() == Some(path.as_path());
                 let mut response = ui.selectable_label(is_selected, name);
                 if is_cursor {
                     response = response.highlight();
@@ -443,10 +473,10 @@ impl App {
         } else {
             std::fs::remove_file(path)
         };
-        if result.is_ok() && self.file_path.as_deref() == Some(path) {
-            self.file_path = None;
-            self.content.clear();
-            self.dirty = false;
+        if result.is_ok() {
+            if let Some(index) = self.tabs.iter().position(|t| t.path.as_deref() == Some(path)) {
+                self.close_tab(index);
+            }
         }
     }
 
@@ -461,8 +491,14 @@ impl App {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join(&new_name);
-        if std::fs::rename(&old_path, &new_path).is_ok() && self.file_path.as_deref() == Some(&old_path) {
-            self.file_path = Some(new_path);
+        if std::fs::rename(&old_path, &new_path).is_ok() {
+            if let Some(tab) = self
+                .tabs
+                .iter_mut()
+                .find(|t| t.path.as_deref() == Some(old_path.as_path()))
+            {
+                tab.path = Some(new_path);
+            }
         }
     }
 }
@@ -657,15 +693,13 @@ impl eframe::App for App {
                         }
                     }
                 });
-                ui.label(self.title());
             });
         });
 
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 let status = self
-                    .file_path
-                    .as_ref()
+                    .active_path()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "No file open".to_string());
                 ui.label(status);
@@ -697,29 +731,56 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
+            let mut close_index = None;
+            ui.horizontal_wrapped(|ui| {
+                for (i, tab) in self.tabs.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(i == self.active_tab, tab.title()).clicked() {
+                            self.active_tab = i;
+                        }
+                        if ui.small_button("×").clicked() {
+                            close_index = Some(i);
+                        }
+                    });
+                }
+            });
+            if let Some(index) = close_index {
+                self.close_tab(index);
+            }
+            ui.separator();
+
+            let Some(_) = self.tabs.get(self.active_tab) else {
+                ui.weak("No file open");
+                return;
+            };
+
+            let extension = self
+                .active_path()
+                .and_then(|p| p.extension().map(|e| e.to_string_lossy().to_string()));
+            let theme_index = self.theme_index;
+
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap_width: f32| {
-                        let extension = self
-                            .file_path
-                            .as_ref()
-                            .and_then(|p| p.extension())
-                            .and_then(|e| e.to_str());
-                        let theme = &self.themes[self.theme_index].1;
-                        let mut job = App::highlight(&self.syntax_set, theme, extension, buf.as_str());
+                    let syntax_set = &self.syntax_set;
+                    let themes = &self.themes;
+                    let mut layouter = move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap_width: f32| {
+                        let theme = &themes[theme_index].1;
+                        let mut job =
+                            App::highlight(syntax_set, theme, extension.as_deref(), buf.as_str());
                         job.wrap.max_width = f32::INFINITY;
                         ui.fonts_mut(|f| f.layout_job(job))
                     };
+                    let tab = &mut self.tabs[self.active_tab];
                     let response = ui.add(
-                        egui::TextEdit::multiline(&mut self.content)
+                        egui::TextEdit::multiline(&mut tab.content)
                             .font(egui::TextStyle::Monospace)
                             .code_editor()
                             .desired_width(f32::INFINITY)
                             .layouter(&mut layouter),
                     );
                     if response.changed() {
-                        self.dirty = true;
+                        tab.dirty = true;
                     }
                 });
         });
