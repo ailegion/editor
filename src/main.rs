@@ -118,7 +118,14 @@ impl App {
     }
 
     fn close_project(&mut self) {
+        if self.dirty && !confirm("Unsaved changes", "Discard unsaved changes?") {
+            return;
+        }
         self.root = None;
+        self.file_path = None;
+        self.content.clear();
+        self.dirty = false;
+        self.tree_cursor = None;
         if let Some(path) = last_project_path() {
             let _ = std::fs::remove_file(path);
         }
@@ -177,12 +184,13 @@ impl App {
         let is_root_cursor = self.tree_cursor.as_deref() == Some(root.as_path());
 
         egui::ScrollArea::vertical().show(ui, |ui| {
+            let bg_shape = ui.painter().add(egui::Shape::Noop);
             let open_override = self.expand_override(&root, is_root_cursor, left_pressed, right_pressed);
             let root_name = root.file_name().map_or_else(
                 || root.to_string_lossy().to_string(),
                 |n| n.to_string_lossy().to_string(),
             );
-            let mut response = egui::CollapsingHeader::new(root_name)
+            let response = egui::CollapsingHeader::new(root_name)
                 .id_salt(&root)
                 .default_open(true)
                 .open(open_override)
@@ -190,7 +198,14 @@ impl App {
                     self.render_dir(ui, &root, left_pressed, right_pressed);
                 });
             if is_root_cursor {
-                response.header_response = response.header_response.highlight();
+                ui.painter().set(
+                    bg_shape,
+                    egui::Shape::rect_filled(
+                        response.header_response.rect,
+                        2.0,
+                        ui.visuals().selection.bg_fill,
+                    ),
+                );
             }
             if response.header_response.clicked() {
                 self.tree_cursor = Some(root.clone());
@@ -295,8 +310,9 @@ impl App {
             }
 
             if path.is_dir() {
+                let bg_shape = ui.painter().add(egui::Shape::Noop);
                 let open_override = self.expand_override(&path, is_cursor, left_pressed, right_pressed);
-                let mut response = egui::CollapsingHeader::new(name)
+                let response = egui::CollapsingHeader::new(name)
                     .id_salt(&path)
                     .default_open(false)
                     .open(open_override)
@@ -304,7 +320,14 @@ impl App {
                         self.render_dir(ui, &path, left_pressed, right_pressed);
                     });
                 if is_cursor {
-                    response.header_response = response.header_response.highlight();
+                    ui.painter().set(
+                        bg_shape,
+                        egui::Shape::rect_filled(
+                            response.header_response.rect,
+                            2.0,
+                            ui.visuals().selection.bg_fill,
+                        ),
+                    );
                 }
                 if response.header_response.clicked() {
                     self.tree_cursor = Some(path.clone());
@@ -647,8 +670,11 @@ impl eframe::App for App {
                     .unwrap_or_else(|| "No file open".to_string());
                 ui.label(status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let label = if self.ai_visible { "Hide AI" } else { "Show AI" };
-                    if ui.button(label).clicked() {
+                    if ui
+                        .selectable_label(self.ai_visible, "🤖")
+                        .on_hover_text("Toggle AI Sidebar")
+                        .clicked()
+                    {
                         self.ai_visible = !self.ai_visible;
                         save_ai_visible(self.ai_visible);
                     }
