@@ -420,9 +420,53 @@ fn confirm(title: &str, description: &str) -> bool {
         == rfd::MessageDialogResult::Yes
 }
 
+/// Derives app-wide `egui::Visuals` from a syntect theme's editor colors, so
+/// panels/buttons/menus match the selected syntax theme instead of only the
+/// code editor text.
+fn visuals_from_theme(theme: &Theme) -> egui::Visuals {
+    let to_color =
+        |c: syntect::highlighting::Color| egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a);
+    let settings = &theme.settings;
+    let background = settings.background.map(to_color);
+
+    let is_dark = background
+        .map(|c| (c.r() as u32 + c.g() as u32 + c.b() as u32) < 384)
+        .unwrap_or(true);
+    let mut visuals = if is_dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+
+    if let Some(bg) = background {
+        visuals.panel_fill = bg;
+        visuals.window_fill = bg;
+        visuals.extreme_bg_color = bg;
+        visuals.widgets.noninteractive.bg_fill = bg;
+        visuals.widgets.open.bg_fill = bg;
+    }
+    if let Some(fg) = settings.foreground.map(to_color) {
+        visuals.widgets.noninteractive.fg_stroke.color = fg;
+        visuals.widgets.inactive.fg_stroke.color = fg;
+        visuals.widgets.hovered.fg_stroke.color = fg;
+        visuals.widgets.active.fg_stroke.color = fg;
+    }
+    if let Some(selection) = settings.selection.map(to_color) {
+        visuals.selection.bg_fill = selection;
+        visuals.widgets.hovered.bg_fill = selection;
+        visuals.widgets.active.bg_fill = selection;
+    }
+    if let Some(line_highlight) = settings.line_highlight.map(to_color) {
+        visuals.faint_bg_color = line_highlight;
+        visuals.widgets.inactive.bg_fill = line_highlight;
+    }
+    visuals
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        ctx.set_visuals(visuals_from_theme(&self.themes[self.theme_index].1));
         let save_shortcut =
             egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
         let open_shortcut =
