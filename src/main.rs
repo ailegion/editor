@@ -671,7 +671,7 @@ impl eframe::App for App {
                 ui.label(status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .selectable_label(self.ai_visible, "🤖")
+                        .selectable_label(self.ai_visible, "✨")
                         .on_hover_text("Toggle AI Sidebar")
                         .clicked()
                     {
