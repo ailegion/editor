@@ -15,3 +15,7 @@ A minimal, no-bloat code editor in Rust, built on `egui`/`eframe`.
 ```sh
 cargo run
 ```
+
+## License
+
+PolyForm Strict License 1.0.0 — free to download and use, but no forking or redistributing modified versions.
