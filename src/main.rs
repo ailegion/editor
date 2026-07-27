@@ -1,3 +1,4 @@
+mod acp;
 mod chat;
 
 use std::path::{Path, PathBuf};
@@ -52,7 +53,16 @@ struct App {
     themes: Vec<(String, Theme)>,
     theme_index: usize,
     chat: chat::Chat,
+    acp: acp::Acp,
+    ai_mode: AiMode,
     ai_visible: bool,
+}
+
+#[derive(Default, PartialEq)]
+enum AiMode {
+    #[default]
+    Http,
+    Acp,
 }
 
 impl App {
@@ -72,6 +82,8 @@ impl App {
             themes: load_themes(),
             theme_index: 0,
             chat: chat::Chat::default(),
+            acp: acp::Acp::default(),
+            ai_mode: AiMode::default(),
             ai_visible: load_ai_visible(),
         }
     }
@@ -659,6 +671,7 @@ impl eframe::App for App {
             self.open_file_dialog();
         }
         self.chat.poll();
+        self.acp.poll();
 
         egui::Panel::top("top_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -726,7 +739,28 @@ impl eframe::App for App {
             egui::Panel::right("ai_sidebar")
                 .default_size(320.0)
                 .show(ui, |ui| {
-                    self.chat.ui(ui);
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(self.ai_mode == AiMode::Http, "HTTP").clicked() {
+                            self.ai_mode = AiMode::Http;
+                        }
+                        if ui
+                            .selectable_label(self.ai_mode == AiMode::Acp, "Claude Code")
+                            .clicked()
+                        {
+                            self.ai_mode = AiMode::Acp;
+                        }
+                    });
+                    ui.separator();
+                    match self.ai_mode {
+                        AiMode::Http => self.chat.ui(ui),
+                        AiMode::Acp => {
+                            let cwd = self
+                                .root
+                                .clone()
+                                .unwrap_or_else(|| PathBuf::from("."));
+                            self.acp.ui(ui, cwd);
+                        }
+                    }
                 });
         }
 
