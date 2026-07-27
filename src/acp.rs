@@ -534,26 +534,34 @@ impl Acp {
             .show(ui, |ui| {
                 let last = self.messages.len().saturating_sub(1);
                 for (i, message) in self.messages.iter().enumerate() {
-                    match message.role {
-                        Role::User => {
-                            ui.strong("You");
-                            ui.label(&message.content);
-                        }
-                        Role::Thinking => {
-                            if !message.content.is_empty() {
-                                ui.weak("Thinking");
-                                ui.weak(&message.content);
-                            }
-                        }
-                        Role::Assistant => {
-                            ui.strong("Claude");
-                            if message.content.is_empty() && i == last && self.streaming {
-                                ui.spinner();
-                            } else {
-                                ui.label(&message.content);
-                            }
-                        }
+                    if message.role == Role::Thinking && message.content.is_empty() {
+                        continue;
                     }
+
+                    let (label, fill) = match message.role {
+                        Role::User => ("You", ui.visuals().faint_bg_color),
+                        Role::Thinking => ("Thinking", ui.visuals().extreme_bg_color),
+                        Role::Assistant => ("Claude", ui.visuals().extreme_bg_color),
+                    };
+
+                    egui::Frame::NONE
+                        .fill(fill)
+                        .corner_radius(6.0)
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            if message.role == Role::Thinking {
+                                ui.weak(label);
+                                ui.weak(&message.content);
+                            } else {
+                                ui.strong(label);
+                                if message.content.is_empty() && i == last && self.streaming {
+                                    ui.spinner();
+                                } else {
+                                    ui.label(&message.content);
+                                }
+                            }
+                        });
                     ui.add_space(6.0);
                 }
             });
