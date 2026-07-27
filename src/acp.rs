@@ -6,8 +6,9 @@ use std::sync::Arc;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, TextContent,
+    PermissionOptionId, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
+    SessionUpdate, TextContent,
 };
 use agent_client_protocol::{AcpAgent, Agent, ConnectionTo};
 use serde::{Deserialize, Serialize};
@@ -44,11 +45,18 @@ struct Usage {
     cost: Option<(f64, String)>,
 }
 
+struct PendingPermission {
+    title: String,
+    options: Vec<(String, String)>,
+    respond: tokio::sync::oneshot::Sender<String>,
+}
+
 enum Event {
     Delta(String),
     ThoughtDelta(String),
     Usage(u64, u64, Option<(f64, String)>),
     SessionId(String),
+    Permission(PendingPermission),
     Done,
     Error(String),
 }
@@ -69,6 +77,7 @@ pub struct Acp {
     thinking_index: Option<usize>,
     assistant_index: Option<usize>,
     usage: Option<Usage>,
+    pending_permission: Option<PendingPermission>,
 }
 
 impl Acp {
@@ -96,6 +105,9 @@ impl Acp {
                     self.usage = Some(Usage { used, size, cost });
                 }
                 Event::SessionId(id) => new_session_id = Some(id),
+                Event::Permission(pending) => {
+                    self.pending_permission = Some(pending);
+                }
                 Event::Done => finished = true,
                 Event::Error(err) => {
                     if let Some(i) = self.assistant_index {
@@ -174,6 +186,7 @@ impl Acp {
         self.prompt_tx = None;
         self.cancel_tx = None;
         self.streaming = false;
+        self.pending_permission = None;
     }
 
     fn start(&mut self, ctx: egui::Context, cwd: PathBuf, resume_session_id: Option<String>) {
@@ -217,6 +230,8 @@ impl Acp {
                 let notify_ctx = ctx.clone();
                 let loop_tx = tx.clone();
                 let loop_ctx = ctx.clone();
+                let permission_tx = tx.clone();
+                let permission_ctx = ctx.clone();
                 let accepting = Arc::new(AtomicBool::new(false));
                 let notify_accepting = accepting.clone();
                 let loop_accepting = accepting.clone();
@@ -255,17 +270,35 @@ impl Acp {
                     )
                     .on_receive_request(
                         async move |request: RequestPermissionRequest, responder, _connection| {
-                            let option_id = request.options.first().map(|opt| opt.option_id.clone());
-                            if let Some(id) = option_id {
-                                responder.respond(RequestPermissionResponse::new(
+                            let title = request
+                                .tool_call
+                                .fields
+                                .title
+                                .clone()
+                                .unwrap_or_else(|| "Permission requested".to_string());
+                            let options: Vec<(String, String)> = request
+                                .options
+                                .iter()
+                                .map(|opt| (opt.option_id.0.to_string(), opt.name.clone()))
+                                .collect();
+
+                            let (respond_tx, respond_rx) = tokio::sync::oneshot::channel::<String>();
+                            let _ = permission_tx.send(Event::Permission(PendingPermission {
+                                title,
+                                options,
+                                respond: respond_tx,
+                            }));
+                            permission_ctx.request_repaint();
+
+                            match respond_rx.await {
+                                Ok(option_id) => responder.respond(RequestPermissionResponse::new(
                                     RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
-                                        id,
+                                        PermissionOptionId::new(option_id),
                                     )),
-                                ))
-                            } else {
-                                responder.respond(RequestPermissionResponse::new(
+                                )),
+                                Err(_) => responder.respond(RequestPermissionResponse::new(
                                     RequestPermissionOutcome::Cancelled,
-                                ))
+                                )),
                             }
                         },
                         agent_client_protocol::on_receive_request!(),
@@ -431,6 +464,24 @@ impl Acp {
         });
 
         egui::Panel::bottom("acp_bottom_bar").show(ui, |ui| {
+            let mut chosen: Option<String> = None;
+            if let Some(pending) = &self.pending_permission {
+                ui.label(&pending.title);
+                ui.horizontal(|ui| {
+                    for (option_id, name) in &pending.options {
+                        if ui.button(name).clicked() {
+                            chosen = Some(option_id.clone());
+                        }
+                    }
+                });
+                ui.separator();
+            }
+            if let Some(option_id) = chosen {
+                if let Some(pending) = self.pending_permission.take() {
+                    let _ = pending.respond.send(option_id);
+                }
+            }
+
             if let Some(usage) = &self.usage {
                 let percent = if usage.size > 0 {
                     usage.used as f64 / usage.size as f64 * 100.0
@@ -449,16 +500,20 @@ impl Acp {
 
             ui.separator();
 
+            let awaiting_permission = self.pending_permission.is_some();
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let clicked = if self.streaming {
-                        ui.button("Stop").clicked()
+                        ui.add_enabled(!awaiting_permission, egui::Button::new("Stop"))
+                            .clicked()
                     } else {
                         ui.button("Send").clicked()
                     };
 
-                    let response = ui
-                        .add_enabled(!self.streaming, egui::TextEdit::singleline(&mut self.input));
+                    let response = ui.add_enabled(
+                        !self.streaming && !awaiting_permission,
+                        egui::TextEdit::singleline(&mut self.input),
+                    );
                     let enter_pressed = response.lost_focus()
                         && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter));
 
