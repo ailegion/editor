@@ -127,6 +127,21 @@ impl App {
         self.tabs.get(self.active_tab).and_then(|t| t.path.clone())
     }
 
+    /// Reloads open, unmodified tabs from disk, in case the AI sidebar just edited them.
+    fn reload_open_tabs(&mut self) {
+        for tab in &mut self.tabs {
+            if tab.dirty {
+                continue;
+            }
+            let Some(path) = &tab.path else { continue };
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if content != tab.content {
+                    tab.content = content;
+                }
+            }
+        }
+    }
+
     fn open_file_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new().pick_file() {
             self.open_path(path);
@@ -672,6 +687,9 @@ impl eframe::App for App {
         }
         self.chat.poll();
         self.acp.poll();
+        if self.acp.take_finished() {
+            self.reload_open_tabs();
+        }
 
         egui::Panel::top("top_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {

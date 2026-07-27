@@ -8,29 +8,57 @@ use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest,
     PermissionOptionId, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
-    SessionUpdate, TextContent,
+    SessionUpdate, TextContent, ToolCallStatus,
 };
 use agent_client_protocol::{AcpAgent, Agent, ConnectionTo};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
-enum Role {
-    User,
-    Thinking,
-    Assistant,
+enum ToolStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+}
+
+impl ToolStatus {
+    fn icon(self) -> &'static str {
+        match self {
+            ToolStatus::Pending => "⏳",
+            ToolStatus::InProgress => "⚙",
+            ToolStatus::Completed => "✓",
+            ToolStatus::Failed => "✗",
+        }
+    }
+}
+
+fn convert_status(status: ToolCallStatus) -> ToolStatus {
+    match status {
+        ToolCallStatus::Pending => ToolStatus::Pending,
+        ToolCallStatus::InProgress => ToolStatus::InProgress,
+        ToolCallStatus::Completed => ToolStatus::Completed,
+        ToolCallStatus::Failed => ToolStatus::Failed,
+        _ => ToolStatus::Pending,
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct Message {
-    role: Role,
-    content: String,
+enum Entry {
+    User { content: String },
+    Thinking { content: String },
+    Assistant { content: String },
+    ToolCall {
+        id: String,
+        title: String,
+        status: ToolStatus,
+    },
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Thread {
     title: String,
     session_id: Option<String>,
-    messages: Vec<Message>,
+    entries: Vec<Entry>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -57,6 +85,16 @@ enum Event {
     Usage(u64, u64, Option<(f64, String)>),
     SessionId(String),
     Permission(PendingPermission),
+    ToolCall {
+        id: String,
+        title: String,
+        status: ToolStatus,
+    },
+    ToolCallUpdate {
+        id: String,
+        title: Option<String>,
+        status: Option<ToolStatus>,
+    },
     Done,
     Error(String),
 }
@@ -67,7 +105,7 @@ pub struct Acp {
     cwd: Option<PathBuf>,
     threads: Vec<Thread>,
     active_thread: usize,
-    messages: Vec<Message>,
+    entries: Vec<Entry>,
     input: String,
     rx: Option<Receiver<Event>>,
     prompt_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
@@ -78,9 +116,16 @@ pub struct Acp {
     assistant_index: Option<usize>,
     usage: Option<Usage>,
     pending_permission: Option<PendingPermission>,
+    just_finished: bool,
 }
 
 impl Acp {
+    /// Returns true (once) the first time this is called after a turn finishes,
+    /// so the caller can react (e.g. reload files the agent may have edited).
+    pub fn take_finished(&mut self) -> bool {
+        std::mem::take(&mut self.just_finished)
+    }
+
     pub fn poll(&mut self) {
         let Some(rx) = &self.rx else { return };
         let mut finished = false;
@@ -89,15 +134,15 @@ impl Acp {
             match event {
                 Event::Delta(text) => {
                     if let Some(i) = self.assistant_index {
-                        if let Some(m) = self.messages.get_mut(i) {
-                            m.content.push_str(&text);
+                        if let Some(Entry::Assistant { content }) = self.entries.get_mut(i) {
+                            content.push_str(&text);
                         }
                     }
                 }
                 Event::ThoughtDelta(text) => {
                     if let Some(i) = self.thinking_index {
-                        if let Some(m) = self.messages.get_mut(i) {
-                            m.content.push_str(&text);
+                        if let Some(Entry::Thinking { content }) = self.entries.get_mut(i) {
+                            content.push_str(&text);
                         }
                     }
                 }
@@ -108,11 +153,17 @@ impl Acp {
                 Event::Permission(pending) => {
                     self.pending_permission = Some(pending);
                 }
+                Event::ToolCall { id, title, status } => {
+                    Self::upsert_tool_call(&mut self.entries, id, Some(title), Some(status));
+                }
+                Event::ToolCallUpdate { id, title, status } => {
+                    Self::upsert_tool_call(&mut self.entries, id, title, status);
+                }
                 Event::Done => finished = true,
                 Event::Error(err) => {
                     if let Some(i) = self.assistant_index {
-                        if let Some(m) = self.messages.get_mut(i) {
-                            m.content.push_str(&format!("\n[error: {err}]"));
+                        if let Some(Entry::Assistant { content }) = self.entries.get_mut(i) {
+                            content.push_str(&format!("\n[error: {err}]"));
                         }
                     }
                     finished = true;
@@ -126,11 +177,43 @@ impl Acp {
         }
         if finished {
             self.streaming = false;
+            self.just_finished = true;
             self.save_current_thread();
             if let Some(cwd) = self.cwd.clone() {
                 self.persist(&cwd);
             }
         }
+    }
+
+    fn upsert_tool_call(
+        entries: &mut Vec<Entry>,
+        id: String,
+        title: Option<String>,
+        status: Option<ToolStatus>,
+    ) {
+        for entry in entries.iter_mut() {
+            if let Entry::ToolCall {
+                id: existing_id,
+                title: t,
+                status: s,
+            } = entry
+            {
+                if *existing_id == id {
+                    if let Some(title) = title {
+                        *t = title;
+                    }
+                    if let Some(status) = status {
+                        *s = status;
+                    }
+                    return;
+                }
+            }
+        }
+        entries.push(Entry::ToolCall {
+            id,
+            title: title.unwrap_or_else(|| "Tool call".to_string()),
+            status: status.unwrap_or(ToolStatus::Pending),
+        });
     }
 
     fn ensure_loaded(&mut self, cwd: &Path) {
@@ -145,7 +228,7 @@ impl Acp {
                     if !store.threads.is_empty() {
                         self.threads = store.threads;
                         self.active_thread = store.active.min(self.threads.len() - 1);
-                        self.messages = self.threads[self.active_thread].messages.clone();
+                        self.entries = self.threads[self.active_thread].entries.clone();
                         return;
                     }
                 }
@@ -157,10 +240,14 @@ impl Acp {
 
     fn save_current_thread(&mut self) {
         if let Some(thread) = self.threads.get_mut(self.active_thread) {
-            thread.messages = self.messages.clone();
+            thread.entries = self.entries.clone();
             if thread.title.is_empty() {
-                if let Some(first_user) = self.messages.iter().find(|m| m.role == Role::User) {
-                    thread.title = first_user.content.chars().take(40).collect();
+                let first_user = self.entries.iter().find_map(|e| match e {
+                    Entry::User { content } => Some(content.clone()),
+                    _ => None,
+                });
+                if let Some(content) = first_user {
+                    thread.title = content.chars().take(40).collect();
                 }
             }
         }
@@ -260,6 +347,22 @@ impl Acp {
                                     let cost = usage.cost.map(|c| (c.amount, c.currency));
                                     let _ =
                                         notify_tx.send(Event::Usage(usage.used, usage.size, cost));
+                                    notify_ctx.request_repaint();
+                                }
+                                SessionUpdate::ToolCall(tool_call) => {
+                                    let _ = notify_tx.send(Event::ToolCall {
+                                        id: tool_call.tool_call_id.0.to_string(),
+                                        title: tool_call.title,
+                                        status: convert_status(tool_call.status),
+                                    });
+                                    notify_ctx.request_repaint();
+                                }
+                                SessionUpdate::ToolCallUpdate(update) => {
+                                    let _ = notify_tx.send(Event::ToolCallUpdate {
+                                        id: update.tool_call_id.0.to_string(),
+                                        title: update.fields.title,
+                                        status: update.fields.status.map(convert_status),
+                                    });
                                     notify_ctx.request_repaint();
                                 }
                                 _ => {}
@@ -385,18 +488,15 @@ impl Acp {
             .get(self.active_thread)
             .and_then(|t| t.session_id.clone());
         self.start(ctx, cwd, resume_session_id);
-        self.messages.push(Message {
-            role: Role::User,
+        self.entries.push(Entry::User {
             content: text.clone(),
         });
-        self.thinking_index = Some(self.messages.len());
-        self.messages.push(Message {
-            role: Role::Thinking,
+        self.thinking_index = Some(self.entries.len());
+        self.entries.push(Entry::Thinking {
             content: String::new(),
         });
-        self.assistant_index = Some(self.messages.len());
-        self.messages.push(Message {
-            role: Role::Assistant,
+        self.assistant_index = Some(self.entries.len());
+        self.entries.push(Entry::Assistant {
             content: String::new(),
         });
         self.streaming = true;
@@ -417,7 +517,7 @@ impl Acp {
         self.persist(cwd);
         self.threads.push(Thread::default());
         self.active_thread = self.threads.len() - 1;
-        self.messages.clear();
+        self.entries.clear();
         self.thinking_index = None;
         self.assistant_index = None;
         self.usage = None;
@@ -431,7 +531,7 @@ impl Acp {
         self.save_current_thread();
         self.persist(cwd);
         self.active_thread = index;
-        self.messages = self.threads[index].messages.clone();
+        self.entries = self.threads[index].entries.clone();
         self.thinking_index = None;
         self.assistant_index = None;
         self.usage = None;
@@ -531,37 +631,68 @@ impl Acp {
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
+            .stick_to_bottom(true)
             .show(ui, |ui| {
-                let last = self.messages.len().saturating_sub(1);
-                for (i, message) in self.messages.iter().enumerate() {
-                    if message.role == Role::Thinking && message.content.is_empty() {
-                        continue;
+                let last = self.entries.len().saturating_sub(1);
+                for (i, entry) in self.entries.iter().enumerate() {
+                    if let Entry::Thinking { content } = entry {
+                        if content.is_empty() {
+                            continue;
+                        }
                     }
 
-                    let (label, fill) = match message.role {
-                        Role::User => ("You", ui.visuals().faint_bg_color),
-                        Role::Thinking => ("Thinking", ui.visuals().extreme_bg_color),
-                        Role::Assistant => ("Claude", ui.visuals().extreme_bg_color),
-                    };
-
-                    egui::Frame::NONE
-                        .fill(fill)
-                        .corner_radius(6.0)
-                        .inner_margin(8.0)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            if message.role == Role::Thinking {
-                                ui.weak(label);
-                                ui.weak(&message.content);
-                            } else {
-                                ui.strong(label);
-                                if message.content.is_empty() && i == last && self.streaming {
-                                    ui.spinner();
-                                } else {
-                                    ui.label(&message.content);
-                                }
-                            }
-                        });
+                    match entry {
+                        Entry::ToolCall { title, status, .. } => {
+                            egui::Frame::NONE
+                                .fill(ui.visuals().faint_bg_color)
+                                .corner_radius(6.0)
+                                .inner_margin(6.0)
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.weak(status.icon());
+                                        ui.weak(title);
+                                    });
+                                });
+                        }
+                        Entry::User { content } => {
+                            egui::Frame::NONE
+                                .fill(ui.visuals().faint_bg_color)
+                                .corner_radius(6.0)
+                                .inner_margin(8.0)
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.strong("You");
+                                    ui.label(content);
+                                });
+                        }
+                        Entry::Thinking { content } => {
+                            egui::Frame::NONE
+                                .fill(ui.visuals().extreme_bg_color)
+                                .corner_radius(6.0)
+                                .inner_margin(8.0)
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.weak("Thinking");
+                                    ui.weak(content);
+                                });
+                        }
+                        Entry::Assistant { content } => {
+                            egui::Frame::NONE
+                                .fill(ui.visuals().extreme_bg_color)
+                                .corner_radius(6.0)
+                                .inner_margin(8.0)
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.strong("Claude");
+                                    if content.is_empty() && i == last && self.streaming {
+                                        ui.spinner();
+                                    } else {
+                                        ui.label(content);
+                                    }
+                                });
+                        }
+                    }
                     ui.add_space(6.0);
                 }
             });
