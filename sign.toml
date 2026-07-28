@@ -1,0 +1,14 @@
+[macos]
+identity = "-"
+
+[macos.auth]
+api-key = {}
+
+[macos.env]
+
+[macos.dmg]
+background = "bg.png"
+window-size = [600, 400]
+icon-size = 128
+app-position = [150, 150]
+app-drop-link = [450, 200]

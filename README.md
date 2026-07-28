@@ -16,6 +16,15 @@ A minimal, no-bloat code editor in Rust, built on `egui`/`eframe`.
 cargo run
 ```
 
+## Build a signed macOS app (.app + .dmg)
+
+```sh
+cargo bundle --release
+cargo codesign macos --app target/release/bundle/osx/editor.app --skip-notarize
+```
+
+Output: signed `.app` and `.dmg` in `target/release/bundle/osx/`. Requires `cargo-bundle` and `cargo-codesign` installed, and `sign.toml` set up (see `sign.toml` / `entitlements.plist` in this repo).
+
 ## License
 
 PolyForm Strict License 1.0.0 — free to download and use, but no forking or redistributing modified versions.
