@@ -34,6 +34,48 @@ impl Tab {
     }
 }
 
+/// Wraps `iced_highlighter::Highlighter` to add a `generation` field to its `Settings`.
+///
+/// The widget only resets its highlighter when `Settings` compares unequal between
+/// renders. Two tabs with the same file extension produce identical `{theme, token}`
+/// settings, so switching between them leaves the previous tab's stale highlighter
+/// state in place. `generation` (the active tab index) forces the comparison to see
+/// a change on every tab switch, even when the extension is the same.
+struct TabHighlighter(iced_highlighter::Highlighter);
+
+#[derive(Clone, PartialEq)]
+struct TabHighlighterSettings {
+    inner: iced_highlighter::Settings,
+    generation: usize,
+}
+
+impl iced_core::text::Highlighter for TabHighlighter {
+    type Settings = TabHighlighterSettings;
+    type Highlight = <iced_highlighter::Highlighter as iced_core::text::Highlighter>::Highlight;
+    type Iterator<'a> =
+        <iced_highlighter::Highlighter as iced_core::text::Highlighter>::Iterator<'a>;
+
+    fn new(settings: &Self::Settings) -> Self {
+        TabHighlighter(iced_highlighter::Highlighter::new(&settings.inner))
+    }
+
+    fn update(&mut self, new_settings: &Self::Settings) {
+        self.0.update(&new_settings.inner);
+    }
+
+    fn change_line(&mut self, line: usize) {
+        self.0.change_line(line);
+    }
+
+    fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
+        self.0.highlight_line(line)
+    }
+
+    fn current_line(&self) -> usize {
+        self.0.current_line()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileAction {
     OpenFile,
@@ -629,7 +671,16 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             .unwrap_or("txt");
         text_editor(&tab.content)
             .on_action(Message::EditorAction)
-            .highlight(extension, highlighter::Theme::SolarizedDark)
+            .highlight_with::<TabHighlighter>(
+                TabHighlighterSettings {
+                    inner: iced_highlighter::Settings {
+                        theme: highlighter::Theme::SolarizedDark,
+                        token: extension.to_string(),
+                    },
+                    generation: state.active_tab,
+                },
+                |highlight, _theme| highlight.to_format(),
+            )
             .height(Length::Fill)
             .into()
     } else {

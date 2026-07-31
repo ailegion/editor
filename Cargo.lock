@@ -898,6 +898,8 @@ dependencies = [
  "iced",
  "iced-swdir-tree",
  "iced_aw",
+ "iced_core",
+ "iced_highlighter",
  "rfd",
  "serde",
  "serde_json",
