@@ -3,7 +3,9 @@ mod chat;
 
 use iced::highlighter;
 use iced::keyboard;
-use iced::widget::{button, column, container, row, text, text_editor, text_input};
+use iced::widget::{
+    button, column, container, pane_grid, row, scrollable, text, text_editor, text_input, PaneGrid,
+};
 use iced::{Element, Length, Subscription, Task};
 use iced_aw::context_menu::ContextMenu;
 use iced_aw::menu::{Item, Menu};
@@ -103,6 +105,12 @@ enum AiMode {
     Acp,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PaneKind {
+    Sidebar,
+    Main,
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     EditorAction(text_editor::Action),
@@ -126,6 +134,7 @@ enum Message {
 
     FileAction(FileAction),
     AppThemeSelected(iced::Theme),
+    PaneResized(pane_grid::ResizeEvent),
 
     KeyPressed(keyboard::Key, keyboard::Modifiers),
     Noop,
@@ -148,6 +157,8 @@ struct State {
 
     app_theme: iced::Theme,
 
+    panes: pane_grid::State<PaneKind>,
+
     ai_visible: bool,
     ai_mode: AiMode,
     chat: chat::ChatState,
@@ -160,6 +171,12 @@ impl State {
         let tree = root
             .clone()
             .map(|p| DirectoryTree::new(p).with_filter(DirectoryFilter::FilesAndFolders));
+        let panes = pane_grid::State::with_configuration(pane_grid::Configuration::Split {
+            axis: pane_grid::Axis::Vertical,
+            ratio: 0.2,
+            a: Box::new(pane_grid::Configuration::Pane(PaneKind::Sidebar)),
+            b: Box::new(pane_grid::Configuration::Pane(PaneKind::Main)),
+        });
         Self {
             root,
             tabs: Vec::new(),
@@ -168,6 +185,7 @@ impl State {
             renaming: None,
             creating: None,
             app_theme: iced::Theme::Dark,
+            panes,
             ai_visible: load_ai_visible(),
             ai_mode: AiMode::default(),
             chat: chat::ChatState::default(),
@@ -437,6 +455,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::CreateCancel => state.creating = None,
 
         Message::AppThemeSelected(theme) => state.app_theme = theme,
+        Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
+            state.panes.resize(split, ratio);
+        }
 
         Message::KeyPressed(key, modifiers) => {
             if modifiers.command() {
@@ -489,24 +510,29 @@ fn view(state: &State) -> Element<'_, Message> {
     let top_bar = view_top_bar(state);
     let status_bar = view_status_bar(state);
 
-    let sidebar = container(view_tree(state))
-        .width(Length::Fixed(220.0))
-        .height(Length::Fill)
-        .padding(8);
+    let panes = PaneGrid::new(&state.panes, |_id, kind, _is_maximized| {
+        let content: Element<'_, Message> = match kind {
+            PaneKind::Sidebar => container(view_tree(state)).padding(8).into(),
+            PaneKind::Main => {
+                let editor = view_editor(state);
+                let mut body = row![editor].height(Length::Fill);
+                if state.ai_visible {
+                    body = body.push(
+                        container(view_ai_sidebar(state))
+                            .width(Length::Fixed(320.0))
+                            .height(Length::Fill)
+                            .padding(8),
+                    );
+                }
+                body.into()
+            }
+        };
+        pane_grid::Content::new(content)
+    })
+    .on_resize(10, Message::PaneResized)
+    .height(Length::Fill);
 
-    let editor = view_editor(state);
-
-    let mut body = row![sidebar, editor].height(Length::Fill);
-    if state.ai_visible {
-        body = body.push(
-            container(view_ai_sidebar(state))
-                .width(Length::Fixed(320.0))
-                .height(Length::Fill)
-                .padding(8),
-        );
-    }
-
-    column![top_bar, body, status_bar].into()
+    column![top_bar, panes, status_bar].into()
 }
 
 fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
@@ -687,7 +713,13 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         text("No file open").into()
     };
 
-    column![tab_row, editor]
+    let tab_strip = scrollable(tab_row)
+        .direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::default(),
+        ))
+        .width(Length::Fill);
+
+    column![tab_strip, editor]
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
