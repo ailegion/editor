@@ -3,11 +3,12 @@ mod chat;
 
 use iced::highlighter;
 use iced::keyboard;
-use iced::widget::{button, column, container, row, scrollable, text, text_editor, text_input};
-use iced::{Alignment, Element, Length, Subscription, Task};
+use iced::widget::{button, column, container, row, text, text_editor, text_input};
+use iced::{Element, Length, Subscription, Task};
+use iced_aw::context_menu::ContextMenu;
 use iced_aw::menu::{Item, Menu};
 use iced_aw::{menu_bar, menu_items};
-use std::collections::HashSet;
+use iced_swdir_tree::{DirectoryFilter, DirectoryTree, DirectoryTreeEvent};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -66,12 +67,14 @@ enum Message {
     TabSelected(usize),
     TabClosed(usize),
 
-    TreeEntryClicked(PathBuf),
-    TreeMenuToggle(PathBuf),
-    NewFile(PathBuf),
-    NewFolder(PathBuf),
-    RenameStart(PathBuf),
-    DeleteEntry(PathBuf),
+    Tree(DirectoryTreeEvent),
+    ContextNewFile,
+    ContextNewFolder,
+    ContextRename,
+    ContextDelete,
+    ContextCopyPath,
+    ContextCopyRelativePath,
+    ContextReveal,
     RenameInput(String),
     RenameSubmit,
     RenameCancel,
@@ -97,8 +100,7 @@ struct State {
     tabs: Vec<Tab>,
     active_tab: usize,
 
-    expanded: HashSet<PathBuf>,
-    tree_menu_open: Option<PathBuf>,
+    tree: Option<DirectoryTree>,
     renaming: Option<(PathBuf, String)>,
     creating: Option<(PathBuf, bool, String)>,
 
@@ -112,12 +114,15 @@ struct State {
 
 impl State {
     fn new() -> Self {
+        let root = load_last_project();
+        let tree = root
+            .clone()
+            .map(|p| DirectoryTree::new(p).with_filter(DirectoryFilter::FilesAndFolders));
         Self {
-            root: load_last_project(),
+            root,
             tabs: Vec::new(),
             active_tab: 0,
-            expanded: HashSet::new(),
-            tree_menu_open: None,
+            tree,
             renaming: None,
             creating: None,
             app_theme: iced::Theme::Dark,
@@ -130,6 +135,34 @@ impl State {
 
     fn root_or_cwd(&self) -> PathBuf {
         self.root.clone().unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// The path the context menu should act on: the tree's current selection, or the root.
+    fn context_target_path(&self) -> Option<PathBuf> {
+        self.tree
+            .as_ref()
+            .and_then(|t| t.selected_path())
+            .map(Path::to_path_buf)
+            .or_else(|| self.root.clone())
+    }
+
+    /// The directory a New File/Folder should be created in.
+    fn context_target_dir(&self) -> Option<PathBuf> {
+        let path = self.context_target_path()?;
+        if path.is_dir() {
+            Some(path)
+        } else {
+            Some(path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(".")))
+        }
+    }
+
+    /// The widget has no incremental refresh; rebuild it from scratch so create/rename/delete
+    /// show up without restarting the app. This collapses the tree back to the root.
+    fn refresh_tree(&mut self) {
+        if let Some(root) = &self.root {
+            self.tree =
+                Some(DirectoryTree::new(root.clone()).with_filter(DirectoryFilter::FilesAndFolders));
+        }
     }
 
     /// Reloads open, unmodified tabs from disk, in case the AI sidebar just edited them.
@@ -223,6 +256,7 @@ impl State {
 }
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
+    let mut task = Task::none();
     match message {
         Message::EditorAction(action) => {
             if let Some(tab) = state.tabs.get_mut(state.active_tab) {
@@ -244,11 +278,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             FileAction::OpenFolder => {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     save_last_project(&path);
+                    state.tree = Some(
+                        DirectoryTree::new(path.clone()).with_filter(DirectoryFilter::FilesAndFolders),
+                    );
                     state.root = Some(path);
                 }
             }
             FileAction::CloseFolder => {
                 state.root = None;
+                state.tree = None;
                 if let Some(path) = last_project_path() {
                     let _ = std::fs::remove_file(path);
                 }
@@ -256,43 +294,61 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             FileAction::Save => state.save(),
         },
 
-        Message::TreeEntryClicked(path) => {
-            if path.is_dir() {
-                if !state.expanded.remove(&path) {
-                    state.expanded.insert(path);
+        Message::Tree(event) => {
+            if let DirectoryTreeEvent::Selected(path, is_dir, _) = &event {
+                if !*is_dir {
+                    state.open_path(path.clone());
                 }
-            } else {
-                state.open_path(path);
+            }
+            if let Some(tree) = &mut state.tree {
+                task = tree.update(event).map(Message::Tree);
             }
         }
-        Message::TreeMenuToggle(path) => {
-            state.tree_menu_open = if state.tree_menu_open.as_deref() == Some(path.as_path()) {
-                None
-            } else {
-                Some(path)
-            };
+        Message::ContextNewFile => {
+            if let Some(dir) = state.context_target_dir() {
+                state.creating = Some((dir, false, String::new()));
+            }
         }
-        Message::NewFile(dir) => {
-            state.creating = Some((dir.clone(), false, String::new()));
-            state.expanded.insert(dir);
-            state.tree_menu_open = None;
+        Message::ContextNewFolder => {
+            if let Some(dir) = state.context_target_dir() {
+                state.creating = Some((dir, true, String::new()));
+            }
         }
-        Message::NewFolder(dir) => {
-            state.creating = Some((dir.clone(), true, String::new()));
-            state.expanded.insert(dir);
-            state.tree_menu_open = None;
+        Message::ContextRename => {
+            if let Some(path) = state.context_target_path() {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                state.renaming = Some((path, name));
+            }
         }
-        Message::RenameStart(path) => {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            state.renaming = Some((path, name));
-            state.tree_menu_open = None;
+        Message::ContextDelete => {
+            if let Some(path) = state.context_target_path() {
+                state.delete_path(&path);
+                state.refresh_tree();
+            }
         }
-        Message::DeleteEntry(path) => {
-            state.delete_path(&path);
-            state.tree_menu_open = None;
+        Message::ContextCopyPath => {
+            if let Some(path) = state.context_target_path() {
+                task = iced::clipboard::write(path.display().to_string());
+            }
+        }
+        Message::ContextCopyRelativePath => {
+            if let Some(path) = state.context_target_path() {
+                let relative = state
+                    .root
+                    .as_ref()
+                    .and_then(|root| path.strip_prefix(root).ok())
+                    .map(Path::to_path_buf)
+                    .unwrap_or(path);
+                task = iced::clipboard::write(relative.display().to_string());
+            }
+        }
+        Message::ContextReveal => {
+            if let Some(path) = state.context_target_path() {
+                reveal_in_file_manager(&path);
+            }
         }
         Message::RenameInput(text) => {
             if let Some((_, buf)) = &mut state.renaming {
@@ -314,6 +370,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         {
                             tab.path = Some(new_path);
                         }
+                        state.refresh_tree();
                     }
                 }
             }
@@ -328,10 +385,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if let Some((dir, is_dir, name)) = state.creating.take() {
                 if !name.is_empty() {
                     let target = dir.join(&name);
-                    if is_dir {
-                        let _ = std::fs::create_dir(target);
+                    let result = if is_dir {
+                        std::fs::create_dir(target)
                     } else {
-                        let _ = std::fs::write(target, "");
+                        std::fs::write(target, "")
+                    };
+                    if result.is_ok() {
+                        state.refresh_tree();
                     }
                 }
             }
@@ -350,6 +410,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         }
                     }
                     _ => {}
+                }
+            } else if let Some(tree) = &state.tree {
+                if let Some(event) = tree.handle_key(&key, modifiers) {
+                    if let DirectoryTreeEvent::Selected(path, is_dir, _) = &event {
+                        if !*is_dir {
+                            state.open_path(path.clone());
+                        }
+                    }
+                    if let Some(tree) = &mut state.tree {
+                        task = tree.update(event).map(Message::Tree);
+                    }
                 }
             }
         }
@@ -373,14 +444,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
     }
-    Task::none()
+    task
 }
 
 fn view(state: &State) -> Element<'_, Message> {
     let top_bar = view_top_bar(state);
     let status_bar = view_status_bar(state);
 
-    let sidebar = container(scrollable(view_tree(state)))
+    let sidebar = container(view_tree(state))
         .width(Length::Fixed(220.0))
         .height(Length::Fill)
         .padding(8);
@@ -488,42 +559,38 @@ fn view_status_bar(state: &State) -> Element<'_, Message> {
 }
 
 fn view_tree(state: &State) -> Element<'_, Message> {
-    let Some(root) = state.root.clone() else {
+    let Some(tree) = &state.tree else {
         return text("No folder open (File > Open Folder)").into();
     };
-    render_dir_entry(state, root, true)
-}
 
-fn render_dir_entry(state: &State, path: PathBuf, is_root: bool) -> Element<'_, Message> {
-    let name = if is_root {
-        path.file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.display().to_string())
-    } else {
-        path.file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default()
-    };
-    let is_expanded = is_root || state.expanded.contains(&path);
-    let arrow = if is_expanded { "v" } else { ">" };
+    let content = ContextMenu::new(tree.view(Message::Tree), || {
+        container(
+            column![
+                menu_button("New File".to_string(), Message::ContextNewFile),
+                menu_button("New Folder".to_string(), Message::ContextNewFolder),
+                menu_button("Rename".to_string(), Message::ContextRename),
+                menu_button("Delete".to_string(), Message::ContextDelete),
+                menu_button("Copy Path".to_string(), Message::ContextCopyPath),
+                menu_button("Copy Relative Path".to_string(), Message::ContextCopyRelativePath),
+                menu_button(reveal_label().to_string(), Message::ContextReveal),
+            ]
+            .width(Length::Fixed(200.0)),
+        )
+        .padding(4)
+        .style(|theme: &iced::Theme| {
+            let palette = theme.extended_palette();
+            iced::widget::container::Style {
+                background: Some(palette.background.weak.color.into()),
+                border: iced::Border::default().rounded(6.0),
+                ..iced::widget::container::Style::default()
+            }
+        })
+        .into()
+    });
 
-    let mut col = column![];
+    let mut col = column![Element::from(content)].spacing(6);
 
-    let header = row![
-        button(text(format!("{arrow} {name}")))
-            .on_press(Message::TreeEntryClicked(path.clone()))
-            .width(Length::Fill),
-        button(text("...")).on_press(Message::TreeMenuToggle(path.clone())),
-    ]
-    .align_y(Alignment::Center);
-    col = col.push(header);
-
-    if state.tree_menu_open.as_deref() == Some(path.as_path()) {
-        col = col.push(view_entry_menu(state, path.clone()));
-    }
-
-    if state.creating.as_ref().map(|(d, _, _)| d.as_path()) == Some(path.as_path()) {
-        let (_, is_dir, buf) = state.creating.as_ref().unwrap();
+    if let Some((_, is_dir, buf)) = &state.creating {
         let hint = if *is_dir { "new folder name" } else { "new file name" };
         col = col.push(row![
             text_input(hint, buf)
@@ -533,76 +600,16 @@ fn render_dir_entry(state: &State, path: PathBuf, is_root: bool) -> Element<'_, 
         ]);
     }
 
-    if is_expanded {
-        if let Ok(read_dir) = std::fs::read_dir(&path) {
-            let mut entries: Vec<PathBuf> = read_dir.flatten().map(|e| e.path()).collect();
-            entries.sort_by_key(|p| (!p.is_dir(), p.file_name().map(|n| n.to_owned())));
-            for entry in entries {
-                if state.renaming.as_ref().map(|(p, _)| p.as_path()) == Some(entry.as_path()) {
-                    let (_, buf) = state.renaming.as_ref().unwrap();
-                    col = col.push(
-                        row![
-                            text("  "),
-                            text_input("", buf)
-                                .on_input(Message::RenameInput)
-                                .on_submit(Message::RenameSubmit),
-                            button(text("x")).on_press(Message::RenameCancel),
-                        ],
-                    );
-                    continue;
-                }
-                if entry.is_dir() {
-                    col = col.push(
-                        container(render_dir_entry(state, entry, false)).padding(iced::Padding { top: 0.0, right: 0.0, bottom: 0.0, left: 12.0 }),
-                    );
-                } else {
-                    let entry_name = entry
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    let selected = state.active_path().as_deref() == Some(entry.as_path());
-                    let label = if selected {
-                        format!("* {entry_name}")
-                    } else {
-                        entry_name
-                    };
-                    col = col.push(container(
-                        row![
-                            button(text(label))
-                                .on_press(Message::TreeEntryClicked(entry.clone()))
-                                .width(Length::Fill),
-                            button(text("...")).on_press(Message::TreeMenuToggle(entry.clone())),
-                        ]
-                        .align_y(Alignment::Center),
-                    ).padding(iced::Padding { top: 0.0, right: 0.0, bottom: 0.0, left: 12.0 }));
-                    if state.tree_menu_open.as_deref() == Some(entry.as_path()) {
-                        col = col.push(
-                            container(view_entry_menu(state, entry.clone())).padding(iced::Padding { top: 0.0, right: 0.0, bottom: 0.0, left: 12.0 }),
-                        );
-                    }
-                }
-            }
-        }
+    if let Some((_, buf)) = &state.renaming {
+        col = col.push(row![
+            text_input("new name", buf)
+                .on_input(Message::RenameInput)
+                .on_submit(Message::RenameSubmit),
+            button(text("x")).on_press(Message::RenameCancel),
+        ]);
     }
 
     col.into()
-}
-
-fn view_entry_menu(_state: &State, path: PathBuf) -> Element<'_, Message> {
-    let is_dir = path.is_dir();
-    let target_dir = if is_dir {
-        path.clone()
-    } else {
-        path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."))
-    };
-    row![
-        button(text("New File")).on_press(Message::NewFile(target_dir.clone())),
-        button(text("New Folder")).on_press(Message::NewFolder(target_dir)),
-        button(text("Rename")).on_press(Message::RenameStart(path.clone())),
-        button(text("Delete")).on_press(Message::DeleteEntry(path)),
-    ]
-    .spacing(4)
-    .into()
 }
 
 fn view_editor(state: &State) -> Element<'_, Message> {
@@ -692,6 +699,38 @@ fn confirm(title: &str, description: &str) -> bool {
         .set_buttons(rfd::MessageButtons::YesNo)
         .show()
         == rfd::MessageDialogResult::Yes
+}
+
+fn reveal_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Reveal in Finder"
+    } else if cfg!(target_os = "windows") {
+        "Show in Explorer"
+    } else {
+        "Open Containing Folder"
+    }
+}
+
+fn reveal_in_file_manager(path: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut arg = std::ffi::OsString::from("/select,");
+        arg.push(path.as_os_str());
+        let _ = std::process::Command::new("explorer").arg(arg).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let target = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        let _ = std::process::Command::new("xdg-open").arg(target).spawn();
+    }
 }
 
 pub fn main() -> iced::Result {
