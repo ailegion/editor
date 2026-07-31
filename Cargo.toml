@@ -5,12 +5,11 @@ edition = "2024"
 
 [dependencies]
 agent-client-protocol = "2.0.0"
-eframe = "0.35.0"
-egui = { version = "0.35.0", features = ["serde"] }
+iced = { version = "0.14.0", features = ["highlighter", "tokio"] }
+iced_aw = { version = "0.14.0", features = ["full"] }
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
 ureq = "3.3.0"
 

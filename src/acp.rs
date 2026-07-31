@@ -1,3 +1,5 @@
+use iced::widget::{button, column, container, row, scrollable, text, text_input};
+use iced::{Element, Length};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -24,10 +26,10 @@ enum ToolStatus {
 impl ToolStatus {
     fn icon(self) -> &'static str {
         match self {
-            ToolStatus::Pending => "⏳",
-            ToolStatus::InProgress => "⚙",
-            ToolStatus::Completed => "✓",
-            ToolStatus::Failed => "✗",
+            ToolStatus::Pending => "...",
+            ToolStatus::InProgress => "*",
+            ToolStatus::Completed => "v",
+            ToolStatus::Failed => "x",
         }
     }
 }
@@ -100,7 +102,7 @@ enum Event {
 }
 
 #[derive(Default)]
-pub struct Acp {
+pub struct AcpState {
     loaded: bool,
     cwd: Option<PathBuf>,
     threads: Vec<Thread>,
@@ -117,9 +119,21 @@ pub struct Acp {
     usage: Option<Usage>,
     pending_permission: Option<PendingPermission>,
     just_finished: bool,
+    thread_menu_open: bool,
 }
 
-impl Acp {
+#[derive(Debug, Clone)]
+pub enum Message {
+    NewThread,
+    SwitchThread(usize),
+    ThreadMenuToggle,
+    InputChanged(String),
+    Send,
+    Stop,
+    PermissionChosen(String),
+}
+
+impl AcpState {
     /// Returns true (once) the first time this is called after a turn finishes,
     /// so the caller can react (e.g. reload files the agent may have edited).
     pub fn take_finished(&mut self) -> bool {
@@ -276,7 +290,7 @@ impl Acp {
         self.pending_permission = None;
     }
 
-    fn start(&mut self, ctx: egui::Context, cwd: PathBuf, resume_session_id: Option<String>) {
+    fn start(&mut self, cwd: PathBuf, resume_session_id: Option<String>) {
         if self.started {
             return;
         }
@@ -297,7 +311,6 @@ impl Acp {
                 Ok(runtime) => runtime,
                 Err(err) => {
                     let _ = tx.send(Event::Error(err.to_string()));
-                    ctx.request_repaint();
                     return;
                 }
             };
@@ -308,17 +321,13 @@ impl Acp {
                     Ok(agent) => agent,
                     Err(err) => {
                         let _ = tx.send(Event::Error(err.to_string()));
-                        ctx.request_repaint();
                         return;
                     }
                 };
 
                 let notify_tx = tx.clone();
-                let notify_ctx = ctx.clone();
                 let loop_tx = tx.clone();
-                let loop_ctx = ctx.clone();
                 let permission_tx = tx.clone();
-                let permission_ctx = ctx.clone();
                 let accepting = Arc::new(AtomicBool::new(false));
                 let notify_accepting = accepting.clone();
                 let loop_accepting = accepting.clone();
@@ -334,20 +343,17 @@ impl Acp {
                                 SessionUpdate::AgentMessageChunk(chunk) => {
                                     if let ContentBlock::Text(text) = chunk.content {
                                         let _ = notify_tx.send(Event::Delta(text.text));
-                                        notify_ctx.request_repaint();
                                     }
                                 }
                                 SessionUpdate::AgentThoughtChunk(chunk) => {
                                     if let ContentBlock::Text(text) = chunk.content {
                                         let _ = notify_tx.send(Event::ThoughtDelta(text.text));
-                                        notify_ctx.request_repaint();
                                     }
                                 }
                                 SessionUpdate::UsageUpdate(usage) => {
                                     let cost = usage.cost.map(|c| (c.amount, c.currency));
                                     let _ =
                                         notify_tx.send(Event::Usage(usage.used, usage.size, cost));
-                                    notify_ctx.request_repaint();
                                 }
                                 SessionUpdate::ToolCall(tool_call) => {
                                     let _ = notify_tx.send(Event::ToolCall {
@@ -355,7 +361,6 @@ impl Acp {
                                         title: tool_call.title,
                                         status: convert_status(tool_call.status),
                                     });
-                                    notify_ctx.request_repaint();
                                 }
                                 SessionUpdate::ToolCallUpdate(update) => {
                                     let _ = notify_tx.send(Event::ToolCallUpdate {
@@ -363,7 +368,6 @@ impl Acp {
                                         title: update.fields.title,
                                         status: update.fields.status.map(convert_status),
                                     });
-                                    notify_ctx.request_repaint();
                                 }
                                 _ => {}
                             }
@@ -391,7 +395,6 @@ impl Acp {
                                 options,
                                 respond: respond_tx,
                             }));
-                            permission_ctx.request_repaint();
 
                             match respond_rx.await {
                                 Ok(option_id) => responder.respond(RequestPermissionResponse::new(
@@ -464,7 +467,6 @@ impl Acp {
                                     let _ = loop_tx.send(Event::Error(err.to_string()));
                                 }
                             }
-                            loop_ctx.request_repaint();
                         }
                         Ok(())
                     })
@@ -472,13 +474,12 @@ impl Acp {
 
                 if let Err(err) = result {
                     let _ = tx.send(Event::Error(err.to_string()));
-                    ctx.request_repaint();
                 }
             });
         });
     }
 
-    fn send(&mut self, ctx: egui::Context, cwd: PathBuf) {
+    fn send(&mut self, cwd: PathBuf) {
         let text = std::mem::take(&mut self.input);
         if text.trim().is_empty() || self.streaming {
             return;
@@ -487,7 +488,7 @@ impl Acp {
             .threads
             .get(self.active_thread)
             .and_then(|t| t.session_id.clone());
-        self.start(ctx, cwd, resume_session_id);
+        self.start(cwd, resume_session_id);
         self.entries.push(Entry::User {
             content: text.clone(),
         });
@@ -537,166 +538,122 @@ impl Acp {
         self.usage = None;
         self.reset_connection();
     }
+}
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, cwd: PathBuf) {
-        self.ensure_loaded(&cwd);
-        self.cwd = Some(cwd.clone());
-
-        egui::Panel::top("acp_top_bar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("+").on_hover_text("New thread").clicked() {
-                    self.new_thread(&cwd);
-                }
-                ui.menu_button("...", |ui| {
-                    for i in 0..self.threads.len() {
-                        let title = if self.threads[i].title.is_empty() {
-                            "New thread".to_string()
-                        } else {
-                            self.threads[i].title.clone()
-                        };
-                        if ui.button(title).clicked() {
-                            self.switch_thread(i, &cwd);
-                            ui.close();
-                        }
-                    }
-                });
-            });
-        });
-
-        egui::Panel::bottom("acp_bottom_bar").show(ui, |ui| {
-            let mut chosen: Option<String> = None;
-            if let Some(pending) = &self.pending_permission {
-                ui.label(&pending.title);
-                ui.horizontal(|ui| {
-                    for (option_id, name) in &pending.options {
-                        if ui.button(name).clicked() {
-                            chosen = Some(option_id.clone());
-                        }
-                    }
-                });
-                ui.separator();
+pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) {
+    state.ensure_loaded(&cwd);
+    state.cwd = Some(cwd.clone());
+    match message {
+        Message::NewThread => state.new_thread(&cwd),
+        Message::SwitchThread(i) => {
+            state.switch_thread(i, &cwd);
+            state.thread_menu_open = false;
+        }
+        Message::ThreadMenuToggle => state.thread_menu_open = !state.thread_menu_open,
+        Message::InputChanged(text) => state.input = text,
+        Message::Send => state.send(cwd),
+        Message::Stop => state.stop(),
+        Message::PermissionChosen(option_id) => {
+            if let Some(pending) = state.pending_permission.take() {
+                let _ = pending.respond.send(option_id);
             }
-            if let Some(option_id) = chosen {
-                if let Some(pending) = self.pending_permission.take() {
-                    let _ = pending.respond.send(option_id);
-                }
-            }
-
-            if let Some(usage) = &self.usage {
-                let percent = if usage.size > 0 {
-                    usage.used as f64 / usage.size as f64 * 100.0
-                } else {
-                    0.0
-                };
-                ui.weak(format!(
-                    "Context: {percent:.0}% ({}/{})",
-                    format_tokens(usage.used),
-                    format_tokens(usage.size)
-                ));
-                if let Some((amount, currency)) = &usage.cost {
-                    ui.weak(format!("{amount:.2} {currency}"));
-                }
-            }
-
-            ui.separator();
-
-            let awaiting_permission = self.pending_permission.is_some();
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let clicked = if self.streaming {
-                        ui.add_enabled(!awaiting_permission, egui::Button::new("Stop"))
-                            .clicked()
-                    } else {
-                        ui.button("Send").clicked()
-                    };
-
-                    let response = ui.add_enabled(
-                        !self.streaming && !awaiting_permission,
-                        egui::TextEdit::singleline(&mut self.input),
-                    );
-                    let enter_pressed = response.lost_focus()
-                        && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter));
-
-                    if self.streaming {
-                        if clicked {
-                            self.stop();
-                        }
-                    } else if (clicked || enter_pressed) && !self.input.trim().is_empty() {
-                        let ctx = ui.ctx().clone();
-                        self.send(ctx, cwd);
-                    }
-                });
-            });
-        });
-
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                let last = self.entries.len().saturating_sub(1);
-                for (i, entry) in self.entries.iter().enumerate() {
-                    if let Entry::Thinking { content } = entry {
-                        if content.is_empty() {
-                            continue;
-                        }
-                    }
-
-                    match entry {
-                        Entry::ToolCall { title, status, .. } => {
-                            egui::Frame::NONE
-                                .fill(ui.visuals().faint_bg_color)
-                                .corner_radius(6.0)
-                                .inner_margin(6.0)
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.horizontal(|ui| {
-                                        ui.weak(status.icon());
-                                        ui.weak(title);
-                                    });
-                                });
-                        }
-                        Entry::User { content } => {
-                            egui::Frame::NONE
-                                .fill(ui.visuals().faint_bg_color)
-                                .corner_radius(6.0)
-                                .inner_margin(8.0)
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.strong("You");
-                                    ui.label(content);
-                                });
-                        }
-                        Entry::Thinking { content } => {
-                            egui::Frame::NONE
-                                .fill(ui.visuals().extreme_bg_color)
-                                .corner_radius(6.0)
-                                .inner_margin(8.0)
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.weak("Thinking");
-                                    ui.weak(content);
-                                });
-                        }
-                        Entry::Assistant { content } => {
-                            egui::Frame::NONE
-                                .fill(ui.visuals().extreme_bg_color)
-                                .corner_radius(6.0)
-                                .inner_margin(8.0)
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.strong("Claude");
-                                    if content.is_empty() && i == last && self.streaming {
-                                        ui.spinner();
-                                    } else {
-                                        ui.label(content);
-                                    }
-                                });
-                        }
-                    }
-                    ui.add_space(6.0);
-                }
-            });
+        }
     }
+}
+
+pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
+    let mut top_bar = row![
+        button(text("+")).on_press(Message::NewThread),
+        button(text("...")).on_press(Message::ThreadMenuToggle),
+    ]
+    .spacing(4);
+    if state.thread_menu_open {
+        let mut menu = row![].spacing(4);
+        for (i, thread) in state.threads.iter().enumerate() {
+            let title = if thread.title.is_empty() {
+                "New thread".to_string()
+            } else {
+                thread.title.clone()
+            };
+            menu = menu.push(button(text(title)).on_press(Message::SwitchThread(i)));
+        }
+        top_bar = top_bar.push(menu);
+    }
+    let _ = cwd;
+
+    let mut messages = column![].spacing(6);
+    let last = state.entries.len().saturating_sub(1);
+    for (i, entry) in state.entries.iter().enumerate() {
+        if let Entry::Thinking { content } = entry {
+            if content.is_empty() {
+                continue;
+            }
+        }
+        let card: Element<'_, Message> = match entry {
+            Entry::ToolCall { title, status, .. } => {
+                row![text(status.icon()), text(title.clone())].spacing(6).into()
+            }
+            Entry::User { content } => {
+                column![text("You"), text(content.clone())].into()
+            }
+            Entry::Thinking { content } => {
+                column![text("Thinking"), text(content.clone())].into()
+            }
+            Entry::Assistant { content } => {
+                if content.is_empty() && i == last && state.streaming {
+                    column![text("Claude"), text("...")].into()
+                } else {
+                    column![text("Claude"), text(content.clone())].into()
+                }
+            }
+        };
+        messages = messages.push(container(card).padding(6));
+    }
+    let messages = scrollable(messages).height(Length::Fill);
+
+    let mut bottom = column![];
+    if let Some(pending) = &state.pending_permission {
+        bottom = bottom.push(text(pending.title.clone()));
+        let mut options = row![].spacing(4);
+        for (option_id, name) in &pending.options {
+            options = options
+                .push(button(text(name.clone())).on_press(Message::PermissionChosen(option_id.clone())));
+        }
+        bottom = bottom.push(options);
+    }
+    if let Some(usage) = &state.usage {
+        let percent = if usage.size > 0 {
+            usage.used as f64 / usage.size as f64 * 100.0
+        } else {
+            0.0
+        };
+        bottom = bottom.push(text(format!(
+            "Context: {percent:.0}% ({}/{})",
+            format_tokens(usage.used),
+            format_tokens(usage.size)
+        )));
+        if let Some((amount, currency)) = &usage.cost {
+            bottom = bottom.push(text(format!("{amount:.2} {currency}")));
+        }
+    }
+
+    let awaiting_permission = state.pending_permission.is_some();
+    let send_button = if state.streaming {
+        button(text("Stop")).on_press(Message::Stop)
+    } else if awaiting_permission {
+        button(text("Send"))
+    } else {
+        button(text("Send")).on_press(Message::Send)
+    };
+    bottom = bottom.push(
+        row![
+            text_input("", &state.input).on_input(Message::InputChanged),
+            send_button,
+        ]
+        .spacing(4),
+    );
+
+    column![top_bar, messages, bottom].height(Length::Fill).into()
 }
 
 fn threads_path(cwd: &Path) -> Option<PathBuf> {
