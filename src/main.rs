@@ -156,14 +156,6 @@ impl State {
         }
     }
 
-    /// The widget has no incremental refresh; rebuild it from scratch so create/rename/delete
-    /// show up without restarting the app. This collapses the tree back to the root.
-    fn refresh_tree(&mut self) {
-        if let Some(root) = &self.root {
-            self.tree =
-                Some(DirectoryTree::new(root.clone()).with_filter(DirectoryFilter::FilesAndFolders));
-        }
-    }
 
     /// Reloads open, unmodified tabs from disk, in case the AI sidebar just edited them.
     fn reload_open_tabs(&mut self) {
@@ -326,7 +318,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::ContextDelete => {
             if let Some(path) = state.context_target_path() {
                 state.delete_path(&path);
-                state.refresh_tree();
+                if let Some(parent) = path.parent() {
+                    task = refresh_dir_task(parent.to_path_buf());
+                }
             }
         }
         Message::ContextCopyPath => {
@@ -370,7 +364,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         {
                             tab.path = Some(new_path);
                         }
-                        state.refresh_tree();
+                        if let Some(parent) = old_path.parent() {
+                            task = refresh_dir_task(parent.to_path_buf());
+                        }
                     }
                 }
             }
@@ -391,7 +387,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         std::fs::write(target, "")
                     };
                     if result.is_ok() {
-                        state.refresh_tree();
+                        task = refresh_dir_task(dir);
                     }
                 }
             }
@@ -640,7 +636,10 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         text("No file open").into()
     };
 
-    column![tab_row, editor].height(Length::Fill).into()
+    column![tab_row, editor]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 fn subscription(_state: &State) -> Subscription<Message> {
@@ -690,6 +689,16 @@ fn load_ai_visible() -> bool {
         .and_then(|path| std::fs::read_to_string(path).ok())
         .map(|text| text.trim() == "true")
         .unwrap_or(false)
+}
+
+/// Forces DirectoryTree to rescan `dir` without disturbing the rest of the tree's expand
+/// state: a collapse+re-expand round trip is the widget's documented cache-invalidation
+/// trick, and it leaves `dir`'s own displayed expand state unchanged either way.
+fn refresh_dir_task(dir: PathBuf) -> Task<Message> {
+    Task::batch([
+        Task::done(Message::Tree(DirectoryTreeEvent::Toggled(dir.clone()))),
+        Task::done(Message::Tree(DirectoryTreeEvent::Toggled(dir))),
+    ])
 }
 
 fn confirm(title: &str, description: &str) -> bool {
