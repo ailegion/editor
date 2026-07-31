@@ -700,7 +700,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             .highlight_with::<TabHighlighter>(
                 TabHighlighterSettings {
                     inner: iced_highlighter::Settings {
-                        theme: highlighter::Theme::SolarizedDark,
+                        theme: highlighter_theme_for(&state.app_theme),
                         token: extension.to_string(),
                     },
                     generation: state.active_tab,
@@ -723,6 +723,19 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+/// `iced_highlighter::Theme` only has 5 fixed variants, none matching the app's 22
+/// named `iced::Theme`s one-to-one, so this maps by computed background brightness
+/// (light app theme -> light syntax theme, dark -> dark) rather than guessing per-name.
+fn highlighter_theme_for(theme: &iced::Theme) -> highlighter::Theme {
+    let bg = theme.palette().background;
+    let brightness = bg.r + bg.g + bg.b;
+    if brightness < 1.5 {
+        highlighter::Theme::SolarizedDark
+    } else {
+        highlighter::Theme::InspiredGitHub
+    }
 }
 
 fn subscription(_state: &State) -> Subscription<Message> {
