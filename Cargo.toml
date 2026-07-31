@@ -7,7 +7,7 @@ edition = "2024"
 agent-client-protocol = "2.0.0"
 iced = { version = "0.14.0", features = ["highlighter", "tokio"] }
 iced_aw = { version = "0.14.0", features = ["full"] }
-iced-swdir-tree = "0.9"
+iced-swdir-tree = { version = "0.9", features = ["icons"] }
 iced_core = "0.14.0"
 iced_highlighter = "0.14.0"
 rfd = "0.17.2"

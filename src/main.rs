@@ -697,6 +697,17 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             .unwrap_or("txt");
         text_editor(&tab.content)
             .on_action(Message::EditorAction)
+            .key_binding(|key_press| {
+                if key_press.modifiers.command()
+                    && key_press.key.as_ref() == keyboard::Key::Character("s")
+                {
+                    Some(text_editor::Binding::Custom(Message::FileAction(
+                        FileAction::Save,
+                    )))
+                } else {
+                    text_editor::Binding::from_key_press(key_press)
+                }
+            })
             .highlight_with::<TabHighlighter>(
                 TabHighlighterSettings {
                     inner: iced_highlighter::Settings {
@@ -843,5 +854,6 @@ pub fn main() -> iced::Result {
         .title("editor")
         .theme(|state: &State| state.app_theme.clone())
         .subscription(subscription)
+        .font(iced_swdir_tree::LUCIDE_FONT_BYTES)
         .run()
 }
