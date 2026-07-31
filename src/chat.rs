@@ -1,3 +1,5 @@
+use iced::widget::{button, column, container, row, scrollable, text, text_input};
+use iced::{Element, Length};
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -18,7 +20,7 @@ impl Role {
     }
 }
 
-struct Message {
+struct ChatMsg {
     role: Role,
     content: String,
 }
@@ -29,30 +31,23 @@ enum Event {
     Error(String),
 }
 
-#[derive(Default)]
-struct Provider {
+pub struct ChatState {
     base_url: String,
     api_key: String,
     model: String,
-}
-
-pub struct Chat {
-    provider: Provider,
-    messages: Vec<Message>,
+    messages: Vec<ChatMsg>,
     input: String,
     rx: Option<Receiver<Event>>,
     cancel: Option<Arc<AtomicBool>>,
     streaming: bool,
 }
 
-impl Default for Chat {
+impl Default for ChatState {
     fn default() -> Self {
         Self {
-            provider: Provider {
-                base_url: "https://api.openai.com/v1".to_string(),
-                api_key: String::new(),
-                model: String::new(),
-            },
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: String::new(),
+            model: String::new(),
             messages: Vec::new(),
             input: String::new(),
             rx: None,
@@ -62,7 +57,17 @@ impl Default for Chat {
     }
 }
 
-impl Chat {
+#[derive(Debug, Clone)]
+pub enum Message {
+    BaseUrlChanged(String),
+    ApiKeyChanged(String),
+    ModelChanged(String),
+    InputChanged(String),
+    Send,
+    Stop,
+}
+
+impl ChatState {
     pub fn poll(&mut self) {
         let Some(rx) = &self.rx else { return };
         let mut finished = false;
@@ -89,16 +94,16 @@ impl Chat {
         }
     }
 
-    fn send(&mut self, ctx: egui::Context) {
+    fn send(&mut self) {
         let text = std::mem::take(&mut self.input);
         if text.trim().is_empty() || self.streaming {
             return;
         }
-        self.messages.push(Message {
+        self.messages.push(ChatMsg {
             role: Role::User,
             content: text,
         });
-        self.messages.push(Message {
+        self.messages.push(ChatMsg {
             role: Role::Assistant,
             content: String::new(),
         });
@@ -108,9 +113,9 @@ impl Chat {
             .map(|m| (m.role.as_str(), m.content.clone()))
             .collect();
 
-        let base_url = self.provider.base_url.trim_end_matches('/').to_string();
-        let api_key = self.provider.api_key.clone();
-        let model = self.provider.model.clone();
+        let base_url = self.base_url.trim_end_matches('/').to_string();
+        let api_key = self.api_key.clone();
+        let model = self.model.clone();
 
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -119,7 +124,7 @@ impl Chat {
         self.streaming = true;
 
         std::thread::spawn(move || {
-            run_request(base_url, api_key, model, history, tx, cancel, ctx);
+            run_request(base_url, api_key, model, history, tx, cancel);
         });
     }
 
@@ -131,60 +136,58 @@ impl Chat {
         self.rx = None;
         self.cancel = None;
     }
+}
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Provider")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Base URL");
-                    ui.text_edit_singleline(&mut self.provider.base_url);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("API Key");
-                    ui.add(egui::TextEdit::singleline(&mut self.provider.api_key).password(true));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Model");
-                    ui.text_edit_singleline(&mut self.provider.model);
-                });
-            });
-
-        ui.separator();
-
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for message in &self.messages {
-                    let sender = match message.role {
-                        Role::User => "You",
-                        Role::Assistant => "AI",
-                    };
-                    ui.strong(sender);
-                    ui.label(&message.content);
-                    ui.add_space(6.0);
-                }
-            });
-
-        ui.separator();
-
-        ui.horizontal(|ui| {
-            let response = ui.add(egui::TextEdit::singleline(&mut self.input));
-            let enter_pressed = response.lost_focus()
-                && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter));
-
-            if self.streaming {
-                if ui.button("Stop").clicked() {
-                    self.stop();
-                }
-            } else if (ui.button("Send").clicked() || enter_pressed)
-                && !self.input.trim().is_empty()
-            {
-                let ctx = ui.ctx().clone();
-                self.send(ctx);
-            }
-        });
+pub fn update(state: &mut ChatState, message: Message) {
+    match message {
+        Message::BaseUrlChanged(text) => state.base_url = text,
+        Message::ApiKeyChanged(text) => state.api_key = text,
+        Message::ModelChanged(text) => state.model = text,
+        Message::InputChanged(text) => state.input = text,
+        Message::Send => state.send(),
+        Message::Stop => state.stop(),
     }
+}
+
+pub fn view(state: &ChatState) -> Element<'_, Message> {
+    let provider = column![
+        row![text("Base URL"), text_input("", &state.base_url).on_input(Message::BaseUrlChanged)]
+            .spacing(6),
+        row![
+            text("API Key"),
+            text_input("", &state.api_key)
+                .on_input(Message::ApiKeyChanged)
+                .secure(true)
+        ]
+        .spacing(6),
+        row![text("Model"), text_input("", &state.model).on_input(Message::ModelChanged)]
+            .spacing(6),
+    ]
+    .spacing(4);
+
+    let mut messages = column![].spacing(6);
+    for message in &state.messages {
+        let sender = match message.role {
+            Role::User => "You",
+            Role::Assistant => "AI",
+        };
+        messages = messages.push(column![text(sender), text(message.content.clone())]);
+    }
+    let messages = scrollable(messages).height(Length::Fill);
+
+    let input_row = row![
+        text_input("", &state.input).on_input(Message::InputChanged),
+        if state.streaming {
+            button(text("Stop")).on_press(Message::Stop)
+        } else {
+            button(text("Send")).on_press(Message::Send)
+        },
+    ]
+    .spacing(4);
+
+    container(column![provider, messages, input_row].spacing(8))
+        .height(Length::Fill)
+        .into()
 }
 
 fn run_request(
@@ -194,7 +197,6 @@ fn run_request(
     history: Vec<(&'static str, String)>,
     tx: mpsc::Sender<Event>,
     cancel: Arc<AtomicBool>,
-    ctx: egui::Context,
 ) {
     let messages: Vec<serde_json::Value> = history
         .iter()
@@ -217,7 +219,6 @@ fn run_request(
         Ok(response) => response,
         Err(err) => {
             let _ = tx.send(Event::Error(err.to_string()));
-            ctx.request_repaint();
             return;
         }
     };
@@ -237,10 +238,8 @@ fn run_request(
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
             if let Some(delta) = value["choices"][0]["delta"]["content"].as_str() {
                 let _ = tx.send(Event::Delta(delta.to_string()));
-                ctx.request_repaint();
             }
         }
     }
     let _ = tx.send(Event::Done);
-    ctx.request_repaint();
 }
