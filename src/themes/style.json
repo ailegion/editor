@@ -1,0 +1,9 @@
+{
+  "text_styles": {
+    "Small": { "size": 12.0, "family": "Proportional" },
+    "Body": { "size": 14.0, "family": "Proportional" },
+    "Monospace": { "size": 14.0, "family": "Monospace" },
+    "Button": { "size": 14.0, "family": "Proportional" },
+    "Heading": { "size": 18.0, "family": "Proportional" }
+  }
+}

@@ -11,7 +11,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "editor",
         eframe::NativeOptions::default(),
-        Box::new(|_cc| Ok(Box::new(App::new()))),
+        Box::new(|cc| {
+            let ui_style: egui::Style =
+                serde_json::from_str(include_str!("themes/style.json"))
+                    .expect("themes/style.json should parse as an egui::Style overlay");
+            cc.egui_ctx.all_styles_mut(|style| *style = ui_style.clone());
+            Ok(Box::new(App::new()))
+        }),
     )
 }
 
@@ -693,6 +699,7 @@ impl eframe::App for App {
 
         egui::Panel::top("top_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
                 ui.menu_button("File", |ui| {
                     if ui.button("Open File (Cmd+O)").clicked() {
                         self.open_file_dialog();
