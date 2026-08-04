@@ -1,4 +1,4 @@
-use iced::widget::{button, column, container, row, scrollable, text, text_input};
+use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use iced::{Element, Length};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -562,13 +562,16 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) {
 }
 
 pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
-    let mut top_bar = row![
+    let top_bar = row![
+        Space::new().width(Length::Fill),
         button(text("+")).on_press(Message::NewThread),
         button(text("...")).on_press(Message::ThreadMenuToggle),
     ]
-    .spacing(4);
+    .spacing(4)
+    .width(Length::Fill);
+    let mut header = column![top_bar].spacing(4);
     if state.thread_menu_open {
-        let mut menu = row![].spacing(4);
+        let mut menu = column![].spacing(4);
         for (i, thread) in state.threads.iter().enumerate() {
             let title = if thread.title.is_empty() {
                 "New thread".to_string()
@@ -577,7 +580,7 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
             };
             menu = menu.push(button(text(title)).on_press(Message::SwitchThread(i)));
         }
-        top_bar = top_bar.push(menu);
+        header = header.push(menu);
     }
     let _ = cwd;
 
@@ -653,7 +656,7 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
         .spacing(4),
     );
 
-    column![top_bar, messages, bottom].height(Length::Fill).into()
+    column![header, messages, bottom].height(Length::Fill).into()
 }
 
 fn threads_path(cwd: &Path) -> Option<PathBuf> {

@@ -109,6 +109,7 @@ enum AiMode {
 enum PaneKind {
     Sidebar,
     Main,
+    Ai,
 }
 
 #[derive(Debug, Clone)]
@@ -171,11 +172,23 @@ impl State {
         let tree = root
             .clone()
             .map(|p| DirectoryTree::new(p).with_filter(DirectoryFilter::FilesAndFolders));
+        let ai_visible = load_ai_visible();
+        let main_pane = pane_grid::Configuration::Pane(PaneKind::Main);
+        let main_and_ai = if ai_visible {
+            pane_grid::Configuration::Split {
+                axis: pane_grid::Axis::Vertical,
+                ratio: 0.75,
+                a: Box::new(main_pane),
+                b: Box::new(pane_grid::Configuration::Pane(PaneKind::Ai)),
+            }
+        } else {
+            main_pane
+        };
         let panes = pane_grid::State::with_configuration(pane_grid::Configuration::Split {
             axis: pane_grid::Axis::Vertical,
             ratio: 0.2,
             a: Box::new(pane_grid::Configuration::Pane(PaneKind::Sidebar)),
-            b: Box::new(pane_grid::Configuration::Pane(PaneKind::Main)),
+            b: Box::new(main_and_ai),
         });
         Self {
             root,
@@ -186,7 +199,7 @@ impl State {
             creating: None,
             app_theme: iced::Theme::Dark,
             panes,
-            ai_visible: load_ai_visible(),
+            ai_visible,
             ai_mode: AiMode::default(),
             chat: chat::ChatState::default(),
             acp: acp::AcpState::default(),
@@ -488,6 +501,29 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::AiToggle => {
             state.ai_visible = !state.ai_visible;
             save_ai_visible(state.ai_visible);
+            if state.ai_visible {
+                let main_pane = state
+                    .panes
+                    .iter()
+                    .find(|(_, kind)| **kind == PaneKind::Main)
+                    .map(|(pane, _)| *pane);
+                if let Some(main_pane) = main_pane {
+                    if let Some((_, split)) =
+                        state.panes.split(pane_grid::Axis::Vertical, main_pane, PaneKind::Ai)
+                    {
+                        state.panes.resize(split, 0.75);
+                    }
+                }
+            } else {
+                let ai_pane = state
+                    .panes
+                    .iter()
+                    .find(|(_, kind)| **kind == PaneKind::Ai)
+                    .map(|(pane, _)| *pane);
+                if let Some(ai_pane) = ai_pane {
+                    state.panes.close(ai_pane);
+                }
+            }
         }
         Message::AiModeSelected(mode) => state.ai_mode = mode,
         Message::Chat(msg) => chat::update(&mut state.chat, msg),
@@ -513,19 +549,11 @@ fn view(state: &State) -> Element<'_, Message> {
     let panes = PaneGrid::new(&state.panes, |_id, kind, _is_maximized| {
         let content: Element<'_, Message> = match kind {
             PaneKind::Sidebar => container(view_tree(state)).padding(8).into(),
-            PaneKind::Main => {
-                let editor = view_editor(state);
-                let mut body = row![editor].height(Length::Fill);
-                if state.ai_visible {
-                    body = body.push(
-                        container(view_ai_sidebar(state))
-                            .width(Length::Fixed(320.0))
-                            .height(Length::Fill)
-                            .padding(8),
-                    );
-                }
-                body.into()
-            }
+            PaneKind::Main => view_editor(state),
+            PaneKind::Ai => container(view_ai_sidebar(state))
+                .height(Length::Fill)
+                .padding(8)
+                .into(),
         };
         pane_grid::Content::new(content)
     })
