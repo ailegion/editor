@@ -1,10 +1,10 @@
 mod acp;
 mod chat;
+mod code_editor;
 
-use iced::highlighter;
 use iced::keyboard;
 use iced::widget::{
-    button, column, container, pane_grid, row, scrollable, text, text_editor, text_input, PaneGrid,
+    button, column, container, pane_grid, row, scrollable, text, text_input, PaneGrid,
 };
 use iced::{Element, Length, Subscription, Task};
 use iced_aw::context_menu::ContextMenu;
@@ -16,7 +16,8 @@ use std::time::Duration;
 
 struct Tab {
     path: Option<PathBuf>,
-    content: text_editor::Content,
+    content: code_editor::Buffer,
+    search: code_editor::search::SearchState,
     dirty: bool,
 }
 
@@ -34,48 +35,21 @@ impl Tab {
             name
         }
     }
+
+    fn extension(&self) -> String {
+        self.path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .unwrap_or("txt")
+            .to_string()
+    }
 }
 
-/// Wraps `iced_highlighter::Highlighter` to add a `generation` field to its `Settings`.
-///
-/// The widget only resets its highlighter when `Settings` compares unequal between
-/// renders. Two tabs with the same file extension produce identical `{theme, token}`
-/// settings, so switching between them leaves the previous tab's stale highlighter
-/// state in place. `generation` (the active tab index) forces the comparison to see
-/// a change on every tab switch, even when the extension is the same.
-struct TabHighlighter(iced_highlighter::Highlighter);
-
-#[derive(Clone, PartialEq)]
-struct TabHighlighterSettings {
-    inner: iced_highlighter::Settings,
-    generation: usize,
-}
-
-impl iced_core::text::Highlighter for TabHighlighter {
-    type Settings = TabHighlighterSettings;
-    type Highlight = <iced_highlighter::Highlighter as iced_core::text::Highlighter>::Highlight;
-    type Iterator<'a> =
-        <iced_highlighter::Highlighter as iced_core::text::Highlighter>::Iterator<'a>;
-
-    fn new(settings: &Self::Settings) -> Self {
-        TabHighlighter(iced_highlighter::Highlighter::new(&settings.inner))
-    }
-
-    fn update(&mut self, new_settings: &Self::Settings) {
-        self.0.update(&new_settings.inner);
-    }
-
-    fn change_line(&mut self, line: usize) {
-        self.0.change_line(line);
-    }
-
-    fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
-        self.0.highlight_line(line)
-    }
-
-    fn current_line(&self) -> usize {
-        self.0.current_line()
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Tree,
+    Editor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,7 +88,8 @@ enum PaneKind {
 
 #[derive(Debug, Clone)]
 enum Message {
-    EditorAction(text_editor::Action),
+    EditorAction(cosmic_text::Action),
+    Search(code_editor::search::Message),
     TabSelected(usize),
     TabClosed(usize),
 
@@ -151,12 +126,14 @@ struct State {
     root: Option<PathBuf>,
     tabs: Vec<Tab>,
     active_tab: usize,
+    focus: Focus,
 
     tree: Option<DirectoryTree>,
     renaming: Option<(PathBuf, String)>,
     creating: Option<(PathBuf, bool, String)>,
 
     app_theme: iced::Theme,
+    highlighter: code_editor::Highlighter,
 
     panes: pane_grid::State<PaneKind>,
 
@@ -173,6 +150,7 @@ impl State {
             .clone()
             .map(|p| DirectoryTree::new(p).with_filter(DirectoryFilter::FilesAndFolders));
         let ai_visible = load_ai_visible();
+        let app_theme = load_app_theme();
         let main_pane = pane_grid::Configuration::Pane(PaneKind::Main);
         let main_and_ai = if ai_visible {
             pane_grid::Configuration::Split {
@@ -194,10 +172,12 @@ impl State {
             root,
             tabs: Vec::new(),
             active_tab: 0,
+            focus: Focus::Editor,
             tree,
             renaming: None,
             creating: None,
-            app_theme: iced::Theme::Dark,
+            app_theme,
+            highlighter: code_editor::Highlighter::new(),
             panes,
             ai_visible,
             ai_mode: AiMode::default(),
@@ -239,7 +219,9 @@ impl State {
             let Some(path) = &tab.path else { continue };
             if let Ok(text) = std::fs::read_to_string(path) {
                 if text != tab.content.text() {
-                    tab.content = text_editor::Content::with_text(&text);
+                    let extension = tab.extension();
+                    tab.content = code_editor::Buffer::new(&text, code_editor::default_metrics());
+                    tab.content.highlight(&self.highlighter, &extension, &self.app_theme);
                 }
             }
         }
@@ -261,12 +243,21 @@ impl State {
         let Ok(text) = std::fs::read_to_string(&path) else {
             return;
         };
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("txt")
+            .to_string();
+        let mut content = code_editor::Buffer::new(&text, code_editor::default_metrics());
+        content.highlight(&self.highlighter, &extension, &self.app_theme);
         self.tabs.push(Tab {
             path: Some(path),
-            content: text_editor::Content::with_text(&text),
+            content,
+            search: code_editor::search::SearchState::default(),
             dirty: false,
         });
         self.active_tab = self.tabs.len() - 1;
+        self.focus = Focus::Editor;
     }
 
     fn close_tab(&mut self, index: usize) {
@@ -300,6 +291,32 @@ impl State {
         }
     }
 
+    /// Routes a key press to the active tab's editor. Returns whether it was handled.
+    fn handle_editor_key(&mut self, key: &keyboard::Key, modifiers: keyboard::Modifiers) -> bool {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return false;
+        };
+        let before = tab.content.undo_count();
+        let handled = code_editor::input::handle_key(&mut tab.content, key, modifiers);
+        self.mark_edited_if_changed(before);
+        handled
+    }
+
+    /// Marks the active tab dirty and re-runs syntax highlighting if `before` (an
+    /// `undo_count()` taken just before some editor operation) no longer matches -- i.e. the
+    /// operation actually changed the document, as opposed to just moving the cursor.
+    fn mark_edited_if_changed(&mut self, before: usize) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        if tab.content.undo_count() == before {
+            return;
+        }
+        tab.dirty = true;
+        let extension = tab.extension();
+        tab.content.highlight(&self.highlighter, &extension, &self.app_theme);
+    }
+
     fn delete_path(&mut self, path: &Path) {
         if !confirm(
             "Delete",
@@ -324,12 +341,27 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
     let mut task = Task::none();
     match message {
         Message::EditorAction(action) => {
+            state.focus = Focus::Editor;
+            let before = state
+                .tabs
+                .get(state.active_tab)
+                .map(|t| t.content.undo_count())
+                .unwrap_or(0);
             if let Some(tab) = state.tabs.get_mut(state.active_tab) {
-                if action.is_edit() {
-                    tab.dirty = true;
-                }
                 tab.content.perform(action);
             }
+            state.mark_edited_if_changed(before);
+        }
+        Message::Search(msg) => {
+            let before = state
+                .tabs
+                .get(state.active_tab)
+                .map(|t| t.content.undo_count())
+                .unwrap_or(0);
+            if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+                code_editor::search::update(&mut tab.search, &mut tab.content, msg);
+            }
+            state.mark_edited_if_changed(before);
         }
         Message::TabSelected(i) => state.active_tab = i,
         Message::TabClosed(i) => state.close_tab(i),
@@ -360,6 +392,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         },
 
         Message::Tree(event) => {
+            state.focus = Focus::Tree;
             if let DirectoryTreeEvent::Selected(path, is_dir, _) = &event {
                 if !*is_dir {
                     state.open_path(path.clone());
@@ -467,7 +500,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::CreateCancel => state.creating = None,
 
-        Message::AppThemeSelected(theme) => state.app_theme = theme,
+        Message::AppThemeSelected(theme) => {
+            save_app_theme(&theme);
+            state.app_theme = theme;
+            for tab in &mut state.tabs {
+                let extension = tab.extension();
+                tab.content.highlight(&state.highlighter, &extension, &state.app_theme);
+            }
+        }
         Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
             state.panes.resize(split, ratio);
         }
@@ -481,10 +521,31 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             state.open_path(path);
                         }
                     }
-                    _ => {}
+                    keyboard::Key::Character("f") => {
+                        if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+                            code_editor::search::update(
+                                &mut tab.search,
+                                &mut tab.content,
+                                code_editor::search::Message::Toggle,
+                            );
+                        }
+                    }
+                    // Other command combos (undo/redo, ...) are the active editor's to handle.
+                    _ => {
+                        state.handle_editor_key(&key, modifiers);
+                    }
                 }
-            } else if let Some(tree) = &state.tree {
-                if let Some(event) = tree.handle_key(&key, modifiers) {
+            } else {
+                // No per-widget focus system here (see `input::handle_key`'s docs), so route
+                // by `state.focus`: the tree when it's the last thing the user interacted
+                // with, the active tab's editor otherwise.
+                let tree_event = if state.focus == Focus::Tree {
+                    state.tree.as_ref().and_then(|tree| tree.handle_key(&key, modifiers))
+                } else {
+                    None
+                };
+
+                if let Some(event) = tree_event {
                     if let DirectoryTreeEvent::Selected(path, is_dir, _) = &event {
                         if !*is_dir {
                             state.open_path(path.clone());
@@ -493,6 +554,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     if let Some(tree) = &mut state.tree {
                         task = tree.update(event).map(Message::Tree);
                     }
+                } else if state.focus == Focus::Editor {
+                    state.handle_editor_key(&key, modifiers);
                 }
             }
         }
@@ -632,7 +695,9 @@ fn view_top_bar(_state: &State) -> Element<'_, Message> {
     let mb = menu_bar!(
         (file_menu_button, menu_tpl(file_items)),
         (theme_menu_button, menu_tpl(theme_items))
-    );
+    )
+    .close_on_background_click(true)
+    .close_on_background_click_global(true);
 
     row![mb].padding(4).into()
 }
@@ -716,41 +781,17 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         );
     }
 
-    let editor: Element<'_, Message> = if let Some(tab) = state.tabs.get(state.active_tab) {
-        let extension = tab
-            .path
-            .as_ref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .unwrap_or("txt");
-        text_editor(&tab.content)
-            .on_action(Message::EditorAction)
-            .key_binding(|key_press| {
-                if key_press.modifiers.command()
-                    && key_press.key.as_ref() == keyboard::Key::Character("s")
-                {
-                    Some(text_editor::Binding::Custom(Message::FileAction(
-                        FileAction::Save,
-                    )))
-                } else {
-                    text_editor::Binding::from_key_press(key_press)
-                }
-            })
-            .highlight_with::<TabHighlighter>(
-                TabHighlighterSettings {
-                    inner: iced_highlighter::Settings {
-                        theme: highlighter_theme_for(&state.app_theme),
-                        token: extension.to_string(),
-                    },
-                    generation: state.active_tab,
-                },
-                |highlight, _theme| highlight.to_format(),
-            )
-            .height(Length::Fill)
-            .into()
+    let mut editor_column = column![];
+
+    if let Some(tab) = state.tabs.get(state.active_tab) {
+        if tab.search.visible {
+            editor_column = editor_column.push(code_editor::search::view(&tab.search).map(Message::Search));
+        }
+        editor_column = editor_column
+            .push(code_editor::code_editor(&tab.content, &state.app_theme, Message::EditorAction));
     } else {
-        text("No file open").into()
-    };
+        editor_column = editor_column.push(text("No file open"));
+    }
 
     let tab_strip = scrollable(tab_row)
         .direction(scrollable::Direction::Horizontal(
@@ -758,23 +799,10 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         ))
         .width(Length::Fill);
 
-    column![tab_strip, editor]
+    column![tab_strip, editor_column.height(Length::Fill)]
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
-}
-
-/// `iced_highlighter::Theme` only has 5 fixed variants, none matching the app's 22
-/// named `iced::Theme`s one-to-one, so this maps by computed background brightness
-/// (light app theme -> light syntax theme, dark -> dark) rather than guessing per-name.
-fn highlighter_theme_for(theme: &iced::Theme) -> highlighter::Theme {
-    let bg = theme.palette().background;
-    let brightness = bg.r + bg.g + bg.b;
-    if brightness < 1.5 {
-        highlighter::Theme::SolarizedDark
-    } else {
-        highlighter::Theme::InspiredGitHub
-    }
 }
 
 fn subscription(_state: &State) -> Subscription<Message> {
@@ -788,9 +816,18 @@ fn subscription(_state: &State) -> Subscription<Message> {
     Subscription::batch([keys, tick])
 }
 
+/// `HOME` is unset on native Windows launches outside Git Bash/pwsh7, so use
+/// `USERPROFILE` there instead.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "windows") {
+        std::env::var_os("USERPROFILE").map(PathBuf::from)
+    } else {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
 fn config_path(name: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config").join("editor").join(name))
+    Some(home_dir()?.join(".config").join("editor").join(name))
 }
 
 fn last_project_path() -> Option<PathBuf> {
@@ -809,6 +846,24 @@ fn load_last_project() -> Option<PathBuf> {
     let text = std::fs::read_to_string(last_project_path()?).ok()?;
     let path = PathBuf::from(text.trim());
     path.is_dir().then_some(path)
+}
+
+fn save_app_theme(theme: &iced::Theme) {
+    let Some(path) = config_path("app_theme") else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, theme.to_string());
+}
+
+fn load_app_theme() -> iced::Theme {
+    config_path("app_theme")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| {
+            let name = text.trim();
+            iced::Theme::ALL.iter().find(|t| t.to_string() == name).cloned()
+        })
+        .unwrap_or(iced::Theme::Dark)
 }
 
 fn save_ai_visible(visible: bool) {

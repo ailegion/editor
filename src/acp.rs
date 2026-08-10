@@ -661,12 +661,11 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
 
 fn threads_path(cwd: &Path) -> Option<PathBuf> {
     use std::hash::{Hash, Hasher};
-    let home = std::env::var_os("HOME")?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     cwd.hash(&mut hasher);
     let hash = hasher.finish();
     Some(
-        PathBuf::from(home)
+        crate::home_dir()?
             .join(".config")
             .join("editor")
             .join("acp_threads")
