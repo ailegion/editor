@@ -3,10 +3,15 @@ use iced::Color;
 pub const FONT_SIZE: f32 = 14.0;
 pub const LINE_HEIGHT: f32 = 20.0;
 
-/// `Metrics` for a freshly created [`super::Buffer`], matching [`Style`]'s font size/line
-/// height so the two stay in sync.
-pub fn default_metrics() -> cosmic_text::Metrics {
-    cosmic_text::Metrics::new(FONT_SIZE, LINE_HEIGHT)
+pub const ZOOM_DEFAULT: f32 = 1.0;
+pub const ZOOM_MIN: f32 = 0.5;
+pub const ZOOM_MAX: f32 = 2.5;
+pub const ZOOM_STEP: f32 = 0.1;
+
+/// `Metrics` for a [`super::Buffer`] at the given zoom level, matching [`Style`]'s font
+/// size/line height (see `Style::from_theme`) so the two stay in sync.
+pub fn metrics_for_zoom(zoom: f32) -> cosmic_text::Metrics {
+    cosmic_text::Metrics::new(FONT_SIZE * zoom, LINE_HEIGHT * zoom)
 }
 
 /// Visual style for [`super::CodeEditor`], derived from the app-wide [`iced::Theme`].
@@ -23,7 +28,7 @@ pub struct Style {
 }
 
 impl Style {
-    pub fn from_theme(theme: &iced::Theme) -> Self {
+    pub fn from_theme(theme: &iced::Theme, zoom: f32) -> Self {
         let palette = theme.extended_palette();
         Self {
             text_color: palette.background.base.text,
@@ -33,8 +38,8 @@ impl Style {
             current_line_color: palette.background.weak.color,
             gutter_background: palette.background.weak.color,
             gutter_text_color: palette.background.strong.text,
-            font_size: FONT_SIZE,
-            line_height: LINE_HEIGHT,
+            font_size: FONT_SIZE * zoom,
+            line_height: LINE_HEIGHT * zoom,
         }
     }
 

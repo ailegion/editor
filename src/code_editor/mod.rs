@@ -15,7 +15,7 @@ mod theme;
 
 pub use buffer::Buffer;
 pub use highlight::Highlighter;
-pub use theme::{default_metrics, Style};
+pub use theme::{metrics_for_zoom, Style, ZOOM_DEFAULT, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP};
 
 use iced::mouse;
 use iced::widget::canvas::{self, Canvas};
@@ -33,10 +33,10 @@ pub struct CodeEditor<'a, Message> {
 }
 
 impl<'a, Message> CodeEditor<'a, Message> {
-    pub fn new(content: &'a Buffer, theme: &Theme) -> Self {
+    pub fn new(content: &'a Buffer, theme: &Theme, zoom: f32) -> Self {
         Self {
             content,
-            style: Style::from_theme(theme),
+            style: Style::from_theme(theme, zoom),
             on_action: None,
         }
     }
@@ -146,12 +146,13 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
 pub fn code_editor<'a, Message>(
     content: &'a Buffer,
     theme: &Theme,
+    zoom: f32,
     on_action: impl Fn(cosmic_text::Action) -> Message + 'a,
 ) -> Element<'a, Message>
 where
     Message: 'a,
 {
-    Canvas::new(CodeEditor::new(content, theme).on_action(on_action))
+    Canvas::new(CodeEditor::new(content, theme, zoom).on_action(on_action))
         .width(Length::Fill)
         .height(Length::Fill)
         .into()

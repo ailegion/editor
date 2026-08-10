@@ -49,6 +49,13 @@ impl Buffer {
         self.sync();
     }
 
+    /// Applies a new font size/line height (e.g. from a zoom change), re-shaping and
+    /// re-syncing cached cursor/selection pixel positions to match.
+    pub fn set_metrics(&mut self, metrics: Metrics) {
+        self.inner.set_metrics(&mut self.font_system, metrics);
+        self.sync();
+    }
+
     pub fn text(&self) -> String {
         self.inner
             .lines

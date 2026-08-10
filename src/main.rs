@@ -88,6 +88,24 @@ impl std::fmt::Display for EditAction {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewAction {
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+}
+
+impl std::fmt::Display for ViewAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            ViewAction::ZoomIn => "Zoom In (Cmd+=)",
+            ViewAction::ZoomOut => "Zoom Out (Cmd+-)",
+            ViewAction::ZoomReset => "Reset Zoom (Cmd+0)",
+        };
+        write!(f, "{label}")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 enum AiMode {
     #[default]
@@ -126,6 +144,7 @@ enum Message {
 
     FileAction(FileAction),
     EditAction(EditAction),
+    ViewAction(ViewAction),
     AppThemeSelected(iced::Theme),
     PaneResized(pane_grid::ResizeEvent),
 
@@ -151,6 +170,7 @@ struct State {
 
     app_theme: iced::Theme,
     highlighter: code_editor::Highlighter,
+    zoom: f32,
 
     panes: pane_grid::State<PaneKind>,
 
@@ -168,6 +188,7 @@ impl State {
             .map(|p| DirectoryTree::new(p).with_filter(DirectoryFilter::FilesAndFolders));
         let ai_visible = load_ai_visible();
         let app_theme = load_app_theme();
+        let zoom = load_zoom();
         let main_pane = pane_grid::Configuration::Pane(PaneKind::Main);
         let main_and_ai = if ai_visible {
             pane_grid::Configuration::Split {
@@ -195,6 +216,7 @@ impl State {
             creating: None,
             app_theme,
             highlighter: code_editor::Highlighter::new(),
+            zoom,
             panes,
             ai_visible,
             ai_mode: AiMode::default(),
@@ -237,7 +259,8 @@ impl State {
             if let Ok(text) = std::fs::read_to_string(path) {
                 if text != tab.content.text() {
                     let extension = tab.extension();
-                    tab.content = code_editor::Buffer::new(&text, code_editor::default_metrics());
+                    tab.content =
+                        code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
                     tab.content.highlight(&self.highlighter, &extension, &self.app_theme);
                 }
             }
@@ -265,7 +288,7 @@ impl State {
             .and_then(|e| e.to_str())
             .unwrap_or("txt")
             .to_string();
-        let mut content = code_editor::Buffer::new(&text, code_editor::default_metrics());
+        let mut content = code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
         content.highlight(&self.highlighter, &extension, &self.app_theme);
         self.tabs.push(Tab {
             path: Some(path),
@@ -331,6 +354,21 @@ impl State {
         tab.dirty = true;
         let extension = tab.extension();
         tab.content.highlight(&self.highlighter, &extension, &self.app_theme);
+    }
+
+    /// Applies `action` to `self.zoom`, then re-shapes every open tab's buffer at the new
+    /// font size/line height and persists the level for next launch.
+    fn apply_zoom(&mut self, action: ViewAction) {
+        self.zoom = match action {
+            ViewAction::ZoomIn => (self.zoom + code_editor::ZOOM_STEP).min(code_editor::ZOOM_MAX),
+            ViewAction::ZoomOut => (self.zoom - code_editor::ZOOM_STEP).max(code_editor::ZOOM_MIN),
+            ViewAction::ZoomReset => code_editor::ZOOM_DEFAULT,
+        };
+        let metrics = code_editor::metrics_for_zoom(self.zoom);
+        for tab in &mut self.tabs {
+            tab.content.set_metrics(metrics);
+        }
+        save_zoom(self.zoom);
     }
 
     fn delete_path(&mut self, path: &Path) {
@@ -422,6 +460,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             state.mark_edited_if_changed(before);
         }
+
+        Message::ViewAction(action) => state.apply_zoom(action),
 
         Message::Tree(event) => {
             state.focus = Focus::Tree;
@@ -562,6 +602,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                                 code_editor::search::Message::Toggle,
                             );
                         }
+                    }
+                    // "+" covers Shift+= on layouts where that's how a plus sign is typed.
+                    keyboard::Key::Character("=") | keyboard::Key::Character("+") => {
+                        state.apply_zoom(ViewAction::ZoomIn);
+                    }
+                    keyboard::Key::Character("-") => {
+                        state.apply_zoom(ViewAction::ZoomOut);
+                    }
+                    keyboard::Key::Character("0") => {
+                        state.apply_zoom(ViewAction::ZoomReset);
                     }
                     // Other command combos (undo/redo, ...) are the active editor's to handle.
                     _ => {
@@ -792,6 +842,22 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
         )),
     );
 
+    let view_menu_button = menu_button("View".to_string(), Message::Noop).width(Length::Shrink);
+    let view_items = menu_items!(
+        (menu_button(
+            ViewAction::ZoomIn.to_string(),
+            Message::ViewAction(ViewAction::ZoomIn)
+        )),
+        (menu_button(
+            ViewAction::ZoomOut.to_string(),
+            Message::ViewAction(ViewAction::ZoomOut)
+        )),
+        (menu_button(
+            ViewAction::ZoomReset.to_string(),
+            Message::ViewAction(ViewAction::ZoomReset)
+        )),
+    );
+
     let theme_menu_button = menu_button("Theme".to_string(), Message::Noop).width(Length::Shrink);
     let theme_items: Vec<_> = iced::Theme::ALL
         .iter()
@@ -801,6 +867,7 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
     let mb = menu_bar!(
         (file_menu_button, menu_tpl(file_items)),
         (edit_menu_button, menu_tpl(edit_items)),
+        (view_menu_button, menu_tpl(view_items)),
         (theme_menu_button, menu_tpl(theme_items))
     )
     .close_on_background_click(true)
@@ -918,7 +985,12 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             editor_column = editor_column.push(code_editor::search::view(&tab.search).map(Message::Search));
         }
         editor_column = editor_column
-            .push(code_editor::code_editor(&tab.content, &state.app_theme, Message::EditorAction));
+            .push(code_editor::code_editor(
+                &tab.content,
+                &state.app_theme,
+                state.zoom,
+                Message::EditorAction,
+            ));
     } else {
         editor_column = editor_column.push(text("No file open"));
     }
@@ -994,6 +1066,22 @@ fn load_app_theme() -> iced::Theme {
             iced::Theme::ALL.iter().find(|t| t.to_string() == name).cloned()
         })
         .unwrap_or(iced::Theme::Dark)
+}
+
+fn save_zoom(zoom: f32) {
+    let Some(path) = config_path("zoom") else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, zoom.to_string());
+}
+
+fn load_zoom() -> f32 {
+    config_path("zoom")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| text.trim().parse::<f32>().ok())
+        .map(|zoom| zoom.clamp(code_editor::ZOOM_MIN, code_editor::ZOOM_MAX))
+        .unwrap_or(code_editor::ZOOM_DEFAULT)
 }
 
 fn save_ai_visible(visible: bool) {
