@@ -86,6 +86,11 @@ pub fn handle_key(buffer: &mut Buffer, key: &Key, modifiers: Modifiers) -> bool 
             buffer.perform(Action::Escape);
             true
         }
+        // iced reports the spacebar as `Named::Space`, not `Character(" ")`.
+        Key::Named(keyboard::key::Named::Space) => {
+            buffer.perform(Action::Insert(' '));
+            true
+        }
         Key::Character(c) => match c.chars().next() {
             Some(ch) => {
                 buffer.perform(Action::Insert(ch));

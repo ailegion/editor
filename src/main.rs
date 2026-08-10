@@ -4,7 +4,7 @@ mod code_editor;
 
 use iced::keyboard;
 use iced::widget::{
-    button, column, container, pane_grid, row, scrollable, text, text_input, PaneGrid,
+    button, column, container, pane_grid, row, scrollable, text, text_input, PaneGrid, Space,
 };
 use iced::{Element, Length, Subscription, Task};
 use iced_aw::context_menu::ContextMenu;
@@ -72,6 +72,22 @@ impl std::fmt::Display for FileAction {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditAction {
+    Undo,
+    Redo,
+}
+
+impl std::fmt::Display for EditAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            EditAction::Undo => "Undo (Cmd+Z)",
+            EditAction::Redo => "Redo (Cmd+Shift+Z)",
+        };
+        write!(f, "{label}")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 enum AiMode {
     #[default]
@@ -109,6 +125,7 @@ enum Message {
     CreateCancel,
 
     FileAction(FileAction),
+    EditAction(EditAction),
     AppThemeSelected(iced::Theme),
     PaneResized(pane_grid::ResizeEvent),
 
@@ -257,7 +274,6 @@ impl State {
             dirty: false,
         });
         self.active_tab = self.tabs.len() - 1;
-        self.focus = Focus::Editor;
     }
 
     fn close_tab(&mut self, index: usize) {
@@ -370,6 +386,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             FileAction::OpenFile => {
                 if let Some(path) = rfd::FileDialog::new().pick_file() {
                     state.open_path(path);
+                    state.focus = Focus::Editor;
                 }
             }
             FileAction::OpenFolder => {
@@ -390,6 +407,21 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             FileAction::Save => state.save(),
         },
+
+        Message::EditAction(action) => {
+            let before = state
+                .tabs
+                .get(state.active_tab)
+                .map(|t| t.content.undo_count())
+                .unwrap_or(0);
+            if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+                match action {
+                    EditAction::Undo => tab.content.undo(),
+                    EditAction::Redo => tab.content.redo(),
+                }
+            }
+            state.mark_edited_if_changed(before);
+        }
 
         Message::Tree(event) => {
             state.focus = Focus::Tree;
@@ -519,6 +551,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     keyboard::Key::Character("o") => {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
                             state.open_path(path);
+                            state.focus = Focus::Editor;
                         }
                     }
                     keyboard::Key::Character("f") => {
@@ -641,7 +674,64 @@ fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
     column![mode_row, panel].height(Length::Fill).into()
 }
 
+/// Transparent-background button style, so a title + close button pair placed inside a
+/// pill-shaped `container` (see `view_editor`'s tab strip) reads as one merged tab rather
+/// than two separate button-shaped elements.
+fn flat_button_style(theme: &iced::Theme, status: iced::widget::button::Status) -> iced::widget::button::Style {
+    use iced::widget::button::{Status, Style};
+
+    let palette = theme.extended_palette();
+    let base = Style {
+        text_color: palette.background.base.text,
+        border: iced::Border::default().rounded(4.0),
+        ..Style::default()
+    };
+    match status {
+        Status::Active | Status::Disabled => base.with_background(iced::Color::TRANSPARENT),
+        Status::Hovered => base.with_background(palette.background.strong.color),
+        Status::Pressed => base.with_background(palette.primary.strong.color),
+    }
+}
+
+/// Text-only tab title style: no background at rest (even when active -- the underline in
+/// `view_editor` carries that signal), a subtle highlight on hover, dimmer text for inactive
+/// tabs so the active one reads clearly without needing a button-like fill.
+fn tab_button_style(
+    theme: &iced::Theme,
+    status: iced::widget::button::Status,
+    is_active: bool,
+) -> iced::widget::button::Style {
+    use iced::widget::button::{Status, Style};
+
+    let palette = theme.extended_palette();
+    let text_color = if is_active {
+        palette.background.base.text
+    } else {
+        iced::Color {
+            a: palette.background.base.text.a * 0.6,
+            ..palette.background.base.text
+        }
+    };
+    let base = Style {
+        text_color,
+        border: iced::Border::default().rounded(4.0),
+        ..Style::default()
+    };
+    match status {
+        Status::Active | Status::Disabled => base.with_background(iced::Color::TRANSPARENT),
+        Status::Hovered => base.with_background(palette.background.weak.color),
+        Status::Pressed => base.with_background(palette.background.strong.color),
+    }
+}
+
 fn menu_button<'a>(label: String, msg: Message) -> iced::widget::button::Button<'a, Message> {
+    menu_button_maybe(label, Some(msg))
+}
+
+/// Like `menu_button`, but `None` leaves the button with no `on_press`, which iced renders
+/// as disabled (greyed out, non-interactive) -- used for Undo/Redo when there's nothing to
+/// undo/redo.
+fn menu_button_maybe<'a>(label: String, msg: Option<Message>) -> iced::widget::button::Button<'a, Message> {
     button(text(label))
         .width(Length::Fill)
         .padding([4, 8])
@@ -660,10 +750,10 @@ fn menu_button<'a>(label: String, msg: Message) -> iced::widget::button::Button<
                 Status::Pressed => base.with_background(palette.primary.strong.color),
             }
         })
-        .on_press(msg)
+        .on_press_maybe(msg)
 }
 
-fn view_top_bar(_state: &State) -> Element<'_, Message> {
+fn view_top_bar(state: &State) -> Element<'_, Message> {
     let menu_tpl = |items| Menu::new(items).width(200.0).offset(4.0).spacing(2.0);
 
     let file_menu_button = menu_button("File".to_string(), Message::Noop).width(Length::Shrink);
@@ -686,6 +776,22 @@ fn view_top_bar(_state: &State) -> Element<'_, Message> {
         )),
     );
 
+    let active_content = state.tabs.get(state.active_tab).map(|t| &t.content);
+    let can_undo = active_content.is_some_and(|c| c.can_undo());
+    let can_redo = active_content.is_some_and(|c| c.can_redo());
+
+    let edit_menu_button = menu_button("Edit".to_string(), Message::Noop).width(Length::Shrink);
+    let edit_items = menu_items!(
+        (menu_button_maybe(
+            EditAction::Undo.to_string(),
+            can_undo.then_some(Message::EditAction(EditAction::Undo)),
+        )),
+        (menu_button_maybe(
+            EditAction::Redo.to_string(),
+            can_redo.then_some(Message::EditAction(EditAction::Redo)),
+        )),
+    );
+
     let theme_menu_button = menu_button("Theme".to_string(), Message::Noop).width(Length::Shrink);
     let theme_items: Vec<_> = iced::Theme::ALL
         .iter()
@@ -694,6 +800,7 @@ fn view_top_bar(_state: &State) -> Element<'_, Message> {
 
     let mb = menu_bar!(
         (file_menu_button, menu_tpl(file_items)),
+        (edit_menu_button, menu_tpl(edit_items)),
         (theme_menu_button, menu_tpl(theme_items))
     )
     .close_on_background_click(true)
@@ -770,15 +877,38 @@ fn view_tree(state: &State) -> Element<'_, Message> {
 }
 
 fn view_editor(state: &State) -> Element<'_, Message> {
-    let mut tab_row = row![].spacing(4).padding(4);
+    let mut tab_row = row![].spacing(2).padding([4, 4]);
     for (i, tab) in state.tabs.iter().enumerate() {
-        tab_row = tab_row.push(
-            row![
-                button(text(tab.title())).on_press(Message::TabSelected(i)),
-                button(text("x")).on_press(Message::TabClosed(i)),
-            ]
-            .spacing(2),
-        );
+        let is_active = i == state.active_tab;
+        let tab_title = row![
+            button(text(tab.title()))
+                .padding([4, 4])
+                .style(move |theme, status| tab_button_style(theme, status, is_active))
+                .on_press(Message::TabSelected(i)),
+            button(text("x").size(12))
+                .padding([2, 6])
+                .style(flat_button_style)
+                .on_press(Message::TabClosed(i)),
+        ]
+        .spacing(2)
+        .align_y(iced::Alignment::Center);
+
+        // A thin underline (rather than a filled pill) marks the active tab, so tabs read
+        // as flat text labels instead of buttons.
+        let underline = container(Space::new().width(Length::Fill).height(2))
+            .style(move |theme: &iced::Theme| iced::widget::container::Style {
+                background: Some(
+                    if is_active {
+                        theme.extended_palette().primary.base.color
+                    } else {
+                        iced::Color::TRANSPARENT
+                    }
+                    .into(),
+                ),
+                ..iced::widget::container::Style::default()
+            });
+
+        tab_row = tab_row.push(column![tab_title, underline].spacing(2));
     }
 
     let mut editor_column = column![];
