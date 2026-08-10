@@ -1,6 +1,7 @@
 mod acp;
 mod chat;
 mod code_editor;
+mod project_search;
 
 use iced::keyboard;
 use iced::widget::{
@@ -50,6 +51,13 @@ impl Tab {
 enum Focus {
     Tree,
     Editor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SidebarMode {
+    #[default]
+    Tree,
+    ProjectSearch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +132,8 @@ enum PaneKind {
 enum Message {
     EditorAction(cosmic_text::Action),
     Search(code_editor::search::Message),
+    ProjectSearch(project_search::Message),
+    ToggleProjectSearch,
     TabSelected(usize),
     TabClosed(usize),
 
@@ -167,6 +177,8 @@ struct State {
     tree: Option<DirectoryTree>,
     renaming: Option<(PathBuf, String)>,
     creating: Option<(PathBuf, bool, String)>,
+    sidebar_mode: SidebarMode,
+    project_search: project_search::SearchState,
 
     app_theme: iced::Theme,
     highlighter: code_editor::Highlighter,
@@ -214,6 +226,8 @@ impl State {
             tree,
             renaming: None,
             creating: None,
+            sidebar_mode: SidebarMode::default(),
+            project_search: project_search::SearchState::default(),
             app_theme,
             highlighter: code_editor::Highlighter::new(),
             zoom,
@@ -417,6 +431,25 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             state.mark_edited_if_changed(before);
         }
+        Message::ProjectSearch(msg) => {
+            let root = state.root.clone();
+            if let Some((path, line)) = project_search::update(&mut state.project_search, msg, root.as_deref()) {
+                state.open_path(path);
+                state.focus = Focus::Editor;
+                if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+                    tab.content
+                        .perform(cosmic_text::Action::Motion(cosmic_text::Motion::GotoLine(
+                            line.saturating_sub(1),
+                        )));
+                }
+            }
+        }
+        Message::ToggleProjectSearch => {
+            state.sidebar_mode = match state.sidebar_mode {
+                SidebarMode::Tree => SidebarMode::ProjectSearch,
+                SidebarMode::ProjectSearch => SidebarMode::Tree,
+            };
+        }
         Message::TabSelected(i) => state.active_tab = i,
         Message::TabClosed(i) => state.close_tab(i),
 
@@ -594,6 +627,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             state.focus = Focus::Editor;
                         }
                     }
+                    // Checked before the plain "f" arm below: Shift+F usually reports as
+                    // character "F", but match on either case defensively.
+                    keyboard::Key::Character(c)
+                        if modifiers.shift() && c.eq_ignore_ascii_case("f") =>
+                    {
+                        state.sidebar_mode = match state.sidebar_mode {
+                            SidebarMode::Tree => SidebarMode::ProjectSearch,
+                            SidebarMode::ProjectSearch => SidebarMode::Tree,
+                        };
+                    }
                     keyboard::Key::Character("f") => {
                         if let Some(tab) = state.tabs.get_mut(state.active_tab) {
                             code_editor::search::update(
@@ -618,6 +661,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         state.handle_editor_key(&key, modifiers);
                     }
                 }
+            } else if key.as_ref() == keyboard::Key::Named(keyboard::key::Named::Escape)
+                && state.sidebar_mode == SidebarMode::ProjectSearch
+            {
+                // The global key subscription fires regardless of which widget has iced's own
+                // focus (see `input::handle_key`'s docs on why this app doesn't rely on that
+                // system), so this closes the panel even while typing in its search box.
+                state.sidebar_mode = SidebarMode::Tree;
             } else {
                 // No per-widget focus system here (see `input::handle_key`'s docs), so route
                 // by `state.focus`: the tree when it's the last thing the user interacted
@@ -694,7 +744,7 @@ fn view(state: &State) -> Element<'_, Message> {
 
     let panes = PaneGrid::new(&state.panes, |_id, kind, _is_maximized| {
         let content: Element<'_, Message> = match kind {
-            PaneKind::Sidebar => container(view_tree(state)).padding(8).into(),
+            PaneKind::Sidebar => container(view_sidebar(state)).padding(8).into(),
             PaneKind::Main => view_editor(state),
             PaneKind::Ai => container(view_ai_sidebar(state))
                 .height(Length::Fill)
@@ -727,7 +777,7 @@ fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
 /// Transparent-background button style, so a title + close button pair placed inside a
 /// pill-shaped `container` (see `view_editor`'s tab strip) reads as one merged tab rather
 /// than two separate button-shaped elements.
-fn flat_button_style(theme: &iced::Theme, status: iced::widget::button::Status) -> iced::widget::button::Style {
+pub(crate) fn flat_button_style(theme: &iced::Theme, status: iced::widget::button::Status) -> iced::widget::button::Style {
     use iced::widget::button::{Status, Style};
 
     let palette = theme.extended_palette();
@@ -830,6 +880,7 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
     let can_undo = active_content.is_some_and(|c| c.can_undo());
     let can_redo = active_content.is_some_and(|c| c.can_redo());
 
+    let has_active_tab = state.tabs.get(state.active_tab).is_some();
     let edit_menu_button = menu_button("Edit".to_string(), Message::Noop).width(Length::Shrink);
     let edit_items = menu_items!(
         (menu_button_maybe(
@@ -839,6 +890,14 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
         (menu_button_maybe(
             EditAction::Redo.to_string(),
             can_redo.then_some(Message::EditAction(EditAction::Redo)),
+        )),
+        (menu_button_maybe(
+            "Find (Cmd+F)".to_string(),
+            has_active_tab.then_some(Message::Search(code_editor::search::Message::Toggle)),
+        )),
+        (menu_button(
+            "Find in Project (Cmd+Shift+F)".to_string(),
+            Message::ToggleProjectSearch
         )),
     );
 
@@ -887,6 +946,15 @@ fn view_status_bar(state: &State) -> Element<'_, Message> {
     ]
     .padding(4)
     .into()
+}
+
+fn view_sidebar(state: &State) -> Element<'_, Message> {
+    match state.sidebar_mode {
+        SidebarMode::Tree => view_tree(state),
+        SidebarMode::ProjectSearch => {
+            project_search::view(&state.project_search, state.root.as_deref()).map(Message::ProjectSearch)
+        }
+    }
 }
 
 fn view_tree(state: &State) -> Element<'_, Message> {
