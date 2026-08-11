@@ -1130,13 +1130,17 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
 fn view_status_bar(state: &State) -> Element<'_, Message> {
     let folder_icon: char = lucide_icons::Icon::Folder.into();
     let git_icon: char = lucide_icons::Icon::GitBranch.into();
+    let find_icon: char = lucide_icons::Icon::Search.into();
     let mut bar = row![
-        button(text(folder_icon).font(iced::Font::with_name("lucide")).size(14))
-            .padding([4, 8])
+        button(text(folder_icon).font(iced::Font::with_name("lucide")).size(12))
+            .padding([2, 6])
             .on_press(Message::SidebarToggle),
-        button(text(git_icon).font(iced::Font::with_name("lucide")).size(14))
-            .padding([4, 8])
+        button(text(git_icon).font(iced::Font::with_name("lucide")).size(12))
+            .padding([2, 6])
             .on_press(Message::GitPanelToggle),
+        button(text(find_icon).font(iced::Font::with_name("lucide")).size(12))
+            .padding([2, 6])
+            .on_press(Message::ToggleProjectSearch),
         Space::new().width(Length::Fill),
     ]
     .spacing(12);
@@ -1151,8 +1155,8 @@ fn view_status_bar(state: &State) -> Element<'_, Message> {
 
     let ai_icon: char = lucide_icons::Icon::Sparkles.into();
     bar.push(
-        button(text(ai_icon).font(iced::Font::with_name("lucide")).size(14))
-            .padding([4, 8])
+        button(text(ai_icon).font(iced::Font::with_name("lucide")).size(12))
+            .padding([2, 6])
             .on_press(Message::AiToggle),
     )
     .align_y(iced::Alignment::Center)
