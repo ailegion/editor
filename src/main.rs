@@ -189,6 +189,7 @@ enum Message {
     KeyPressed(keyboard::Key, keyboard::Modifiers),
     Noop,
 
+    SidebarToggle,
     AiToggle,
     AiModeSelected(AiMode),
     Chat(chat::Message),
@@ -217,8 +218,9 @@ struct State {
     zoom: f32,
 
     panes: pane_grid::State<PaneKind>,
-    sidebar_split: pane_grid::Split,
+    sidebar_split: Option<pane_grid::Split>,
     ai_split: Option<pane_grid::Split>,
+    sidebar_visible: bool,
 
     /// The most recent size reported by a `WindowResized` event -- kept so the async
     /// `is_maximized` check triggered by that same event (see its handler) knows what to
@@ -237,17 +239,28 @@ impl State {
         let tree = root
             .clone()
             .map(|p| DirectoryTree::new(p).with_filter(DirectoryFilter::FilesAndFolders));
+        let sidebar_visible = load_sidebar_visible();
         let ai_visible = load_ai_visible();
         let app_theme = load_app_theme();
         let zoom = load_zoom();
         let sidebar_ratio = load_sidebar_ratio();
         let ai_ratio = load_ai_ratio();
 
-        let (mut panes, sidebar_pane) = pane_grid::State::new(PaneKind::Sidebar);
-        let (main_pane, sidebar_split) = panes
-            .split(pane_grid::Axis::Vertical, sidebar_pane, PaneKind::Main)
-            .expect("splitting a freshly created single-pane state always succeeds");
-        panes.resize(sidebar_split, sidebar_ratio);
+        let (mut panes, first_pane) = if sidebar_visible {
+            pane_grid::State::new(PaneKind::Sidebar)
+        } else {
+            pane_grid::State::new(PaneKind::Main)
+        };
+
+        let (main_pane, sidebar_split) = if sidebar_visible {
+            let (main_pane, split) = panes
+                .split(pane_grid::Axis::Vertical, first_pane, PaneKind::Main)
+                .expect("splitting a freshly created single-pane state always succeeds");
+            panes.resize(split, sidebar_ratio);
+            (main_pane, Some(split))
+        } else {
+            (first_pane, None)
+        };
 
         let ai_split = if ai_visible {
             let split = panes
@@ -277,6 +290,7 @@ impl State {
             panes,
             sidebar_split,
             ai_split,
+            sidebar_visible,
             last_known_size: load_window_size(),
             ai_visible,
             ai_mode: AiMode::default(),
@@ -325,10 +339,6 @@ impl State {
                 }
             }
         }
-    }
-
-    fn active_path(&self) -> Option<PathBuf> {
-        self.tabs.get(self.active_tab).and_then(|t| t.path.clone())
     }
 
     fn open_path(&mut self, path: PathBuf) {
@@ -664,7 +674,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
             state.panes.resize(split, ratio);
-            if split == state.sidebar_split {
+            if Some(split) == state.sidebar_split {
                 save_sidebar_ratio(ratio);
             } else if Some(split) == state.ai_split {
                 save_ai_ratio(ratio);
@@ -747,6 +757,39 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::Noop => {}
+
+        Message::SidebarToggle => {
+            state.sidebar_visible = !state.sidebar_visible;
+            save_sidebar_visible(state.sidebar_visible);
+            if state.sidebar_visible {
+                let main_pane = state
+                    .panes
+                    .iter()
+                    .find(|(_, kind)| **kind == PaneKind::Main)
+                    .map(|(pane, _)| *pane);
+                if let Some(main_pane) = main_pane {
+                    if let Some((sidebar_pane, split)) =
+                        state.panes.split(pane_grid::Axis::Vertical, main_pane, PaneKind::Sidebar)
+                    {
+                        // `split` always inserts the new pane after the target, i.e. to
+                        // Main's right; swap them so the sidebar ends up on the left.
+                        state.panes.swap(main_pane, sidebar_pane);
+                        state.panes.resize(split, load_sidebar_ratio());
+                        state.sidebar_split = Some(split);
+                    }
+                }
+            } else {
+                let sidebar_pane = state
+                    .panes
+                    .iter()
+                    .find(|(_, kind)| **kind == PaneKind::Sidebar)
+                    .map(|(pane, _)| *pane);
+                if let Some(sidebar_pane) = sidebar_pane {
+                    state.panes.close(sidebar_pane);
+                }
+                state.sidebar_split = None;
+            }
+        }
 
         Message::AiToggle => {
             state.ai_visible = !state.ai_visible;
@@ -1042,12 +1085,14 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
 }
 
 fn view_status_bar(state: &State) -> Element<'_, Message> {
-    let status = state
-        .active_path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "No file open".to_string());
-
-    let mut bar = row![text(status).width(Length::Fill)].spacing(12);
+    let folder_icon: char = lucide_icons::Icon::Folder.into();
+    let mut bar = row![
+        button(text(folder_icon).font(iced::Font::with_name("lucide")).size(14))
+            .padding([4, 8])
+            .on_press(Message::SidebarToggle),
+        Space::new().width(Length::Fill),
+    ]
+    .spacing(12);
 
     if let Some(tab) = state.tabs.get(state.active_tab) {
         let (line, col) = tab.content.cursor_line_col();
@@ -1378,6 +1423,21 @@ fn load_ai_visible() -> bool {
         .and_then(|path| std::fs::read_to_string(path).ok())
         .map(|text| text.trim() == "true")
         .unwrap_or(false)
+}
+
+fn save_sidebar_visible(visible: bool) {
+    let Some(path) = config_path("sidebar_visible") else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, if visible { "true" } else { "false" });
+}
+
+fn load_sidebar_visible() -> bool {
+    config_path("sidebar_visible")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| text.trim() == "true")
+        .unwrap_or(true)
 }
 
 /// Forces DirectoryTree to rescan `dir` without disturbing the rest of the tree's expand
