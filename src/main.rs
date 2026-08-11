@@ -1059,7 +1059,8 @@ fn view_status_bar(state: &State) -> Element<'_, Message> {
 
     let ai_icon: char = lucide_icons::Icon::Sparkles.into();
     bar.push(
-        button(text(ai_icon).font(iced::Font::with_name("lucide")))
+        button(text(ai_icon).font(iced::Font::with_name("lucide")).size(14))
+            .padding([4, 8])
             .on_press(Message::AiToggle),
     )
     .align_y(iced::Alignment::Center)

@@ -563,7 +563,10 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
                 if state.streaming {
                     button(text("Stop")).on_press(Message::Stop)
                 } else {
-                    button(text("Send")).on_press(Message::Send)
+                    let send_icon: char = lucide_icons::Icon::SendHorizonal.into();
+                    button(text(send_icon).font(iced::Font::with_name("lucide")).size(14))
+                        .padding([4, 8])
+                        .on_press(Message::Send)
                 },
             ],
         ]
