@@ -750,7 +750,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::AiModeSelected(mode) => state.ai_mode = mode,
-        Message::Chat(msg) => chat::update(&mut state.chat, msg),
+        Message::Chat(msg) => {
+            let cwd = state.root_or_cwd();
+            chat::update(&mut state.chat, msg, cwd);
+        }
         Message::Acp(msg) => {
             let cwd = state.root_or_cwd();
             acp::update(&mut state.acp, msg, cwd);

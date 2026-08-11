@@ -1,21 +1,40 @@
-use iced::widget::{button, column, container, row, scrollable, text, text_input};
+use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use iced::{Element, Length};
 use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
+
+/// Tool calls loop at most this many rounds before the conversation is forced to stop, so a
+/// model that keeps requesting tools (or a server that keeps claiming `tool_calls`) can't hang
+/// the chat forever.
+const MAX_TOOL_ROUNDS: usize = 8;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Role {
     User,
     Assistant,
+    Tool,
 }
 
 impl Role {
-    fn as_str(self) -> &'static str {
+    fn label(self) -> &'static str {
+        match self {
+            Role::User => "You",
+            Role::Assistant => "AI",
+            Role::Tool => "Tool",
+        }
+    }
+
+    /// The role folded into the wire-format history rebuilt for each request. `Tool` notices
+    /// are sent back as assistant text rather than real `tool` messages -- structured
+    /// `tool_call_id` round-tripping only happens within a single `send()`'s background-thread
+    /// loop (see `run_conversation`), not across turns.
+    fn wire_role(self) -> &'static str {
         match self {
             Role::User => "user",
-            Role::Assistant => "assistant",
+            Role::Assistant | Role::Tool => "assistant",
         }
     }
 }
@@ -27,6 +46,10 @@ struct ChatMsg {
 
 enum Event {
     Delta(String),
+    /// A tool call the model requested, formatted for display (e.g. `read_file(...)`\).
+    /// Closes out the current assistant bubble and opens a fresh one for whatever text
+    /// follows.
+    ToolStart(String),
     Done,
     Error(String),
 }
@@ -40,6 +63,7 @@ pub struct ChatState {
     rx: Option<Receiver<Event>>,
     cancel: Option<Arc<AtomicBool>>,
     streaming: bool,
+    settings_open: bool,
 }
 
 impl Default for ChatState {
@@ -53,6 +77,7 @@ impl Default for ChatState {
             rx: None,
             cancel: None,
             streaming: false,
+            settings_open: false,
         }
     }
 }
@@ -63,6 +88,7 @@ pub enum Message {
     ApiKeyChanged(String),
     ModelChanged(String),
     InputChanged(String),
+    ToggleSettings,
     Send,
     Stop,
 }
@@ -77,6 +103,10 @@ impl ChatState {
                     if let Some(last) = self.messages.last_mut() {
                         last.content.push_str(&text);
                     }
+                }
+                Event::ToolStart(label) => {
+                    self.messages.push(ChatMsg { role: Role::Tool, content: label });
+                    self.messages.push(ChatMsg { role: Role::Assistant, content: String::new() });
                 }
                 Event::Done => finished = true,
                 Event::Error(err) => {
@@ -94,7 +124,7 @@ impl ChatState {
         }
     }
 
-    fn send(&mut self) {
+    fn send(&mut self, cwd: PathBuf) {
         let text = std::mem::take(&mut self.input);
         if text.trim().is_empty() || self.streaming {
             return;
@@ -110,7 +140,7 @@ impl ChatState {
 
         let history: Vec<(&'static str, String)> = self.messages[..self.messages.len() - 1]
             .iter()
-            .map(|m| (m.role.as_str(), m.content.clone()))
+            .map(|m| (m.role.wire_role(), m.content.clone()))
             .collect();
 
         let base_url = self.base_url.trim_end_matches('/').to_string();
@@ -124,7 +154,7 @@ impl ChatState {
         self.streaming = true;
 
         std::thread::spawn(move || {
-            run_request(base_url, api_key, model, history, tx, cancel);
+            run_conversation(base_url, api_key, model, history, cwd, tx, cancel);
         });
     }
 
@@ -138,42 +168,71 @@ impl ChatState {
     }
 }
 
-pub fn update(state: &mut ChatState, message: Message) {
+pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) {
     match message {
         Message::BaseUrlChanged(text) => state.base_url = text,
         Message::ApiKeyChanged(text) => state.api_key = text,
         Message::ModelChanged(text) => state.model = text,
         Message::InputChanged(text) => state.input = text,
-        Message::Send => state.send(),
+        Message::ToggleSettings => state.settings_open = !state.settings_open,
+        Message::Send => state.send(cwd),
         Message::Stop => state.stop(),
     }
 }
 
 pub fn view(state: &ChatState) -> Element<'_, Message> {
-    let provider = column![
-        row![text("Base URL"), text_input("", &state.base_url).on_input(Message::BaseUrlChanged)]
-            .spacing(6),
-        row![
-            text("API Key"),
-            text_input("", &state.api_key)
-                .on_input(Message::ApiKeyChanged)
-                .secure(true)
-        ]
-        .spacing(6),
-        row![text("Model"), text_input("", &state.model).on_input(Message::ModelChanged)]
-            .spacing(6),
-    ]
+    let gear_icon: char = lucide_icons::Icon::Settings.into();
+    let mut header = column![row![
+        Space::new().width(Length::Fill),
+        button(text(gear_icon).font(iced::Font::with_name("lucide")))
+            .padding([4, 8])
+            .style(crate::flat_button_style)
+            .on_press(Message::ToggleSettings),
+    ]]
     .spacing(4);
 
-    let mut messages = column![].spacing(6);
-    for message in &state.messages {
-        let sender = match message.role {
-            Role::User => "You",
-            Role::Assistant => "AI",
-        };
-        messages = messages.push(column![text(sender), text(message.content.clone())]);
+    if state.settings_open {
+        let field = |label: &'static str| text(label).width(Length::Fixed(70.0));
+        let form = column![
+            row![field("Base URL"), text_input("", &state.base_url).on_input(Message::BaseUrlChanged)]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
+            row![
+                field("API Key"),
+                text_input("optional", &state.api_key)
+                    .on_input(Message::ApiKeyChanged)
+                    .secure(true)
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+            row![field("Model"), text_input("", &state.model).on_input(Message::ModelChanged)]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
+        ]
+        .spacing(6);
+
+        header = header.push(container(form).padding(8).style(|theme: &iced::Theme| {
+            let palette = theme.extended_palette();
+            iced::widget::container::Style {
+                background: Some(palette.background.weak.color.into()),
+                border: iced::Border::default().rounded(6.0),
+                ..iced::widget::container::Style::default()
+            }
+        }));
     }
-    let messages = scrollable(messages).height(Length::Fill);
+
+    let mut messages_col = column![].spacing(6);
+    let last = state.messages.len().saturating_sub(1);
+    for (i, message) in state.messages.iter().enumerate() {
+        if message.content.is_empty() {
+            if i == last && state.streaming {
+                messages_col = messages_col.push(column![text(message.role.label()), text("...")]);
+            }
+            continue;
+        }
+        messages_col = messages_col.push(column![text(message.role.label()), text(message.content.clone())]);
+    }
+    let messages = scrollable(messages_col).height(Length::Fill);
 
     let input_row = row![
         text_input("", &state.input).on_input(Message::InputChanged),
@@ -185,48 +244,119 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
     ]
     .spacing(4);
 
-    container(column![provider, messages, input_row].spacing(8))
+    container(column![header, messages, input_row].spacing(8))
         .height(Length::Fill)
         .into()
 }
 
-fn run_request(
+/// One tool call the model has requested, accumulated across streamed SSE deltas: `id` and
+/// `name` normally arrive whole in the first delta for a given `index`, while `arguments`
+/// arrives as a JSON string built up fragment by fragment.
+#[derive(Default)]
+struct ToolCallAccum {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Drives the whole exchange for one `Send`: sends the request, streams the reply, and if the
+/// model asks for tool calls, executes them locally and loops back with the results appended --
+/// up to `MAX_TOOL_ROUNDS` -- until it gets a plain text reply.
+fn run_conversation(
     base_url: String,
     api_key: String,
     model: String,
     history: Vec<(&'static str, String)>,
+    cwd: PathBuf,
     tx: mpsc::Sender<Event>,
     cancel: Arc<AtomicBool>,
 ) {
-    let messages: Vec<serde_json::Value> = history
+    let mut messages: Vec<serde_json::Value> = history
         .iter()
         .map(|(role, content)| serde_json::json!({ "role": role, "content": content }))
         .collect();
+
+    for _ in 0..MAX_TOOL_ROUNDS {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some((content, tool_calls)) = run_request(&base_url, &api_key, &model, &messages, &tx, &cancel)
+        else {
+            return;
+        };
+        if tool_calls.is_empty() {
+            break;
+        }
+
+        messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": if content.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(content) },
+            "tool_calls": tool_calls.iter().map(|call| serde_json::json!({
+                "id": call.id,
+                "type": "function",
+                "function": { "name": call.name, "arguments": call.arguments },
+            })).collect::<Vec<_>>(),
+        }));
+
+        for call in &tool_calls {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let preview = truncate(&call.arguments, 80);
+            let _ = tx.send(Event::ToolStart(format!("{}({})", call.name, preview)));
+            let result = execute_tool(&cwd, &call.name, &call.arguments);
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": result,
+            }));
+        }
+    }
+    let _ = tx.send(Event::Done);
+}
+
+/// Sends one chat-completions request and streams the SSE response, forwarding text deltas as
+/// `Event::Delta` as they arrive. Returns the full accumulated assistant text plus any tool
+/// calls the model requested, or `None` if the request failed or was cancelled (in which case
+/// an `Event::Error` has already been sent, or nothing further should happen for a cancel).
+fn run_request(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[serde_json::Value],
+    tx: &mpsc::Sender<Event>,
+    cancel: &Arc<AtomicBool>,
+) -> Option<(String, Vec<ToolCallAccum>)> {
     let body = serde_json::json!({
         "model": model,
         "stream": true,
         "messages": messages,
+        "tools": tool_defs(),
     })
     .to_string();
 
     let url = format!("{base_url}/chat/completions");
-    let result = ureq::post(&url)
-        .header("Authorization", &format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .send(body);
+    let mut request = ureq::post(&url).header("Content-Type", "application/json");
+    if !api_key.trim().is_empty() {
+        request = request.header("Authorization", &format!("Bearer {api_key}"));
+    }
+    let result = request.send(body);
 
     let response = match result {
         Ok(response) => response,
         Err(err) => {
             let _ = tx.send(Event::Error(err.to_string()));
-            return;
+            return None;
         }
     };
+
+    let mut content = String::new();
+    let mut tool_calls: Vec<ToolCallAccum> = Vec::new();
 
     let reader = BufReader::new(response.into_body().into_reader());
     for line in reader.lines() {
         if cancel.load(Ordering::Relaxed) {
-            return;
+            return None;
         }
         let Ok(line) = line else { break };
         let Some(data) = line.strip_prefix("data: ") else {
@@ -235,11 +365,153 @@ fn run_request(
         if data == "[DONE]" {
             break;
         }
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
-            if let Some(delta) = value["choices"][0]["delta"]["content"].as_str() {
-                let _ = tx.send(Event::Delta(delta.to_string()));
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        let delta = &value["choices"][0]["delta"];
+        if let Some(text) = delta["content"].as_str() {
+            content.push_str(text);
+            let _ = tx.send(Event::Delta(text.to_string()));
+        }
+        if let Some(calls) = delta["tool_calls"].as_array() {
+            for call in calls {
+                let index = call["index"].as_u64().unwrap_or(0) as usize;
+                while tool_calls.len() <= index {
+                    tool_calls.push(ToolCallAccum::default());
+                }
+                let entry = &mut tool_calls[index];
+                if let Some(id) = call["id"].as_str() {
+                    entry.id.push_str(id);
+                }
+                if let Some(name) = call["function"]["name"].as_str() {
+                    entry.name.push_str(name);
+                }
+                if let Some(args) = call["function"]["arguments"].as_str() {
+                    entry.arguments.push_str(args);
+                }
             }
         }
     }
-    let _ = tx.send(Event::Done);
+    Some((content, tool_calls))
+}
+
+/// OpenAI-format `tools` array describing the functions the model may call. Kept small and
+/// read-only -- enough for the model to orient itself in the open project -- rather than
+/// exposing write access.
+fn tool_defs() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read the contents of a text file in the open project, given a path relative to the project root.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Path relative to the project root" },
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_dir",
+                "description": "List files and folders inside a directory in the open project, given a path relative to the project root ('.' for the root).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Path relative to the project root" },
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_project",
+                "description": "Case-insensitive substring search across every text file in the open project. Returns matching file:line pairs with a preview.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+    ])
+}
+
+fn execute_tool(cwd: &Path, name: &str, arguments: &str) -> String {
+    let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+    match name {
+        "read_file" => {
+            let Some(rel) = args["path"].as_str() else {
+                return "error: missing 'path'".to_string();
+            };
+            match resolve_path(cwd, rel) {
+                Some(path) => std::fs::read_to_string(&path)
+                    .map(|s| truncate(&s, 20_000))
+                    .unwrap_or_else(|err| format!("error reading file: {err}")),
+                None => "error: path escapes the project root".to_string(),
+            }
+        }
+        "list_dir" => {
+            let rel = args["path"].as_str().unwrap_or(".");
+            match resolve_path(cwd, rel) {
+                Some(path) => match std::fs::read_dir(&path) {
+                    Ok(entries) => {
+                        let mut names: Vec<String> = entries
+                            .flatten()
+                            .map(|entry| {
+                                let name = entry.file_name().to_string_lossy().to_string();
+                                if entry.path().is_dir() { format!("{name}/") } else { name }
+                            })
+                            .collect();
+                        names.sort();
+                        names.join("\n")
+                    }
+                    Err(err) => format!("error listing directory: {err}"),
+                },
+                None => "error: path escapes the project root".to_string(),
+            }
+        }
+        "search_project" => {
+            let query = args["query"].as_str().unwrap_or("");
+            let results = crate::project_search::search(cwd, query);
+            if results.is_empty() {
+                "no matches".to_string()
+            } else {
+                results
+                    .iter()
+                    .take(50)
+                    .map(|r| {
+                        let rel = r.path.strip_prefix(cwd).unwrap_or(&r.path);
+                        format!("{}:{}: {}", rel.display(), r.line, r.preview)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+        other => format!("error: unknown tool '{other}'"),
+    }
+}
+
+/// Resolves `rel` against `cwd`, rejecting anything that canonicalizes outside `cwd` -- the
+/// model only gets to read within the open project, not the rest of the filesystem.
+fn resolve_path(cwd: &Path, rel: &str) -> Option<PathBuf> {
+    let root = cwd.canonicalize().ok()?;
+    let candidate = root.join(rel).canonicalize().ok()?;
+    candidate.starts_with(&root).then_some(candidate)
+}
+
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max_chars).collect();
+    format!("{truncated}\n... [truncated]")
 }

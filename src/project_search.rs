@@ -68,7 +68,7 @@ pub fn update(state: &mut SearchState, message: Message, root: Option<&Path>) ->
 /// Case-insensitive substring search over every non-ignored file under `root`, capped at
 /// `MAX_RESULTS` matches. Files that aren't valid UTF-8 (most binaries) are silently
 /// skipped, same as `std::fs::read_to_string` failing on them.
-fn search(root: &Path, query: &str) -> Vec<SearchResult> {
+pub(crate) fn search(root: &Path, query: &str) -> Vec<SearchResult> {
     if query.trim().is_empty() {
         return Vec::new();
     }
