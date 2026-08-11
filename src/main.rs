@@ -1,6 +1,7 @@
 mod acp;
 mod chat;
 mod code_editor;
+mod git;
 mod project_search;
 
 use iced::keyboard;
@@ -84,6 +85,7 @@ enum SidebarMode {
     #[default]
     Tree,
     ProjectSearch,
+    Git,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +164,8 @@ enum Message {
     Search(code_editor::search::Message),
     ProjectSearch(project_search::Message),
     ToggleProjectSearch,
+    Git(git::Message),
+    GitPanelToggle,
     TabSelected(usize),
     TabClosed(usize),
 
@@ -213,6 +217,7 @@ struct State {
     creating: Option<(PathBuf, bool, String)>,
     sidebar_mode: SidebarMode,
     project_search: project_search::SearchState,
+    git: git::GitState,
 
     app_theme: iced::Theme,
     highlighter: code_editor::Highlighter,
@@ -285,6 +290,7 @@ impl State {
             creating: None,
             sidebar_mode: SidebarMode::default(),
             project_search: project_search::SearchState::default(),
+            git: git::GitState::default(),
             app_theme,
             highlighter: code_editor::Highlighter::new(),
             zoom,
@@ -302,6 +308,54 @@ impl State {
 
     fn root_or_cwd(&self) -> PathBuf {
         self.root.clone().unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// Re-inserts the sidebar pane (to Main's left) if it isn't already showing, and marks it
+    /// visible/persisted. Safe to call when the sidebar is already visible -- it's a no-op.
+    fn show_sidebar(&mut self) {
+        if self.sidebar_visible {
+            return;
+        }
+        self.sidebar_visible = true;
+        save_sidebar_visible(true);
+        let main_pane = self.panes.iter().find(|(_, kind)| **kind == PaneKind::Main).map(|(pane, _)| *pane);
+        if let Some(main_pane) = main_pane {
+            if let Some((sidebar_pane, split)) =
+                self.panes.split(pane_grid::Axis::Vertical, main_pane, PaneKind::Sidebar)
+            {
+                // `split` always inserts the new pane after the target, i.e. to Main's
+                // right; swap them so the sidebar ends up on the left.
+                self.panes.swap(main_pane, sidebar_pane);
+                self.panes.resize(split, load_sidebar_ratio());
+                self.sidebar_split = Some(split);
+            }
+        }
+    }
+
+    fn hide_sidebar(&mut self) {
+        self.sidebar_visible = false;
+        save_sidebar_visible(false);
+        let sidebar_pane = self.panes.iter().find(|(_, kind)| **kind == PaneKind::Sidebar).map(|(pane, _)| *pane);
+        if let Some(sidebar_pane) = sidebar_pane {
+            self.panes.close(sidebar_pane);
+        }
+        self.sidebar_split = None;
+    }
+
+    /// Single entry point for every sidebar-mode button (tree/git/project-search): clicking
+    /// the button for the panel that's already showing collapses the sidebar (matching the
+    /// familiar "activity bar" pattern); clicking any other button switches to that panel,
+    /// opening the sidebar first if it was closed. Returns `true` if `mode` ended up visible
+    /// (as opposed to the sidebar collapsing), so callers can decide whether to e.g. refresh.
+    fn toggle_sidebar_mode(&mut self, mode: SidebarMode) -> bool {
+        if self.sidebar_visible && self.sidebar_mode == mode {
+            self.hide_sidebar();
+            false
+        } else {
+            self.sidebar_mode = mode;
+            self.show_sidebar();
+            true
+        }
     }
 
     /// The path the context menu should act on: the tree's current selection, or the root.
@@ -504,10 +558,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::ToggleProjectSearch => {
-            state.sidebar_mode = match state.sidebar_mode {
-                SidebarMode::Tree => SidebarMode::ProjectSearch,
-                SidebarMode::ProjectSearch => SidebarMode::Tree,
-            };
+            state.toggle_sidebar_mode(SidebarMode::ProjectSearch);
+        }
+        Message::Git(msg) => {
+            let cwd = state.root_or_cwd();
+            task = git::update(&mut state.git, msg, cwd).map(Message::Git);
+        }
+        Message::GitPanelToggle => {
+            if state.toggle_sidebar_mode(SidebarMode::Git) {
+                let cwd = state.root_or_cwd();
+                task = git::update(&mut state.git, git::Message::Refresh, cwd).map(Message::Git);
+            }
         }
         Message::TabSelected(i) => state.active_tab = i,
         Message::TabClosed(i) => state.close_tab(i),
@@ -702,10 +763,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     keyboard::Key::Character(c)
                         if modifiers.shift() && c.eq_ignore_ascii_case("f") =>
                     {
-                        state.sidebar_mode = match state.sidebar_mode {
-                            SidebarMode::Tree => SidebarMode::ProjectSearch,
-                            SidebarMode::ProjectSearch => SidebarMode::Tree,
-                        };
+                        state.toggle_sidebar_mode(SidebarMode::ProjectSearch);
                     }
                     keyboard::Key::Character("f") => {
                         if let Some(tab) = state.tabs.get_mut(state.active_tab) {
@@ -765,36 +823,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Noop => {}
 
         Message::SidebarToggle => {
-            state.sidebar_visible = !state.sidebar_visible;
-            save_sidebar_visible(state.sidebar_visible);
-            if state.sidebar_visible {
-                let main_pane = state
-                    .panes
-                    .iter()
-                    .find(|(_, kind)| **kind == PaneKind::Main)
-                    .map(|(pane, _)| *pane);
-                if let Some(main_pane) = main_pane {
-                    if let Some((sidebar_pane, split)) =
-                        state.panes.split(pane_grid::Axis::Vertical, main_pane, PaneKind::Sidebar)
-                    {
-                        // `split` always inserts the new pane after the target, i.e. to
-                        // Main's right; swap them so the sidebar ends up on the left.
-                        state.panes.swap(main_pane, sidebar_pane);
-                        state.panes.resize(split, load_sidebar_ratio());
-                        state.sidebar_split = Some(split);
-                    }
-                }
-            } else {
-                let sidebar_pane = state
-                    .panes
-                    .iter()
-                    .find(|(_, kind)| **kind == PaneKind::Sidebar)
-                    .map(|(pane, _)| *pane);
-                if let Some(sidebar_pane) = sidebar_pane {
-                    state.panes.close(sidebar_pane);
-                }
-                state.sidebar_split = None;
-            }
+            state.toggle_sidebar_mode(SidebarMode::Tree);
         }
 
         Message::AiToggle => {
@@ -1100,10 +1129,14 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
 
 fn view_status_bar(state: &State) -> Element<'_, Message> {
     let folder_icon: char = lucide_icons::Icon::Folder.into();
+    let git_icon: char = lucide_icons::Icon::GitBranch.into();
     let mut bar = row![
         button(text(folder_icon).font(iced::Font::with_name("lucide")).size(14))
             .padding([4, 8])
             .on_press(Message::SidebarToggle),
+        button(text(git_icon).font(iced::Font::with_name("lucide")).size(14))
+            .padding([4, 8])
+            .on_press(Message::GitPanelToggle),
         Space::new().width(Length::Fill),
     ]
     .spacing(12);
@@ -1133,6 +1166,7 @@ fn view_sidebar(state: &State) -> Element<'_, Message> {
         SidebarMode::ProjectSearch => {
             project_search::view(&state.project_search, state.root.as_deref()).map(Message::ProjectSearch)
         }
+        SidebarMode::Git => git::view(&state.git).map(Message::Git),
     }
 }
 
