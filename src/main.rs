@@ -864,7 +864,15 @@ fn view(state: &State) -> Element<'_, Message> {
 
     let panes = PaneGrid::new(&state.panes, |_id, kind, _is_maximized| {
         let content: Element<'_, Message> = match kind {
-            PaneKind::Sidebar => container(view_sidebar(state)).padding(8).into(),
+            PaneKind::Sidebar => container(view_sidebar(state))
+                .padding(8)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(|theme: &iced::Theme| iced::widget::container::Style {
+                    background: Some(theme.extended_palette().background.weak.color.into()),
+                    ..iced::widget::container::Style::default()
+                })
+                .into(),
             PaneKind::Main => view_editor(state),
             PaneKind::Ai => container(view_ai_sidebar(state))
                 .height(Length::Fill)
