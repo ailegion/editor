@@ -712,7 +712,10 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
     let awaiting_permission = state.pending_permission.is_some();
     let send_icon: char = lucide_icons::Icon::SendHorizonal.into();
     let send_button = if state.streaming {
-        button(text("Stop")).on_press(Message::Stop)
+        let stop_icon: char = lucide_icons::Icon::CircleStop.into();
+        button(text(stop_icon).font(iced::Font::with_name("lucide")).size(14))
+            .padding([4, 8])
+            .on_press(Message::Stop)
     } else if awaiting_permission {
         button(text(send_icon).font(iced::Font::with_name("lucide")).size(14)).padding([4, 8])
     } else {

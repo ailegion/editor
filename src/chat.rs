@@ -334,6 +334,7 @@ impl ChatState {
         self.api_key = conn.api_key.clone();
         self.model = conn.model.clone();
         self.test_connection();
+        self.settings_open = false;
     }
 
     fn delete_connection(&mut self, index: usize) {
@@ -559,16 +560,26 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
                     }
                 }),
             row![
+                text(if state.model.is_empty() {
+                    "No model selected".to_string()
+                } else {
+                    state.model.clone()
+                })
+                .size(12),
                 Space::new().width(Length::Fill),
                 if state.streaming {
-                    button(text("Stop")).on_press(Message::Stop)
+                    let stop_icon: char = lucide_icons::Icon::CircleStop.into();
+                    button(text(stop_icon).font(iced::Font::with_name("lucide")).size(14))
+                        .padding([4, 8])
+                        .on_press(Message::Stop)
                 } else {
                     let send_icon: char = lucide_icons::Icon::SendHorizonal.into();
                     button(text(send_icon).font(iced::Font::with_name("lucide")).size(14))
                         .padding([4, 8])
                         .on_press(Message::Send)
                 },
-            ],
+            ]
+            .align_y(iced::Alignment::Center),
         ]
         .spacing(4),
     );
