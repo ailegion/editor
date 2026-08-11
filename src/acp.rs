@@ -564,23 +564,44 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) {
 pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
     let top_bar = row![
         Space::new().width(Length::Fill),
-        button(text("+")).on_press(Message::NewThread),
-        button(text("...")).on_press(Message::ThreadMenuToggle),
+        button(text("+"))
+            .padding([4, 8])
+            .style(crate::flat_button_style)
+            .on_press(Message::NewThread),
+        button(text("..."))
+            .padding([4, 8])
+            .style(crate::flat_button_style)
+            .on_press(Message::ThreadMenuToggle),
     ]
     .spacing(4)
     .width(Length::Fill);
     let mut header = column![top_bar].spacing(4);
     if state.thread_menu_open {
-        let mut menu = column![].spacing(4);
+        let mut menu = column![].spacing(2);
         for (i, thread) in state.threads.iter().enumerate() {
             let title = if thread.title.is_empty() {
                 "New thread".to_string()
             } else {
                 thread.title.clone()
             };
-            menu = menu.push(button(text(title)).on_press(Message::SwitchThread(i)));
+            menu = menu.push(
+                button(text(title))
+                    .width(Length::Fill)
+                    .padding([4, 8])
+                    .style(crate::flat_button_style)
+                    .on_press(Message::SwitchThread(i)),
+            );
         }
-        header = header.push(menu);
+        header = header.push(
+            container(menu).padding(4).style(|theme: &iced::Theme| {
+                let palette = theme.extended_palette();
+                iced::widget::container::Style {
+                    background: Some(palette.background.weak.color.into()),
+                    border: iced::Border::default().rounded(6.0),
+                    ..iced::widget::container::Style::default()
+                }
+            }),
+        );
     }
     let _ = cwd;
 

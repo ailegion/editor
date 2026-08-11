@@ -804,13 +804,15 @@ fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
             },
         );
         column![
-            button(text(label))
+            button(text(label).wrapping(iced::widget::text::Wrapping::None))
                 .padding([4, 4])
+                .width(Length::Shrink)
                 .style(move |theme, status| tab_button_style(theme, status, is_active))
                 .on_press(Message::AiModeSelected(mode)),
             underline,
         ]
         .spacing(2)
+        .width(Length::Shrink)
     };
 
     let mode_row = row![mode_tab("HTTP", AiMode::Http), mode_tab("Claude Code", AiMode::Acp)]
@@ -1002,8 +1004,12 @@ fn view_status_bar(state: &State) -> Element<'_, Message> {
         bar = bar.push(text(language.to_string()));
     }
 
-    bar.push(button(text("AI")).on_press(Message::AiToggle))
-        .align_y(iced::Alignment::Center)
+    let ai_icon: char = lucide_icons::Icon::Sparkles.into();
+    bar.push(
+        button(text(ai_icon).font(iced::Font::with_name("lucide")))
+            .on_press(Message::AiToggle),
+    )
+    .align_y(iced::Alignment::Center)
         .padding(4)
         .into()
 }

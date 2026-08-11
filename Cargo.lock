@@ -1021,6 +1021,7 @@ dependencies = [
  "iced_aw",
  "iced_core",
  "iced_highlighter",
+ "lucide-icons",
  "rfd",
  "serde",
  "serde_json",
