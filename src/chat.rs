@@ -1,4 +1,4 @@
-use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
+use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input, Space};
 use iced::{Element, Length};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -54,14 +54,31 @@ enum Event {
     Error(String),
 }
 
+enum TestEvent {
+    Success(Vec<String>),
+    Error(String),
+}
+
+#[derive(Default)]
+enum ConnectionStatus {
+    #[default]
+    Idle,
+    Testing,
+    Connected,
+    Failed(String),
+}
+
 pub struct ChatState {
     base_url: String,
     api_key: String,
     model: String,
+    models: Vec<String>,
+    connection_status: ConnectionStatus,
     messages: Vec<ChatMsg>,
     input: String,
     rx: Option<Receiver<Event>>,
     cancel: Option<Arc<AtomicBool>>,
+    test_rx: Option<Receiver<TestEvent>>,
     streaming: bool,
     settings_open: bool,
 }
@@ -72,10 +89,13 @@ impl Default for ChatState {
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: String::new(),
             model: String::new(),
+            models: Vec::new(),
+            connection_status: ConnectionStatus::default(),
             messages: Vec::new(),
             input: String::new(),
             rx: None,
             cancel: None,
+            test_rx: None,
             streaming: false,
             settings_open: false,
         }
@@ -87,6 +107,8 @@ pub enum Message {
     BaseUrlChanged(String),
     ApiKeyChanged(String),
     ModelChanged(String),
+    ModelSelected(String),
+    TestConnection,
     InputChanged(String),
     ToggleSettings,
     Send,
@@ -95,6 +117,31 @@ pub enum Message {
 
 impl ChatState {
     pub fn poll(&mut self) {
+        if let Some(rx) = &self.test_rx {
+            let mut finished = false;
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    TestEvent::Success(models) => {
+                        self.models = models;
+                        self.connection_status = ConnectionStatus::Connected;
+                        if self.models.iter().all(|m| m != &self.model) {
+                            if let Some(first) = self.models.first() {
+                                self.model = first.clone();
+                            }
+                        }
+                    }
+                    TestEvent::Error(err) => {
+                        self.models.clear();
+                        self.connection_status = ConnectionStatus::Failed(err);
+                    }
+                }
+                finished = true;
+            }
+            if finished {
+                self.test_rx = None;
+            }
+        }
+
         let Some(rx) = &self.rx else { return };
         let mut finished = false;
         while let Ok(event) = rx.try_recv() {
@@ -166,13 +213,37 @@ impl ChatState {
         self.rx = None;
         self.cancel = None;
     }
+
+    /// Hits the `/models` endpoint to confirm the base URL/API key work before letting the
+    /// user chat, and populates the model picker from whatever it reports.
+    fn test_connection(&mut self) {
+        let base_url = self.base_url.trim_end_matches('/').to_string();
+        let api_key = self.api_key.clone();
+
+        let (tx, rx) = mpsc::channel();
+        self.test_rx = Some(rx);
+        self.connection_status = ConnectionStatus::Testing;
+        self.models.clear();
+
+        std::thread::spawn(move || fetch_models(base_url, api_key, tx));
+    }
 }
 
 pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) {
     match message {
-        Message::BaseUrlChanged(text) => state.base_url = text,
-        Message::ApiKeyChanged(text) => state.api_key = text,
+        Message::BaseUrlChanged(text) => {
+            state.base_url = text;
+            state.connection_status = ConnectionStatus::Idle;
+            state.models.clear();
+        }
+        Message::ApiKeyChanged(text) => {
+            state.api_key = text;
+            state.connection_status = ConnectionStatus::Idle;
+            state.models.clear();
+        }
         Message::ModelChanged(text) => state.model = text,
+        Message::ModelSelected(model) => state.model = model,
+        Message::TestConnection => state.test_connection(),
         Message::InputChanged(text) => state.input = text,
         Message::ToggleSettings => state.settings_open = !state.settings_open,
         Message::Send => state.send(cwd),
@@ -193,6 +264,29 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
 
     if state.settings_open {
         let field = |label: &'static str| text(label).width(Length::Fixed(70.0));
+
+        let status_text = match &state.connection_status {
+            ConnectionStatus::Idle => String::new(),
+            ConnectionStatus::Testing => "Testing...".to_string(),
+            ConnectionStatus::Connected => format!("Connected -- {} model(s) found", state.models.len()),
+            ConnectionStatus::Failed(err) => format!("Failed: {err}"),
+        };
+
+        let model_row = if state.models.is_empty() {
+            row![
+                field("Model"),
+                text_input("", &state.model).on_input(Message::ModelChanged),
+            ]
+        } else {
+            row![
+                field("Model"),
+                pick_list(state.models.as_slice(), Some(state.model.clone()), Message::ModelSelected)
+                    .width(Length::Fill),
+            ]
+        }
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+
         let form = column![
             row![field("Base URL"), text_input("", &state.base_url).on_input(Message::BaseUrlChanged)]
                 .spacing(6)
@@ -205,9 +299,16 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center),
-            row![field("Model"), text_input("", &state.model).on_input(Message::ModelChanged)]
-                .spacing(6)
-                .align_y(iced::Alignment::Center),
+            row![
+                Space::new().width(Length::Fixed(70.0)),
+                button(text("Test Connection"))
+                    .style(crate::flat_button_style)
+                    .on_press(Message::TestConnection),
+                text(status_text).size(12),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+            model_row,
         ]
         .spacing(6);
 
@@ -313,6 +414,56 @@ fn run_conversation(
         }
     }
     let _ = tx.send(Event::Done);
+}
+
+/// Calls the OpenAI-compatible `GET /models` endpoint to both confirm the base URL/API key
+/// work and list what's available to pick from -- local runtimes like Ollama serve this from
+/// their OpenAI-compatible port without needing an API key.
+fn fetch_models(base_url: String, api_key: String, tx: mpsc::Sender<TestEvent>) {
+    let url = format!("{base_url}/models");
+    let mut request = ureq::get(&url).header("Content-Type", "application/json");
+    if !api_key.trim().is_empty() {
+        request = request.header("Authorization", &format!("Bearer {api_key}"));
+    }
+
+    let response = match request.call() {
+        Ok(response) => response,
+        Err(err) => {
+            let _ = tx.send(TestEvent::Error(err.to_string()));
+            return;
+        }
+    };
+
+    let mut reader = response.into_body().into_reader();
+    let mut text = String::new();
+    if let Err(err) = std::io::Read::read_to_string(&mut reader, &mut text) {
+        let _ = tx.send(TestEvent::Error(err.to_string()));
+        return;
+    }
+
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(err) => {
+            let _ = tx.send(TestEvent::Error(format!("invalid response: {err}")));
+            return;
+        }
+    };
+
+    let models: Vec<String> = value["data"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry["id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if models.is_empty() {
+        let _ = tx.send(TestEvent::Error("connected, but no models were returned".to_string()));
+    } else {
+        let _ = tx.send(TestEvent::Success(models));
+    }
 }
 
 /// Sends one chat-completions request and streams the SSE response, forwarding text deltas as
