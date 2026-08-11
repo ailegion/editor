@@ -491,7 +491,13 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
     for (i, message) in state.messages.iter().enumerate() {
         if message.content.is_empty() {
             if i == last && state.streaming {
-                messages_col = messages_col.push(column![text(message.role.label()), text("...")]);
+                messages_col = messages_col.push(column![
+                    text(message.role.label()),
+                    text("Waiting for response...").style(|theme: &iced::Theme| {
+                        let palette = theme.extended_palette();
+                        iced::widget::text::Style { color: Some(palette.background.strong.color) }
+                    }),
+                ]);
             }
             continue;
         }
@@ -514,22 +520,44 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
     let mut bottom = column![].spacing(4);
     if let Some(pending) = &state.pending_permission {
         bottom = bottom.push(
-            row![
-                text(format!("Allow tool call: {}?", pending.label)),
-                Space::new().width(Length::Fill),
-                button(text("Allow")).on_press(Message::PermissionChosen(true)),
-                button(text("Deny")).on_press(Message::PermissionChosen(false)),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center),
+            container(
+                column![
+                    text(format!("Allow tool call: {}?", pending.label)),
+                    row![
+                        button(text("Allow")).on_press(Message::PermissionChosen(true)),
+                        button(text("Deny")).on_press(Message::PermissionChosen(false)),
+                    ]
+                    .spacing(6),
+                ]
+                .spacing(6),
+            )
+            .padding(8)
+            .width(Length::Fill)
+            .style(|theme: &iced::Theme| {
+                let palette = theme.extended_palette();
+                iced::widget::container::Style {
+                    background: Some(palette.background.weak.color.into()),
+                    border: iced::Border::default().rounded(6.0),
+                    ..iced::widget::container::Style::default()
+                }
+            }),
         );
     }
     bottom = bottom.push(
         row![
             text_editor(&state.input)
-                .placeholder("Message...")
+                .placeholder("Message... (Cmd+Enter to send)")
                 .on_action(Message::InputChanged)
-                .height(Length::Fixed(72.0)),
+                .height(Length::Fixed(72.0))
+                .key_binding(|key_press| {
+                    let is_enter =
+                        key_press.key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter);
+                    if is_enter && key_press.modifiers.command() {
+                        Some(text_editor::Binding::Custom(Message::Send))
+                    } else {
+                        text_editor::Binding::from_key_press(key_press)
+                    }
+                }),
             if state.streaming {
                 button(text("Stop")).on_press(Message::Stop)
             } else {

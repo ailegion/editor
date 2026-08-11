@@ -666,7 +666,14 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
             Entry::Thinking { content } => labeled_copyable("Thinking", content),
             Entry::Assistant { content } => {
                 if content.is_empty() && i == last && state.streaming {
-                    column![text("Claude"), text("...")].into()
+                    column![
+                        text("Claude"),
+                        text("Waiting for response...").style(|theme: &iced::Theme| {
+                            let palette = theme.extended_palette();
+                            iced::widget::text::Style { color: Some(palette.background.strong.color) }
+                        }),
+                    ]
+                    .into()
                 } else {
                     labeled_copyable("Claude", content)
                 }
@@ -713,9 +720,18 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
     bottom = bottom.push(
         row![
             text_editor(&state.input)
-                .placeholder("Message...")
+                .placeholder("Message... (Cmd+Enter to send)")
                 .on_action(Message::InputChanged)
-                .height(Length::Fixed(72.0)),
+                .height(Length::Fixed(72.0))
+                .key_binding(|key_press| {
+                    let is_enter =
+                        key_press.key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter);
+                    if is_enter && key_press.modifiers.command() {
+                        Some(text_editor::Binding::Custom(Message::Send))
+                    } else {
+                        text_editor::Binding::from_key_press(key_press)
+                    }
+                }),
             send_button,
         ]
         .spacing(4),
