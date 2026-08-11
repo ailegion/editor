@@ -718,7 +718,7 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
         button(text("Send")).on_press(Message::Send)
     };
     bottom = bottom.push(
-        row![
+        column![
             text_editor(&state.input)
                 .placeholder("Message... (Cmd+Enter to send)")
                 .on_action(Message::InputChanged)
@@ -732,7 +732,7 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
                         text_editor::Binding::from_key_press(key_press)
                     }
                 }),
-            send_button,
+            row![Space::new().width(Length::Fill), send_button],
         ]
         .spacing(4),
     );

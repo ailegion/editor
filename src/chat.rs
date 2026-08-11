@@ -544,7 +544,7 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
         );
     }
     bottom = bottom.push(
-        row![
+        column![
             text_editor(&state.input)
                 .placeholder("Message... (Cmd+Enter to send)")
                 .on_action(Message::InputChanged)
@@ -558,11 +558,14 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
                         text_editor::Binding::from_key_press(key_press)
                     }
                 }),
-            if state.streaming {
-                button(text("Stop")).on_press(Message::Stop)
-            } else {
-                button(text("Send")).on_press(Message::Send)
-            },
+            row![
+                Space::new().width(Length::Fill),
+                if state.streaming {
+                    button(text("Stop")).on_press(Message::Stop)
+                } else {
+                    button(text("Send")).on_press(Message::Send)
+                },
+            ],
         ]
         .spacing(4),
     );
@@ -752,17 +755,26 @@ fn run_request(
 
     let mut content = String::new();
     let mut tool_calls: Vec<ToolCallAccum> = Vec::new();
+    let mut saw_done = false;
+    let mut read_error: Option<String> = None;
 
     let reader = BufReader::new(response.into_body().into_reader());
     for line in reader.lines() {
         if cancel.load(Ordering::Relaxed) {
             return None;
         }
-        let Ok(line) = line else { break };
+        let line = match line {
+            Ok(line) => line,
+            Err(err) => {
+                read_error = Some(err.to_string());
+                break;
+            }
+        };
         let Some(data) = line.strip_prefix("data: ") else {
             continue;
         };
         if data == "[DONE]" {
+            saw_done = true;
             break;
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
@@ -792,6 +804,20 @@ fn run_request(
             }
         }
     }
+
+    // A well-behaved OpenAI-compatible stream always ends with a `[DONE]` marker; if the
+    // connection was cut short before that (dropped, reset, server crash mid-generation),
+    // silently returning whatever was gathered so far would look to the user like the AI just
+    // stopped replying with no explanation. Surface it instead.
+    if !saw_done && !cancel.load(Ordering::Relaxed) {
+        let reason = read_error.unwrap_or_else(|| "connection closed unexpectedly".to_string());
+        if content.is_empty() && tool_calls.is_empty() {
+            let _ = tx.send(Event::Error(reason));
+            return None;
+        }
+        let _ = tx.send(Event::Delta(format!("\n\n[response interrupted: {reason}]")));
+    }
+
     Some((content, tool_calls))
 }
 
