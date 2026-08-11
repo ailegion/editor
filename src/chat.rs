@@ -2,6 +2,7 @@ use iced::widget::{
     button, column, container, pick_list, row, scrollable, text, text_editor, text_input, Space,
 };
 use iced::{Element, Length, Task};
+use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,13 +56,55 @@ enum Event {
     /// Sent when a `write_file` tool call succeeds, so the main app can reload any open tabs
     /// and refresh the file tree to pick up the change.
     FileChanged,
+    /// The background thread wants to run a tool and is blocked on `respond` until the main
+    /// thread relays the user's Allow/Deny choice back through it.
+    PermissionRequest(PendingPermission),
     Done,
     Error(String),
+}
+
+/// One tool call awaiting the user's Allow/Deny -- `respond` unblocks the background thread's
+/// blocking `recv()` in `request_permission`. Dropping it without sending (e.g. because the
+/// user hit Stop) reads as a denial on the other end.
+struct PendingPermission {
+    label: String,
+    respond: mpsc::Sender<bool>,
 }
 
 enum TestEvent {
     Success(Vec<String>),
     Error(String),
+}
+
+/// One base URL/API key/model combination the user has saved, so switching between e.g. a
+/// local Ollama instance and a hosted API doesn't mean retyping everything each time.
+#[derive(Clone, Serialize, Deserialize)]
+struct SavedConnection {
+    name: String,
+    base_url: String,
+    api_key: String,
+    model: String,
+}
+
+fn connections_path() -> Option<PathBuf> {
+    crate::config_path("ai_connections.json")
+}
+
+fn load_connections() -> Vec<SavedConnection> {
+    connections_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_connections(connections: &[SavedConnection]) {
+    let Some(path) = connections_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string(connections) {
+        let _ = std::fs::write(path, text);
+    }
 }
 
 #[derive(Default)]
@@ -74,16 +117,19 @@ enum ConnectionStatus {
 }
 
 pub struct ChatState {
+    connection_name: String,
     base_url: String,
     api_key: String,
     model: String,
     models: Vec<String>,
+    connections: Vec<SavedConnection>,
     connection_status: ConnectionStatus,
     messages: Vec<ChatMsg>,
     input: text_editor::Content,
     rx: Option<Receiver<Event>>,
     cancel: Option<Arc<AtomicBool>>,
     test_rx: Option<Receiver<TestEvent>>,
+    pending_permission: Option<PendingPermission>,
     streaming: bool,
     settings_open: bool,
     files_changed: bool,
@@ -92,16 +138,19 @@ pub struct ChatState {
 impl Default for ChatState {
     fn default() -> Self {
         Self {
+            connection_name: String::new(),
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: String::new(),
             model: String::new(),
             models: Vec::new(),
+            connections: load_connections(),
             connection_status: ConnectionStatus::default(),
             messages: Vec::new(),
             input: text_editor::Content::new(),
             rx: None,
             cancel: None,
             test_rx: None,
+            pending_permission: None,
             streaming: false,
             settings_open: false,
             files_changed: false,
@@ -111,16 +160,21 @@ impl Default for ChatState {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    ConnectionNameChanged(String),
     BaseUrlChanged(String),
     ApiKeyChanged(String),
     ModelChanged(String),
     ModelSelected(String),
     TestConnection,
+    SaveConnection,
+    LoadConnection(usize),
+    DeleteConnection(usize),
     InputChanged(text_editor::Action),
     ToggleSettings,
     Send,
     Stop,
     Copy(String),
+    PermissionChosen(bool),
 }
 
 impl ChatState {
@@ -164,6 +218,7 @@ impl ChatState {
                     self.messages.push(ChatMsg { role: Role::Assistant, content: String::new() });
                 }
                 Event::FileChanged => self.files_changed = true,
+                Event::PermissionRequest(pending) => self.pending_permission = Some(pending),
                 Event::Done => finished = true,
                 Event::Error(err) => {
                     if let Some(last) = self.messages.last_mut() {
@@ -229,6 +284,9 @@ impl ChatState {
         self.streaming = false;
         self.rx = None;
         self.cancel = None;
+        // Dropped without a reply, this reads as a denial to whatever `request_permission`
+        // call the background thread is blocked on, letting it unwind instead of hanging.
+        self.pending_permission = None;
     }
 
     /// Hits the `/models` endpoint to confirm the base URL/API key work before letting the
@@ -244,10 +302,52 @@ impl ChatState {
 
         std::thread::spawn(move || fetch_models(base_url, api_key, tx));
     }
+
+    /// Saves the current Base URL/API key/model as a named card, updating one of the same
+    /// name in place if it already exists.
+    fn save_connection(&mut self) {
+        let name = if self.connection_name.trim().is_empty() {
+            if self.model.is_empty() { self.base_url.clone() } else { self.model.clone() }
+        } else {
+            self.connection_name.clone()
+        };
+        let entry = SavedConnection {
+            name: name.clone(),
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+        };
+        match self.connections.iter_mut().find(|c| c.name == name) {
+            Some(existing) => *existing = entry,
+            None => self.connections.push(entry),
+        }
+        self.connection_name = name;
+        save_connections(&self.connections);
+    }
+
+    /// Loads a saved card into the current form and immediately re-tests it, so picking a
+    /// card is enough to get back to a working, connected state.
+    fn load_connection(&mut self, index: usize) {
+        let Some(conn) = self.connections.get(index) else { return };
+        self.connection_name = conn.name.clone();
+        self.base_url = conn.base_url.clone();
+        self.api_key = conn.api_key.clone();
+        self.model = conn.model.clone();
+        self.test_connection();
+    }
+
+    fn delete_connection(&mut self, index: usize) {
+        if index >= self.connections.len() {
+            return;
+        }
+        self.connections.remove(index);
+        save_connections(&self.connections);
+    }
 }
 
 pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Message> {
     match message {
+        Message::ConnectionNameChanged(text) => state.connection_name = text,
         Message::BaseUrlChanged(text) => {
             state.base_url = text;
             state.connection_status = ConnectionStatus::Idle;
@@ -261,11 +361,19 @@ pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Mes
         Message::ModelChanged(text) => state.model = text,
         Message::ModelSelected(model) => state.model = model,
         Message::TestConnection => state.test_connection(),
+        Message::SaveConnection => state.save_connection(),
+        Message::LoadConnection(index) => state.load_connection(index),
+        Message::DeleteConnection(index) => state.delete_connection(index),
         Message::InputChanged(action) => state.input.perform(action),
         Message::ToggleSettings => state.settings_open = !state.settings_open,
         Message::Send => state.send(cwd),
         Message::Stop => state.stop(),
         Message::Copy(text) => return iced::clipboard::write(text),
+        Message::PermissionChosen(allowed) => {
+            if let Some(pending) = state.pending_permission.take() {
+                let _ = pending.respond.send(allowed);
+            }
+        }
     }
     Task::none()
 }
@@ -283,6 +391,31 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
 
     if state.settings_open {
         let field = |label: &'static str| text(label).width(Length::Fixed(70.0));
+
+        let mut cards = column![].spacing(2);
+        for (i, conn) in state.connections.iter().enumerate() {
+            cards = cards.push(
+                row![
+                    button(
+                        column![
+                            text(conn.name.clone()),
+                            text(format!("{} -- {}", conn.base_url, conn.model)).size(11),
+                        ]
+                        .spacing(1)
+                    )
+                    .width(Length::Fill)
+                    .padding([4, 8])
+                    .style(crate::flat_button_style)
+                    .on_press(Message::LoadConnection(i)),
+                    button(text("x"))
+                        .padding([4, 8])
+                        .style(crate::flat_button_style)
+                        .on_press(Message::DeleteConnection(i)),
+                ]
+                .spacing(4)
+                .align_y(iced::Alignment::Center),
+            );
+        }
 
         let status_text = match &state.connection_status {
             ConnectionStatus::Idle => String::new(),
@@ -307,6 +440,10 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
         .align_y(iced::Alignment::Center);
 
         let form = column![
+            cards,
+            row![field("Name"), text_input("", &state.connection_name).on_input(Message::ConnectionNameChanged)]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
             row![field("Base URL"), text_input("", &state.base_url).on_input(Message::BaseUrlChanged)]
                 .spacing(6)
                 .align_y(iced::Alignment::Center),
@@ -328,6 +465,14 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
             .spacing(6)
             .align_y(iced::Alignment::Center),
             model_row,
+            row![
+                Space::new().width(Length::Fixed(70.0)),
+                button(text("Save"))
+                    .style(crate::flat_button_style)
+                    .on_press(Message::SaveConnection),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
         ]
         .spacing(6);
 
@@ -366,20 +511,35 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
     }
     let messages = scrollable(messages_col).height(Length::Fill);
 
-    let input_row = row![
-        text_editor(&state.input)
-            .placeholder("Message...")
-            .on_action(Message::InputChanged)
-            .height(Length::Fixed(72.0)),
-        if state.streaming {
-            button(text("Stop")).on_press(Message::Stop)
-        } else {
-            button(text("Send")).on_press(Message::Send)
-        },
-    ]
-    .spacing(4);
+    let mut bottom = column![].spacing(4);
+    if let Some(pending) = &state.pending_permission {
+        bottom = bottom.push(
+            row![
+                text(format!("Allow tool call: {}?", pending.label)),
+                Space::new().width(Length::Fill),
+                button(text("Allow")).on_press(Message::PermissionChosen(true)),
+                button(text("Deny")).on_press(Message::PermissionChosen(false)),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+        );
+    }
+    bottom = bottom.push(
+        row![
+            text_editor(&state.input)
+                .placeholder("Message...")
+                .on_action(Message::InputChanged)
+                .height(Length::Fixed(72.0)),
+            if state.streaming {
+                button(text("Stop")).on_press(Message::Stop)
+            } else {
+                button(text("Send")).on_press(Message::Send)
+            },
+        ]
+        .spacing(4),
+    );
 
-    container(column![header, messages, input_row].spacing(8))
+    container(column![header, messages, bottom].spacing(8))
         .height(Length::Fill)
         .into()
 }
@@ -438,7 +598,19 @@ fn run_conversation(
                 return;
             }
             let preview = truncate(&call.arguments, 80);
-            let _ = tx.send(Event::ToolStart(format!("{}({})", call.name, preview)));
+            let label = format!("{}({})", call.name, preview);
+
+            if !request_permission(&tx, &label) {
+                let _ = tx.send(Event::ToolStart(format!("{label}  [denied]")));
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": "error: user denied permission for this tool call",
+                }));
+                continue;
+            }
+
+            let _ = tx.send(Event::ToolStart(label));
             let result = execute_tool(&cwd, &call.name, &call.arguments);
             if call.name == "write_file" && !result.starts_with("error") {
                 let _ = tx.send(Event::FileChanged);
@@ -451,6 +623,18 @@ fn run_conversation(
         }
     }
     let _ = tx.send(Event::Done);
+}
+
+/// Blocks the background thread until the main thread relays the user's Allow/Deny choice for
+/// `label` back through the one-shot channel bundled into the `PermissionRequest` event. If
+/// the channel disconnects without a reply (e.g. the user hit Stop), that reads as a denial.
+fn request_permission(tx: &mpsc::Sender<Event>, label: &str) -> bool {
+    let (respond, response) = mpsc::channel();
+    let request = PendingPermission { label: label.to_string(), respond };
+    if tx.send(Event::PermissionRequest(request)).is_err() {
+        return false;
+    }
+    response.recv().unwrap_or(false)
 }
 
 /// Calls the OpenAI-compatible `GET /models` endpoint to both confirm the base URL/API key

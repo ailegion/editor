@@ -1171,7 +1171,7 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
     }
 }
 
-fn config_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn config_path(name: &str) -> Option<PathBuf> {
     Some(home_dir()?.join(".config").join("editor").join(name))
 }
 
