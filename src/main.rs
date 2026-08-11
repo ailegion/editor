@@ -1219,10 +1219,15 @@ fn reveal_in_file_manager(path: &Path) {
 }
 
 pub fn main() -> iced::Result {
+    let icon = iced::window::icon::from_file_data(include_bytes!("../icon.png"), None).ok();
     iced::application(State::new, update, view)
         .title("editor")
         .theme(|state: &State| state.app_theme.clone())
         .subscription(subscription)
         .font(iced_swdir_tree::LUCIDE_FONT_BYTES)
+        .window(iced::window::Settings {
+            icon,
+            ..Default::default()
+        })
         .run()
 }
