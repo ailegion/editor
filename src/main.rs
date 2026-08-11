@@ -166,6 +166,7 @@ enum Message {
     TabClosed(usize),
 
     Tree(DirectoryTreeEvent),
+    RefreshTree,
     ContextNewFile,
     ContextNewFolder,
     ContextRename,
@@ -564,6 +565,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             if let Some(tree) = &mut state.tree {
                 task = tree.update(event).map(Message::Tree);
+            }
+        }
+        Message::RefreshTree => {
+            if let Some(root) = state.root.clone() {
+                task = refresh_dir_task(root);
             }
         }
         Message::ContextNewFile => {
@@ -1145,6 +1151,7 @@ fn view_tree(state: &State) -> Element<'_, Message> {
                 menu_button("Copy Path".to_string(), Message::ContextCopyPath),
                 menu_button("Copy Relative Path".to_string(), Message::ContextCopyRelativePath),
                 menu_button(reveal_label().to_string(), Message::ContextReveal),
+                menu_button("Refresh".to_string(), Message::RefreshTree),
             ]
             .width(Length::Fixed(200.0)),
         )
@@ -1152,7 +1159,7 @@ fn view_tree(state: &State) -> Element<'_, Message> {
         .style(|theme: &iced::Theme| {
             let palette = theme.extended_palette();
             iced::widget::container::Style {
-                background: Some(palette.background.weak.color.into()),
+                background: Some(palette.background.base.color.into()),
                 border: iced::Border::default().rounded(6.0),
                 ..iced::widget::container::Style::default()
             }
