@@ -85,6 +85,16 @@ impl Buffer {
         (self.cursor.line + 1, col + 1)
     }
 
+    /// Selects the entire document, cursor ending at the very end. `perform` only reads
+    /// `self.selection` back into the transient `Editor` at the start of each call, so setting
+    /// it directly between the two motions (rather than via an `Action`) sticks -- matching
+    /// how `input::handle_key` anchors shift-selections.
+    pub fn select_all(&mut self) {
+        self.perform(cosmic_text::Action::Motion(cosmic_text::Motion::BufferStart));
+        self.selection = Selection::Normal(self.cursor);
+        self.perform(cosmic_text::Action::Motion(cosmic_text::Motion::BufferEnd));
+    }
+
     /// Pixel position of the top-left corner of the cursor, relative to the buffer origin.
     pub fn cursor_pixel(&self) -> Option<(i32, i32)> {
         self.cursor_pixel

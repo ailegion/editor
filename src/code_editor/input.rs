@@ -30,6 +30,10 @@ pub fn handle_key(buffer: &mut Buffer, key: &Key, modifiers: Modifiers) -> bool 
                 buffer.redo();
                 true
             }
+            Key::Character("a") => {
+                buffer.select_all();
+                true
+            }
             _ => false,
         };
     }

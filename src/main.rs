@@ -110,6 +110,7 @@ impl std::fmt::Display for FileAction {
 enum EditAction {
     Undo,
     Redo,
+    SelectAll,
 }
 
 impl std::fmt::Display for EditAction {
@@ -117,6 +118,7 @@ impl std::fmt::Display for EditAction {
         let label = match self {
             EditAction::Undo => "Undo (Cmd+Z)",
             EditAction::Redo => "Redo (Cmd+Shift+Z)",
+            EditAction::SelectAll => "Select All (Cmd+A)",
         };
         write!(f, "{label}")
     }
@@ -211,6 +213,8 @@ struct State {
     zoom: f32,
 
     panes: pane_grid::State<PaneKind>,
+    sidebar_split: pane_grid::Split,
+    ai_split: Option<pane_grid::Split>,
 
     ai_visible: bool,
     ai_mode: AiMode,
@@ -227,23 +231,27 @@ impl State {
         let ai_visible = load_ai_visible();
         let app_theme = load_app_theme();
         let zoom = load_zoom();
-        let main_pane = pane_grid::Configuration::Pane(PaneKind::Main);
-        let main_and_ai = if ai_visible {
-            pane_grid::Configuration::Split {
-                axis: pane_grid::Axis::Vertical,
-                ratio: 0.75,
-                a: Box::new(main_pane),
-                b: Box::new(pane_grid::Configuration::Pane(PaneKind::Ai)),
+        let sidebar_ratio = load_sidebar_ratio();
+        let ai_ratio = load_ai_ratio();
+
+        let (mut panes, sidebar_pane) = pane_grid::State::new(PaneKind::Sidebar);
+        let (main_pane, sidebar_split) = panes
+            .split(pane_grid::Axis::Vertical, sidebar_pane, PaneKind::Main)
+            .expect("splitting a freshly created single-pane state always succeeds");
+        panes.resize(sidebar_split, sidebar_ratio);
+
+        let ai_split = if ai_visible {
+            let split = panes
+                .split(pane_grid::Axis::Vertical, main_pane, PaneKind::Ai)
+                .map(|(_, split)| split);
+            if let Some(split) = split {
+                panes.resize(split, ai_ratio);
             }
+            split
         } else {
-            main_pane
+            None
         };
-        let panes = pane_grid::State::with_configuration(pane_grid::Configuration::Split {
-            axis: pane_grid::Axis::Vertical,
-            ratio: 0.2,
-            a: Box::new(pane_grid::Configuration::Pane(PaneKind::Sidebar)),
-            b: Box::new(main_and_ai),
-        });
+
         Self {
             root,
             tabs: Vec::new(),
@@ -258,6 +266,8 @@ impl State {
             highlighter: code_editor::Highlighter::new(),
             zoom,
             panes,
+            sidebar_split,
+            ai_split,
             ai_visible,
             ai_mode: AiMode::default(),
             chat: chat::ChatState::default(),
@@ -517,6 +527,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 match action {
                     EditAction::Undo => tab.content.undo(),
                     EditAction::Redo => tab.content.redo(),
+                    EditAction::SelectAll => tab.content.select_all(),
                 }
             }
             state.mark_edited_if_changed(before);
@@ -643,6 +654,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
             state.panes.resize(split, ratio);
+            if split == state.sidebar_split {
+                save_sidebar_ratio(ratio);
+            } else if Some(split) == state.ai_split {
+                save_ai_ratio(ratio);
+            }
         }
 
         Message::KeyPressed(key, modifiers) => {
@@ -735,7 +751,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     if let Some((_, split)) =
                         state.panes.split(pane_grid::Axis::Vertical, main_pane, PaneKind::Ai)
                     {
-                        state.panes.resize(split, 0.75);
+                        state.panes.resize(split, load_ai_ratio());
+                        state.ai_split = Some(split);
                     }
                 }
             } else {
@@ -747,6 +764,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 if let Some(ai_pane) = ai_pane {
                     state.panes.close(ai_pane);
                 }
+                state.ai_split = None;
             }
         }
         Message::AiModeSelected(mode) => state.ai_mode = mode,
@@ -952,6 +970,10 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
         (menu_button_maybe(
             EditAction::Redo.to_string(),
             can_redo.then_some(Message::EditAction(EditAction::Redo)),
+        )),
+        (menu_button_maybe(
+            EditAction::SelectAll.to_string(),
+            has_active_tab.then_some(Message::EditAction(EditAction::SelectAll)),
         )),
         (menu_button_maybe(
             "Find (Cmd+F)".to_string(),
@@ -1225,6 +1247,40 @@ fn load_zoom() -> f32 {
         .and_then(|text| text.trim().parse::<f32>().ok())
         .map(|zoom| zoom.clamp(code_editor::ZOOM_MIN, code_editor::ZOOM_MAX))
         .unwrap_or(code_editor::ZOOM_DEFAULT)
+}
+
+fn save_sidebar_ratio(ratio: f32) {
+    let Some(path) = config_path("sidebar_ratio") else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, ratio.to_string());
+}
+
+fn load_sidebar_ratio() -> f32 {
+    config_path("sidebar_ratio")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| text.trim().parse::<f32>().ok())
+        .map(|ratio| ratio.clamp(0.05, 0.95))
+        .unwrap_or(0.2)
+}
+
+fn save_ai_ratio(ratio: f32) {
+    let Some(path) = config_path("ai_ratio") else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, ratio.to_string());
+}
+
+/// Default is wider than the pane grid's original 0.75 (main:ai) -- the AI panel was too
+/// cramped out of the box.
+fn load_ai_ratio() -> f32 {
+    config_path("ai_ratio")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| text.trim().parse::<f32>().ok())
+        .map(|ratio| ratio.clamp(0.05, 0.95))
+        .unwrap_or(0.65)
 }
 
 fn save_ai_visible(visible: bool) {
