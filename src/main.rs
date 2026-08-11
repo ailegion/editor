@@ -194,6 +194,10 @@ enum Message {
     Chat(chat::Message),
     Acp(acp::Message),
     Tick,
+
+    WindowResized(iced::window::Id, iced::Size),
+    WindowMoved(iced::Point),
+    WindowMaximizedChecked(bool),
 }
 
 struct State {
@@ -215,6 +219,11 @@ struct State {
     panes: pane_grid::State<PaneKind>,
     sidebar_split: pane_grid::Split,
     ai_split: Option<pane_grid::Split>,
+
+    /// The most recent size reported by a `WindowResized` event -- kept so the async
+    /// `is_maximized` check triggered by that same event (see its handler) knows what to
+    /// persist as "windowed size" once it resolves.
+    last_known_size: iced::Size,
 
     ai_visible: bool,
     ai_mode: AiMode,
@@ -268,6 +277,7 @@ impl State {
             panes,
             sidebar_split,
             ai_split,
+            last_known_size: load_window_size(),
             ai_visible,
             ai_mode: AiMode::default(),
             chat: chat::ChatState::default(),
@@ -789,6 +799,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
             }
         }
+
+        Message::WindowResized(id, size) => {
+            state.last_known_size = size;
+            task = iced::window::is_maximized(id).map(Message::WindowMaximizedChecked);
+        }
+        Message::WindowMoved(position) => save_window_position(position),
+        Message::WindowMaximizedChecked(maximized) => {
+            save_window_maximized(maximized);
+            if !maximized {
+                save_window_size(state.last_known_size);
+            }
+        }
     }
     task
 }
@@ -1180,7 +1202,12 @@ fn subscription(_state: &State) -> Subscription<Message> {
         _ => Message::Noop,
     });
     let tick = iced::time::every(Duration::from_millis(50)).map(|_| Message::Tick);
-    Subscription::batch([keys, tick])
+    let window_events = iced::window::events().map(|(id, event)| match event {
+        iced::window::Event::Resized(size) => Message::WindowResized(id, size),
+        iced::window::Event::Moved(position) => Message::WindowMoved(position),
+        _ => Message::Noop,
+    });
+    Subscription::batch([keys, tick, window_events])
 }
 
 /// `HOME` is unset on native Windows launches outside Git Bash/pwsh7, so use
@@ -1283,6 +1310,60 @@ fn load_ai_ratio() -> f32 {
         .unwrap_or(0.65)
 }
 
+fn save_window_size(size: iced::Size) {
+    let Some(path) = config_path("window_size") else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, format!("{},{}", size.width, size.height));
+}
+
+fn load_window_size() -> iced::Size {
+    config_path("window_size")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| {
+            let (w, h) = text.trim().split_once(',')?;
+            Some(iced::Size::new(w.parse().ok()?, h.parse().ok()?))
+        })
+        .unwrap_or(iced::Size::new(1280.0, 800.0))
+}
+
+fn save_window_position(position: iced::Point) {
+    let Some(path) = config_path("window_position") else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, format!("{},{}", position.x, position.y));
+}
+
+fn load_window_position() -> iced::window::Position {
+    config_path("window_position")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| {
+            let (x, y) = text.trim().split_once(',')?;
+            Some(iced::window::Position::Specific(iced::Point::new(
+                x.parse().ok()?,
+                y.parse().ok()?,
+            )))
+        })
+        .unwrap_or_default()
+}
+
+fn save_window_maximized(maximized: bool) {
+    let Some(path) = config_path("window_maximized") else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, if maximized { "true" } else { "false" });
+}
+
+fn load_window_maximized() -> bool {
+    config_path("window_maximized")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| text.trim() == "true")
+        .unwrap_or(false)
+}
+
 fn save_ai_visible(visible: bool) {
     let Some(path) = config_path("ai_visible") else { return };
     if let Some(parent) = path.parent() {
@@ -1358,6 +1439,9 @@ pub fn main() -> iced::Result {
         .font(iced_swdir_tree::LUCIDE_FONT_BYTES)
         .window(iced::window::Settings {
             icon,
+            size: load_window_size(),
+            position: load_window_position(),
+            maximized: load_window_maximized(),
             ..Default::default()
         })
         .run()
