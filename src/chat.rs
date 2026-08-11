@@ -1,5 +1,7 @@
-use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input, Space};
-use iced::{Element, Length};
+use iced::widget::{
+    button, column, container, pick_list, row, scrollable, text, text_editor, text_input, Space,
+};
+use iced::{Element, Length, Task};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +52,9 @@ enum Event {
     /// Closes out the current assistant bubble and opens a fresh one for whatever text
     /// follows.
     ToolStart(String),
+    /// Sent when a `write_file` tool call succeeds, so the main app can reload any open tabs
+    /// and refresh the file tree to pick up the change.
+    FileChanged,
     Done,
     Error(String),
 }
@@ -75,12 +80,13 @@ pub struct ChatState {
     models: Vec<String>,
     connection_status: ConnectionStatus,
     messages: Vec<ChatMsg>,
-    input: String,
+    input: text_editor::Content,
     rx: Option<Receiver<Event>>,
     cancel: Option<Arc<AtomicBool>>,
     test_rx: Option<Receiver<TestEvent>>,
     streaming: bool,
     settings_open: bool,
+    files_changed: bool,
 }
 
 impl Default for ChatState {
@@ -92,12 +98,13 @@ impl Default for ChatState {
             models: Vec::new(),
             connection_status: ConnectionStatus::default(),
             messages: Vec::new(),
-            input: String::new(),
+            input: text_editor::Content::new(),
             rx: None,
             cancel: None,
             test_rx: None,
             streaming: false,
             settings_open: false,
+            files_changed: false,
         }
     }
 }
@@ -109,10 +116,11 @@ pub enum Message {
     ModelChanged(String),
     ModelSelected(String),
     TestConnection,
-    InputChanged(String),
+    InputChanged(text_editor::Action),
     ToggleSettings,
     Send,
     Stop,
+    Copy(String),
 }
 
 impl ChatState {
@@ -155,6 +163,7 @@ impl ChatState {
                     self.messages.push(ChatMsg { role: Role::Tool, content: label });
                     self.messages.push(ChatMsg { role: Role::Assistant, content: String::new() });
                 }
+                Event::FileChanged => self.files_changed = true,
                 Event::Done => finished = true,
                 Event::Error(err) => {
                     if let Some(last) = self.messages.last_mut() {
@@ -171,11 +180,19 @@ impl ChatState {
         }
     }
 
+    /// Returns true (once) after a `write_file` tool call succeeds, so the caller can reload
+    /// open tabs and refresh the file tree.
+    pub fn take_files_changed(&mut self) -> bool {
+        std::mem::take(&mut self.files_changed)
+    }
+
     fn send(&mut self, cwd: PathBuf) {
-        let text = std::mem::take(&mut self.input);
+        let text = self.input.text();
         if text.trim().is_empty() || self.streaming {
             return;
         }
+        let text = text.trim_end().to_string();
+        self.input = text_editor::Content::new();
         self.messages.push(ChatMsg {
             role: Role::User,
             content: text,
@@ -229,7 +246,7 @@ impl ChatState {
     }
 }
 
-pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) {
+pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Message> {
     match message {
         Message::BaseUrlChanged(text) => {
             state.base_url = text;
@@ -244,11 +261,13 @@ pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) {
         Message::ModelChanged(text) => state.model = text,
         Message::ModelSelected(model) => state.model = model,
         Message::TestConnection => state.test_connection(),
-        Message::InputChanged(text) => state.input = text,
+        Message::InputChanged(action) => state.input.perform(action),
         Message::ToggleSettings => state.settings_open = !state.settings_open,
         Message::Send => state.send(cwd),
         Message::Stop => state.stop(),
+        Message::Copy(text) => return iced::clipboard::write(text),
     }
+    Task::none()
 }
 
 pub fn view(state: &ChatState) -> Element<'_, Message> {
@@ -331,12 +350,27 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
             }
             continue;
         }
-        messages_col = messages_col.push(column![text(message.role.label()), text(message.content.clone())]);
+        messages_col = messages_col.push(column![
+            row![
+                text(message.role.label()),
+                Space::new().width(Length::Fill),
+                button(text("Copy"))
+                    .padding([2, 6])
+                    .style(crate::flat_button_style)
+                    .on_press(Message::Copy(message.content.clone())),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+            text(message.content.clone()),
+        ]);
     }
     let messages = scrollable(messages_col).height(Length::Fill);
 
     let input_row = row![
-        text_input("", &state.input).on_input(Message::InputChanged),
+        text_editor(&state.input)
+            .placeholder("Message...")
+            .on_action(Message::InputChanged)
+            .height(Length::Fixed(72.0)),
         if state.streaming {
             button(text("Stop")).on_press(Message::Stop)
         } else {
@@ -406,6 +440,9 @@ fn run_conversation(
             let preview = truncate(&call.arguments, 80);
             let _ = tx.send(Event::ToolStart(format!("{}({})", call.name, preview)));
             let result = execute_tool(&cwd, &call.name, &call.arguments);
+            if call.name == "write_file" && !result.starts_with("error") {
+                let _ = tx.send(Event::FileChanged);
+            }
             messages.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": call.id,
@@ -546,9 +583,9 @@ fn run_request(
     Some((content, tool_calls))
 }
 
-/// OpenAI-format `tools` array describing the functions the model may call. Kept small and
-/// read-only -- enough for the model to orient itself in the open project -- rather than
-/// exposing write access.
+/// OpenAI-format `tools` array describing the functions the model may call: enough for the
+/// model to read/search its way around the open project, plus `write_file` to create or
+/// overwrite files in it.
 fn tool_defs() -> serde_json::Value {
     serde_json::json!([
         {
@@ -590,6 +627,21 @@ fn tool_defs() -> serde_json::Value {
                         "query": { "type": "string" },
                     },
                     "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Create a new file or overwrite an existing one in the open project, given a path relative to the project root and the file's full text content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Path relative to the project root" },
+                        "content": { "type": "string", "description": "The full text content to write" },
+                    },
+                    "required": ["path", "content"],
                 },
             },
         },
@@ -647,6 +699,21 @@ fn execute_tool(cwd: &Path, name: &str, arguments: &str) -> String {
                     .join("\n")
             }
         }
+        "write_file" => {
+            let Some(rel) = args["path"].as_str() else {
+                return "error: missing 'path'".to_string();
+            };
+            let Some(content) = args["content"].as_str() else {
+                return "error: missing 'content'".to_string();
+            };
+            match resolve_write_path(cwd, rel) {
+                Some(path) => match std::fs::write(&path, content) {
+                    Ok(()) => format!("wrote {} bytes to {rel}", content.len()),
+                    Err(err) => format!("error writing file: {err}"),
+                },
+                None => "error: path escapes the project root".to_string(),
+            }
+        }
         other => format!("error: unknown tool '{other}'"),
     }
 }
@@ -657,6 +724,21 @@ fn resolve_path(cwd: &Path, rel: &str) -> Option<PathBuf> {
     let root = cwd.canonicalize().ok()?;
     let candidate = root.join(rel).canonicalize().ok()?;
     candidate.starts_with(&root).then_some(candidate)
+}
+
+/// Like `resolve_path`, but for a file that may not exist yet: canonicalizes the parent
+/// directory (creating it if needed) instead of the file itself, and rejects anything whose
+/// parent falls outside `cwd`.
+fn resolve_write_path(cwd: &Path, rel: &str) -> Option<PathBuf> {
+    let root = cwd.canonicalize().ok()?;
+    let candidate = root.join(rel);
+    let parent = candidate.parent()?;
+    std::fs::create_dir_all(parent).ok()?;
+    let canon_parent = parent.canonicalize().ok()?;
+    if !canon_parent.starts_with(&root) {
+        return None;
+    }
+    Some(canon_parent.join(candidate.file_name()?))
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {

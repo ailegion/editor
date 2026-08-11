@@ -752,17 +752,23 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::AiModeSelected(mode) => state.ai_mode = mode,
         Message::Chat(msg) => {
             let cwd = state.root_or_cwd();
-            chat::update(&mut state.chat, msg, cwd);
+            task = chat::update(&mut state.chat, msg, cwd).map(Message::Chat);
         }
         Message::Acp(msg) => {
             let cwd = state.root_or_cwd();
-            acp::update(&mut state.acp, msg, cwd);
+            task = acp::update(&mut state.acp, msg, cwd).map(Message::Acp);
         }
         Message::Tick => {
             state.chat.poll();
             state.acp.poll();
             if state.acp.take_finished() {
                 state.reload_open_tabs();
+            }
+            if state.chat.take_files_changed() {
+                state.reload_open_tabs();
+                if let Some(root) = state.root.clone() {
+                    task = refresh_dir_task(root);
+                }
             }
         }
     }

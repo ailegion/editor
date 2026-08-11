@@ -1,5 +1,5 @@
-use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
-use iced::{Element, Length};
+use iced::widget::{button, column, container, row, scrollable, text, text_editor, Space};
+use iced::{Element, Length, Task};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -101,14 +101,13 @@ enum Event {
     Error(String),
 }
 
-#[derive(Default)]
 pub struct AcpState {
     loaded: bool,
     cwd: Option<PathBuf>,
     threads: Vec<Thread>,
     active_thread: usize,
     entries: Vec<Entry>,
-    input: String,
+    input: text_editor::Content,
     rx: Option<Receiver<Event>>,
     prompt_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     cancel_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
@@ -122,15 +121,40 @@ pub struct AcpState {
     thread_menu_open: bool,
 }
 
+impl Default for AcpState {
+    fn default() -> Self {
+        Self {
+            loaded: false,
+            cwd: None,
+            threads: Vec::new(),
+            active_thread: 0,
+            entries: Vec::new(),
+            input: text_editor::Content::new(),
+            rx: None,
+            prompt_tx: None,
+            cancel_tx: None,
+            streaming: false,
+            started: false,
+            thinking_index: None,
+            assistant_index: None,
+            usage: None,
+            pending_permission: None,
+            just_finished: false,
+            thread_menu_open: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     NewThread,
     SwitchThread(usize),
     ThreadMenuToggle,
-    InputChanged(String),
+    InputChanged(text_editor::Action),
     Send,
     Stop,
     PermissionChosen(String),
+    Copy(String),
 }
 
 impl AcpState {
@@ -480,10 +504,12 @@ impl AcpState {
     }
 
     fn send(&mut self, cwd: PathBuf) {
-        let text = std::mem::take(&mut self.input);
+        let text = self.input.text();
         if text.trim().is_empty() || self.streaming {
             return;
         }
+        let text = text.trim_end().to_string();
+        self.input = text_editor::Content::new();
         let resume_session_id = self
             .threads
             .get(self.active_thread)
@@ -540,7 +566,7 @@ impl AcpState {
     }
 }
 
-pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) {
+pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Message> {
     state.ensure_loaded(&cwd);
     state.cwd = Some(cwd.clone());
     match message {
@@ -550,7 +576,7 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) {
             state.thread_menu_open = false;
         }
         Message::ThreadMenuToggle => state.thread_menu_open = !state.thread_menu_open,
-        Message::InputChanged(text) => state.input = text,
+        Message::InputChanged(action) => state.input.perform(action),
         Message::Send => state.send(cwd),
         Message::Stop => state.stop(),
         Message::PermissionChosen(option_id) => {
@@ -558,7 +584,9 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) {
                 let _ = pending.respond.send(option_id);
             }
         }
+        Message::Copy(text) => return iced::clipboard::write(text),
     }
+    Task::none()
 }
 
 pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
@@ -605,6 +633,23 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
     }
     let _ = cwd;
 
+    let labeled_copyable = |label: &'static str, content: &str| -> Element<'_, Message> {
+        column![
+            row![
+                text(label),
+                Space::new().width(Length::Fill),
+                button(text("Copy"))
+                    .padding([2, 6])
+                    .style(crate::flat_button_style)
+                    .on_press(Message::Copy(content.to_string())),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+            text(content.to_string()),
+        ]
+        .into()
+    };
+
     let mut messages = column![].spacing(6);
     let last = state.entries.len().saturating_sub(1);
     for (i, entry) in state.entries.iter().enumerate() {
@@ -617,17 +662,13 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
             Entry::ToolCall { title, status, .. } => {
                 row![text(status.icon()), text(title.clone())].spacing(6).into()
             }
-            Entry::User { content } => {
-                column![text("You"), text(content.clone())].into()
-            }
-            Entry::Thinking { content } => {
-                column![text("Thinking"), text(content.clone())].into()
-            }
+            Entry::User { content } => labeled_copyable("You", content),
+            Entry::Thinking { content } => labeled_copyable("Thinking", content),
             Entry::Assistant { content } => {
                 if content.is_empty() && i == last && state.streaming {
                     column![text("Claude"), text("...")].into()
                 } else {
-                    column![text("Claude"), text(content.clone())].into()
+                    labeled_copyable("Claude", content)
                 }
             }
         };
@@ -671,7 +712,10 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
     };
     bottom = bottom.push(
         row![
-            text_input("", &state.input).on_input(Message::InputChanged),
+            text_editor(&state.input)
+                .placeholder("Message...")
+                .on_action(Message::InputChanged)
+                .height(Length::Fixed(72.0)),
             send_button,
         ]
         .spacing(4),
