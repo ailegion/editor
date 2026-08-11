@@ -26,6 +26,12 @@ impl Highlighter {
             .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text())
     }
 
+    /// Human-readable language name (e.g. "Rust", "Go", "JavaScript") for the status bar,
+    /// taken straight from `syntect`'s syntax definitions.
+    pub fn language_name(&self, extension: &str) -> &str {
+        &self.syntax_for(extension).name
+    }
+
     /// `syntect`'s bundled themes have no 1:1 mapping to the app's 22 named `iced::Theme`s,
     /// so (matching `highlighter_theme_for` in main.rs) this maps by background brightness
     /// instead of guessing per-name.

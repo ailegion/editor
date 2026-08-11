@@ -69,6 +69,22 @@ impl Buffer {
         self.inner.lines.len()
     }
 
+    /// 1-indexed (line, column) of the cursor, for the status bar. Column is a character
+    /// count (not a byte offset), so it stays correct on lines with multi-byte characters.
+    pub fn cursor_line_col(&self) -> (usize, usize) {
+        let col = self
+            .inner
+            .lines
+            .get(self.cursor.line)
+            .map(|line| {
+                let text = line.text();
+                let index = self.cursor.index.min(text.len());
+                text[..index].chars().count()
+            })
+            .unwrap_or(0);
+        (self.cursor.line + 1, col + 1)
+    }
+
     /// Pixel position of the top-left corner of the cursor, relative to the buffer origin.
     pub fn cursor_pixel(&self) -> Option<(i32, i32)> {
         self.cursor_pixel

@@ -15,11 +15,37 @@ use iced_swdir_tree::{DirectoryFilter, DirectoryTree, DirectoryTreeEvent};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineEnding {
+    Lf,
+    Crlf,
+}
+
+impl LineEnding {
+    fn detect(text: &str) -> Self {
+        if text.contains("\r\n") {
+            LineEnding::Crlf
+        } else {
+            LineEnding::Lf
+        }
+    }
+}
+
+impl std::fmt::Display for LineEnding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LineEnding::Lf => write!(f, "LF"),
+            LineEnding::Crlf => write!(f, "CRLF"),
+        }
+    }
+}
+
 struct Tab {
     path: Option<PathBuf>,
     content: code_editor::Buffer,
     search: code_editor::search::SearchState,
     dirty: bool,
+    line_ending: LineEnding,
 }
 
 impl Tab {
@@ -302,6 +328,7 @@ impl State {
             .and_then(|e| e.to_str())
             .unwrap_or("txt")
             .to_string();
+        let line_ending = LineEnding::detect(&text);
         let mut content = code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
         content.highlight(&self.highlighter, &extension, &self.app_theme);
         self.tabs.push(Tab {
@@ -309,6 +336,7 @@ impl State {
             content,
             search: code_editor::search::SearchState::default(),
             dirty: false,
+            line_ending,
         });
         self.active_tab = self.tabs.len() - 1;
     }
@@ -760,11 +788,34 @@ fn view(state: &State) -> Element<'_, Message> {
 }
 
 fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
-    let mode_row = row![
-        button(text("HTTP")).on_press(Message::AiModeSelected(AiMode::Http)),
-        button(text("Claude Code")).on_press(Message::AiModeSelected(AiMode::Acp)),
-    ]
-    .spacing(4);
+    let mode_tab = |label: &'static str, mode: AiMode| {
+        let is_active = state.ai_mode == mode;
+        let underline = container(Space::new().width(Length::Fill).height(2)).style(
+            move |theme: &iced::Theme| iced::widget::container::Style {
+                background: Some(
+                    if is_active {
+                        theme.extended_palette().primary.base.color
+                    } else {
+                        iced::Color::TRANSPARENT
+                    }
+                    .into(),
+                ),
+                ..iced::widget::container::Style::default()
+            },
+        );
+        column![
+            button(text(label))
+                .padding([4, 4])
+                .style(move |theme, status| tab_button_style(theme, status, is_active))
+                .on_press(Message::AiModeSelected(mode)),
+            underline,
+        ]
+        .spacing(2)
+    };
+
+    let mode_row = row![mode_tab("HTTP", AiMode::Http), mode_tab("Claude Code", AiMode::Acp)]
+        .spacing(2)
+        .padding([4, 4]);
 
     let panel: Element<'_, Message> = match state.ai_mode {
         AiMode::Http => chat::view(&state.chat).map(Message::Chat),
@@ -940,12 +991,21 @@ fn view_status_bar(state: &State) -> Element<'_, Message> {
         .active_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "No file open".to_string());
-    row![
-        text(status).width(Length::Fill),
-        button(text("AI")).on_press(Message::AiToggle),
-    ]
-    .padding(4)
-    .into()
+
+    let mut bar = row![text(status).width(Length::Fill)].spacing(12);
+
+    if let Some(tab) = state.tabs.get(state.active_tab) {
+        let (line, col) = tab.content.cursor_line_col();
+        let language = state.highlighter.language_name(&tab.extension());
+        bar = bar.push(text(format!("Ln {line}, Col {col}")));
+        bar = bar.push(text(tab.line_ending.to_string()));
+        bar = bar.push(text(language.to_string()));
+    }
+
+    bar.push(button(text("AI")).on_press(Message::AiToggle))
+        .align_y(iced::Alignment::Center)
+        .padding(4)
+        .into()
 }
 
 fn view_sidebar(state: &State) -> Element<'_, Message> {
