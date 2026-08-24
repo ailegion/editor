@@ -3,6 +3,7 @@ mod chat;
 mod code_editor;
 mod git;
 mod project_search;
+mod quick_open;
 
 use iced::keyboard;
 use iced::widget::{
@@ -164,6 +165,8 @@ enum Message {
     Search(code_editor::search::Message),
     ProjectSearch(project_search::Message),
     ToggleProjectSearch,
+    QuickOpen(quick_open::Message),
+    ToggleQuickOpen,
     Git(git::Message),
     GitPanelToggle,
     TabSelected(usize),
@@ -217,6 +220,7 @@ struct State {
     creating: Option<(PathBuf, bool, String)>,
     sidebar_mode: SidebarMode,
     project_search: project_search::SearchState,
+    quick_open: quick_open::QuickOpenState,
     git: git::GitState,
 
     app_theme: iced::Theme,
@@ -290,6 +294,7 @@ impl State {
             creating: None,
             sidebar_mode: SidebarMode::default(),
             project_search: project_search::SearchState::default(),
+            quick_open: quick_open::QuickOpenState::default(),
             git: git::GitState::default(),
             app_theme,
             highlighter: code_editor::Highlighter::new(),
@@ -560,6 +565,25 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::ToggleProjectSearch => {
             state.toggle_sidebar_mode(SidebarMode::ProjectSearch);
         }
+        Message::QuickOpen(msg) => {
+            let root = state.root.clone();
+            let (t, opened) = quick_open::update(&mut state.quick_open, msg, root.as_deref());
+            task = t.map(Message::QuickOpen);
+            if let Some(path) = opened {
+                state.open_path(path);
+                state.focus = Focus::Editor;
+            }
+        }
+        Message::ToggleQuickOpen => {
+            let root = state.root.clone();
+            let msg = if state.quick_open.visible {
+                quick_open::Message::Close
+            } else {
+                quick_open::Message::Open
+            };
+            let (t, _) = quick_open::update(&mut state.quick_open, msg, root.as_deref());
+            task = t.map(Message::QuickOpen);
+        }
         Message::Git(msg) => {
             let cwd = state.root_or_cwd();
             task = git::update(&mut state.git, msg, cwd).map(Message::Git);
@@ -774,6 +798,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             );
                         }
                     }
+                    keyboard::Key::Character("p") => {
+                        let root = state.root.clone();
+                        let msg = if state.quick_open.visible {
+                            quick_open::Message::Close
+                        } else {
+                            quick_open::Message::Open
+                        };
+                        let (t, _) = quick_open::update(&mut state.quick_open, msg, root.as_deref());
+                        task = t.map(Message::QuickOpen);
+                    }
                     // "+" covers Shift+= on layouts where that's how a plus sign is typed.
                     keyboard::Key::Character("=") | keyboard::Key::Character("+") => {
                         state.apply_zoom(ViewAction::ZoomIn);
@@ -787,6 +821,25 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     // Other command combos (undo/redo, ...) are the active editor's to handle.
                     _ => {
                         state.handle_editor_key(&key, modifiers);
+                    }
+                }
+            } else if state.quick_open.visible {
+                // Single-line `text_input` captures Enter (via `on_submit`) and character keys
+                // itself, so only the keys it doesn't bind reach this global handler: arrow
+                // navigation and Escape-to-close.
+                let msg = match key.as_ref() {
+                    keyboard::Key::Named(keyboard::key::Named::Escape) => Some(quick_open::Message::Close),
+                    keyboard::Key::Named(keyboard::key::Named::ArrowDown) => Some(quick_open::Message::MoveDown),
+                    keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Some(quick_open::Message::MoveUp),
+                    _ => None,
+                };
+                if let Some(msg) = msg {
+                    let root = state.root.clone();
+                    let (t, opened) = quick_open::update(&mut state.quick_open, msg, root.as_deref());
+                    task = t.map(Message::QuickOpen);
+                    if let Some(path) = opened {
+                        state.open_path(path);
+                        state.focus = Focus::Editor;
                     }
                 }
             } else if key.as_ref() == keyboard::Key::Named(keyboard::key::Named::Escape)
@@ -919,7 +972,17 @@ fn view(state: &State) -> Element<'_, Message> {
     .on_resize(10, Message::PaneResized)
     .height(Length::Fill);
 
-    column![top_bar, panes, status_bar].into()
+    let base: Element<'_, Message> = column![top_bar, panes, status_bar].into();
+
+    if state.quick_open.visible {
+        iced::widget::stack![
+            base,
+            quick_open::view(&state.quick_open, state.root.as_deref()).map(Message::QuickOpen),
+        ]
+        .into()
+    } else {
+        base
+    }
 }
 
 fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
@@ -1090,6 +1153,10 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
         (menu_button(
             "Find in Project (Cmd+Shift+F)".to_string(),
             Message::ToggleProjectSearch
+        )),
+        (menu_button(
+            "Quick Open (Cmd+P)".to_string(),
+            Message::ToggleQuickOpen
         )),
     );
 
