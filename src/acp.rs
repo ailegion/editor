@@ -1,5 +1,5 @@
-use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
-use iced::{Element, Length};
+use iced::widget::{button, column, container, row, scrollable, text, text_editor, Space};
+use iced::{Element, Length, Task};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -101,14 +101,13 @@ enum Event {
     Error(String),
 }
 
-#[derive(Default)]
 pub struct AcpState {
     loaded: bool,
     cwd: Option<PathBuf>,
     threads: Vec<Thread>,
     active_thread: usize,
     entries: Vec<Entry>,
-    input: String,
+    input: text_editor::Content,
     rx: Option<Receiver<Event>>,
     prompt_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     cancel_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
@@ -122,15 +121,40 @@ pub struct AcpState {
     thread_menu_open: bool,
 }
 
+impl Default for AcpState {
+    fn default() -> Self {
+        Self {
+            loaded: false,
+            cwd: None,
+            threads: Vec::new(),
+            active_thread: 0,
+            entries: Vec::new(),
+            input: text_editor::Content::new(),
+            rx: None,
+            prompt_tx: None,
+            cancel_tx: None,
+            streaming: false,
+            started: false,
+            thinking_index: None,
+            assistant_index: None,
+            usage: None,
+            pending_permission: None,
+            just_finished: false,
+            thread_menu_open: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     NewThread,
     SwitchThread(usize),
     ThreadMenuToggle,
-    InputChanged(String),
+    InputChanged(text_editor::Action),
     Send,
     Stop,
     PermissionChosen(String),
+    Copy(String),
 }
 
 impl AcpState {
@@ -480,10 +504,12 @@ impl AcpState {
     }
 
     fn send(&mut self, cwd: PathBuf) {
-        let text = std::mem::take(&mut self.input);
+        let text = self.input.text();
         if text.trim().is_empty() || self.streaming {
             return;
         }
+        let text = text.trim_end().to_string();
+        self.input = text_editor::Content::new();
         let resume_session_id = self
             .threads
             .get(self.active_thread)
@@ -540,7 +566,7 @@ impl AcpState {
     }
 }
 
-pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) {
+pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Message> {
     state.ensure_loaded(&cwd);
     state.cwd = Some(cwd.clone());
     match message {
@@ -550,7 +576,7 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) {
             state.thread_menu_open = false;
         }
         Message::ThreadMenuToggle => state.thread_menu_open = !state.thread_menu_open,
-        Message::InputChanged(text) => state.input = text,
+        Message::InputChanged(action) => state.input.perform(action),
         Message::Send => state.send(cwd),
         Message::Stop => state.stop(),
         Message::PermissionChosen(option_id) => {
@@ -558,31 +584,71 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) {
                 let _ = pending.respond.send(option_id);
             }
         }
+        Message::Copy(text) => return iced::clipboard::write(text),
     }
+    Task::none()
 }
 
 pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
     let top_bar = row![
         Space::new().width(Length::Fill),
-        button(text("+")).on_press(Message::NewThread),
-        button(text("...")).on_press(Message::ThreadMenuToggle),
+        button(text("+"))
+            .padding([4, 8])
+            .style(crate::flat_button_style)
+            .on_press(Message::NewThread),
+        button(text("..."))
+            .padding([4, 8])
+            .style(crate::flat_button_style)
+            .on_press(Message::ThreadMenuToggle),
     ]
     .spacing(4)
     .width(Length::Fill);
     let mut header = column![top_bar].spacing(4);
     if state.thread_menu_open {
-        let mut menu = column![].spacing(4);
+        let mut menu = column![].spacing(2);
         for (i, thread) in state.threads.iter().enumerate() {
             let title = if thread.title.is_empty() {
                 "New thread".to_string()
             } else {
                 thread.title.clone()
             };
-            menu = menu.push(button(text(title)).on_press(Message::SwitchThread(i)));
+            menu = menu.push(
+                button(text(title))
+                    .width(Length::Fill)
+                    .padding([4, 8])
+                    .style(crate::flat_button_style)
+                    .on_press(Message::SwitchThread(i)),
+            );
         }
-        header = header.push(menu);
+        header = header.push(
+            container(menu).padding(4).style(|theme: &iced::Theme| {
+                let palette = theme.extended_palette();
+                iced::widget::container::Style {
+                    background: Some(palette.background.weak.color.into()),
+                    border: iced::Border::default().rounded(6.0),
+                    ..iced::widget::container::Style::default()
+                }
+            }),
+        );
     }
     let _ = cwd;
+
+    let labeled_copyable = |label: &'static str, content: &str| -> Element<'_, Message> {
+        column![
+            row![
+                text(label),
+                Space::new().width(Length::Fill),
+                button(text("Copy"))
+                    .padding([2, 6])
+                    .style(crate::flat_button_style)
+                    .on_press(Message::Copy(content.to_string())),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+            text(content.to_string()),
+        ]
+        .into()
+    };
 
     let mut messages = column![].spacing(6);
     let last = state.entries.len().saturating_sub(1);
@@ -596,17 +662,20 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
             Entry::ToolCall { title, status, .. } => {
                 row![text(status.icon()), text(title.clone())].spacing(6).into()
             }
-            Entry::User { content } => {
-                column![text("You"), text(content.clone())].into()
-            }
-            Entry::Thinking { content } => {
-                column![text("Thinking"), text(content.clone())].into()
-            }
+            Entry::User { content } => labeled_copyable("You", content),
+            Entry::Thinking { content } => labeled_copyable("Thinking", content),
             Entry::Assistant { content } => {
                 if content.is_empty() && i == last && state.streaming {
-                    column![text("Claude"), text("...")].into()
+                    column![
+                        text("Claude"),
+                        text("Waiting for response...").style(|theme: &iced::Theme| {
+                            let palette = theme.extended_palette();
+                            iced::widget::text::Style { color: Some(palette.background.strong.color) }
+                        }),
+                    ]
+                    .into()
                 } else {
-                    column![text("Claude"), text(content.clone())].into()
+                    labeled_copyable("Claude", content)
                 }
             }
         };
@@ -641,17 +710,35 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
     }
 
     let awaiting_permission = state.pending_permission.is_some();
+    let send_icon: char = lucide_icons::Icon::SendHorizonal.into();
     let send_button = if state.streaming {
-        button(text("Stop")).on_press(Message::Stop)
+        let stop_icon: char = lucide_icons::Icon::CircleStop.into();
+        button(text(stop_icon).font(iced::Font::with_name("lucide")).size(14))
+            .padding([4, 8])
+            .on_press(Message::Stop)
     } else if awaiting_permission {
-        button(text("Send"))
+        button(text(send_icon).font(iced::Font::with_name("lucide")).size(14)).padding([4, 8])
     } else {
-        button(text("Send")).on_press(Message::Send)
+        button(text(send_icon).font(iced::Font::with_name("lucide")).size(14))
+            .padding([4, 8])
+            .on_press(Message::Send)
     };
     bottom = bottom.push(
-        row![
-            text_input("", &state.input).on_input(Message::InputChanged),
-            send_button,
+        column![
+            text_editor(&state.input)
+                .placeholder("Message... (Cmd+Enter to send)")
+                .on_action(Message::InputChanged)
+                .height(Length::Fixed(72.0))
+                .key_binding(|key_press| {
+                    let is_enter =
+                        key_press.key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter);
+                    if is_enter && key_press.modifiers.command() {
+                        Some(text_editor::Binding::Custom(Message::Send))
+                    } else {
+                        text_editor::Binding::from_key_press(key_press)
+                    }
+                }),
+            row![Space::new().width(Length::Fill), send_button],
         ]
         .spacing(4),
     );
@@ -661,12 +748,11 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
 
 fn threads_path(cwd: &Path) -> Option<PathBuf> {
     use std::hash::{Hash, Hasher};
-    let home = std::env::var_os("HOME")?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     cwd.hash(&mut hasher);
     let hash = hasher.finish();
     Some(
-        PathBuf::from(home)
+        crate::home_dir()?
             .join(".config")
             .join("editor")
             .join("acp_threads")
