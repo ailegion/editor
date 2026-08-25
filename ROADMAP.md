@@ -85,7 +85,12 @@ Ordered by (impact on daily editing) ÷ (implementation cost).
    Quick Open/Command Palette (minus the fuzzy list -- just a digits-only field), applies
    `cosmic_text::Motion::GotoLine` on confirm. Gated on there being an active tab, same as
    Find in the Edit menu.
-4. **Recent files** — small MRU list, feeds into quick open.
+4. ~~**Recent files**~~ — done: `src/recent_files.rs`, persisted MRU list (20 entries,
+   `~/.config/editor/recent_files`), recorded on every `open_path` call (tree click, Cmd+O,
+   quick open, project search, go to line's file open) regardless of how the file was
+   opened. Quick Open shows it (most-recent-first, filtered to the current project) above
+   the rest of the walked file list when the query is empty, under a "Recently opened" /
+   "Other files" split.
 
 ### Phase 2 — Editing polish
 5. **Word wrap toggle** — per-tab or global, persisted like zoom.

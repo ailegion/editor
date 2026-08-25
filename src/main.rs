@@ -6,6 +6,7 @@ mod git;
 mod goto_line;
 mod project_search;
 mod quick_open;
+mod recent_files;
 
 use iced::keyboard;
 use iced::widget::{
@@ -229,6 +230,7 @@ struct State {
     quick_open: quick_open::QuickOpenState,
     command_palette: command_palette::PaletteState,
     goto_line: goto_line::GotoLineState,
+    recent_files: Vec<PathBuf>,
     git: git::GitState,
 
     app_theme: iced::Theme,
@@ -305,6 +307,7 @@ impl State {
             quick_open: quick_open::QuickOpenState::default(),
             command_palette: command_palette::PaletteState::default(),
             goto_line: goto_line::GotoLineState::default(),
+            recent_files: recent_files::load(),
             git: git::GitState::default(),
             app_theme,
             highlighter: code_editor::Highlighter::new(),
@@ -418,6 +421,7 @@ impl State {
             .position(|t| t.path.as_deref() == Some(path.as_path()))
         {
             self.active_tab = index;
+            recent_files::record(&mut self.recent_files, path);
             return;
         }
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -431,6 +435,7 @@ impl State {
         let line_ending = LineEnding::detect(&text);
         let mut content = code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
         content.highlight(&self.highlighter, &extension, &self.app_theme);
+        recent_files::record(&mut self.recent_files, path.clone());
         self.tabs.push(Tab {
             path: Some(path),
             content,
@@ -574,7 +579,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::QuickOpen(msg) => {
             let root = state.root.clone();
-            let (t, opened) = quick_open::update(&mut state.quick_open, msg, root.as_deref());
+            let (t, opened) = quick_open::update(&mut state.quick_open, msg, root.as_deref(), &state.recent_files);
             task = t.map(Message::QuickOpen);
             if let Some(path) = opened {
                 state.open_path(path);
@@ -590,7 +595,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
                 quick_open::Message::Open
             };
-            let (t, _) = quick_open::update(&mut state.quick_open, msg, root.as_deref());
+            let (t, _) = quick_open::update(&mut state.quick_open, msg, root.as_deref(), &state.recent_files);
             task = t.map(Message::QuickOpen);
         }
         Message::CommandPalette(msg) => {
@@ -874,7 +879,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
                             quick_open::Message::Open
                         };
-                        let (t, _) = quick_open::update(&mut state.quick_open, msg, root.as_deref());
+                        let (t, _) = quick_open::update(&mut state.quick_open, msg, root.as_deref(), &state.recent_files);
                         task = t.map(Message::QuickOpen);
                     }
                     // "+" covers Shift+= on layouts where that's how a plus sign is typed.
@@ -904,7 +909,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 };
                 if let Some(msg) = msg {
                     let root = state.root.clone();
-                    let (t, opened) = quick_open::update(&mut state.quick_open, msg, root.as_deref());
+                    let (t, opened) = quick_open::update(&mut state.quick_open, msg, root.as_deref(), &state.recent_files);
                     task = t.map(Message::QuickOpen);
                     if let Some(path) = opened {
                         state.open_path(path);

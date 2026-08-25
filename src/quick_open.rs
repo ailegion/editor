@@ -52,7 +52,14 @@ pub struct QuickOpenState {
     pub visible: bool,
     query: String,
     files: Vec<PathBuf>,
+    /// Snapshot of the app's recent-files list (already most-recent-first), taken on open.
+    /// Only the ones that also appear in `files` (i.e. under the current project root) are
+    /// actually usable here.
+    recent: Vec<PathBuf>,
     results: Vec<PathBuf>,
+    /// Number of leading `results` entries that came from `recent` rather than the rest of
+    /// the project walk -- lets `view` label exactly the recent ones, not the whole list.
+    recent_count: usize,
     selected: usize,
 }
 
@@ -71,8 +78,22 @@ impl QuickOpenState {
     fn refresh_results(&mut self) {
         let matcher = SkimMatcherV2::default();
         if self.query.trim().is_empty() {
-            self.results = self.files.iter().take(MAX_RESULTS).cloned().collect();
+            // Recent files first (most-recent-first, like most editors' Cmd+P), then the
+            // rest of the project in walk order, until MAX_RESULTS is filled.
+            let mut results: Vec<PathBuf> =
+                self.recent.iter().filter(|path| self.files.contains(path)).cloned().collect();
+            self.recent_count = results.len();
+            for path in &self.files {
+                if results.len() >= MAX_RESULTS {
+                    break;
+                }
+                if !results.contains(path) {
+                    results.push(path.clone());
+                }
+            }
+            self.results = results;
         } else {
+            self.recent_count = 0;
             let mut scored: Vec<(i64, &PathBuf)> = self
                 .files
                 .iter()
@@ -89,17 +110,20 @@ impl QuickOpenState {
 }
 
 /// Applies `message`. Returns the focus/close `Task` plus `Some(path)` when a file was
-/// picked, for the caller to open.
+/// picked, for the caller to open. `recent` (only used by `Message::Open`) should be the
+/// app's recent-files list, most-recent-first.
 pub fn update(
     state: &mut QuickOpenState,
     message: Message,
     root: Option<&Path>,
+    recent: &[PathBuf],
 ) -> (Task<Message>, Option<PathBuf>) {
     match message {
         Message::Open => {
             state.visible = true;
             state.query.clear();
             state.files = root.map(walk).unwrap_or_default();
+            state.recent = recent.to_vec();
             state.refresh_results();
             (iced::widget::operation::focus(query_input_id()), None)
         }
@@ -175,6 +199,11 @@ pub fn view<'a>(state: &'a QuickOpenState, root: Option<&Path>) -> Element<'a, M
         results_col = results_col.push(text("No matching files").size(13));
     }
     for (i, path) in state.results.iter().enumerate() {
+        if i == 0 && state.recent_count > 0 {
+            results_col = results_col.push(text("Recently opened").size(11));
+        } else if i == state.recent_count && state.recent_count > 0 {
+            results_col = results_col.push(text("Other files").size(11));
+        }
         let relative = root.and_then(|root| path.strip_prefix(root).ok()).unwrap_or(path);
         let name = path
             .file_name()
