@@ -1,45 +1,37 @@
-//! "Quick Open" (Cmd+P): fuzzy file finder over every file under the open project root.
+//! Command Palette (Cmd+Shift+P): a searchable list of app-level actions, filtered with the
+//! same fuzzy matcher as `quick_open`. Reuses the same overlay/backdrop presentation, too.
 //!
-//! Unlike `project_search` (which walks the disk on every query, since it also reads file
-//! contents), this walks the file list once when the panel opens and fuzzy-filters that
-//! in-memory list live as the user types -- cheap enough with no background-thread plumbing.
-
-use std::path::{Path, PathBuf};
+//! Unlike `quick_open` (which walks the filesystem on open), the command list here is built
+//! by the caller (`main.rs`, via `command_list`) from state it already has -- gating e.g.
+//! Undo/Redo on whether there's anything to undo/redo, exactly like the existing Edit menu
+//! does. `open` takes that list and snapshots it into `PaletteState` for the duration the
+//! palette stays open, so filtering as the user types is just an in-memory fuzzy match, no
+//! rebuilding.
 
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use iced::widget::{button, column, container, mouse_area, scrollable, text, text_input, Space};
 use iced::{Element, Length, Task};
 
-const MAX_RESULTS: usize = 50;
-
-/// Directories skipped during the walk, matching `project_search::IGNORED_DIRS`.
-const IGNORED_DIRS: &[&str] = &[
-    ".git",
-    "target",
-    "node_modules",
-    "dist",
-    "build",
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".idea",
-    ".vscode",
-];
+/// One selectable action: a label shown in the palette, and the app-level `Message` it
+/// dispatches (via a direct recursive call into `main::update`, see `main.rs`'s
+/// `Message::CommandPalette` handler) when picked.
+pub struct Command {
+    pub label: String,
+    pub message: crate::Message,
+}
 
 pub fn query_input_id() -> iced::widget::Id {
-    iced::widget::Id::new("quick-open-query")
+    iced::widget::Id::new("command-palette-query")
 }
 
 fn results_id() -> iced::widget::Id {
-    iced::widget::Id::new("quick-open-results")
+    iced::widget::Id::new("command-palette-results")
 }
 
-/// Scrolls the results list so the selected row is (proportionally) in view. Not
-/// pixel-exact -- it snaps to `selected / (len - 1)` along the scrollable's full range
-/// rather than computing exact row bounds -- but that's enough to keep arrow-key
-/// navigation from silently moving the selection off-screen.
-fn scroll_to_selected(state: &QuickOpenState) -> Task<Message> {
+/// Scrolls the results list so the selected row is (proportionally) in view -- see
+/// `quick_open::scroll_to_selected` for the same trick and its caveats.
+fn scroll_to_selected(state: &PaletteState) -> Task<Message> {
     if state.results.len() <= 1 {
         return Task::none();
     }
@@ -48,17 +40,16 @@ fn scroll_to_selected(state: &QuickOpenState) -> Task<Message> {
 }
 
 #[derive(Default)]
-pub struct QuickOpenState {
+pub struct PaletteState {
     pub visible: bool,
     query: String,
-    files: Vec<PathBuf>,
-    results: Vec<PathBuf>,
+    commands: Vec<Command>,
+    results: Vec<usize>,
     selected: usize,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Open,
     Close,
     QueryChanged(String),
     MoveUp,
@@ -67,49 +58,45 @@ pub enum Message {
     ResultClicked(usize),
 }
 
-impl QuickOpenState {
-    fn refresh_results(&mut self) {
+impl PaletteState {
+    fn refresh(&mut self) {
         let matcher = SkimMatcherV2::default();
         if self.query.trim().is_empty() {
-            self.results = self.files.iter().take(MAX_RESULTS).cloned().collect();
+            self.results = (0..self.commands.len()).collect();
         } else {
-            let mut scored: Vec<(i64, &PathBuf)> = self
-                .files
+            let mut scored: Vec<(i64, usize)> = self
+                .commands
                 .iter()
-                .filter_map(|path| {
-                    let label = path.to_string_lossy();
-                    matcher.fuzzy_match(&label, &self.query).map(|score| (score, path))
-                })
+                .enumerate()
+                .filter_map(|(i, cmd)| matcher.fuzzy_match(&cmd.label, &self.query).map(|score| (score, i)))
                 .collect();
             scored.sort_by(|a, b| b.0.cmp(&a.0));
-            self.results = scored.into_iter().take(MAX_RESULTS).map(|(_, path)| path.clone()).collect();
+            self.results = scored.into_iter().map(|(_, i)| i).collect();
         }
         self.selected = 0;
     }
 }
 
-/// Applies `message`. Returns the focus/close `Task` plus `Some(path)` when a file was
-/// picked, for the caller to open.
-pub fn update(
-    state: &mut QuickOpenState,
-    message: Message,
-    root: Option<&Path>,
-) -> (Task<Message>, Option<PathBuf>) {
+/// Opens the palette with a fresh snapshot of `commands`, focusing the query box.
+pub fn open(state: &mut PaletteState, commands: Vec<Command>) -> Task<Message> {
+    state.visible = true;
+    state.query.clear();
+    state.commands = commands;
+    state.refresh();
+    iced::widget::operation::focus(query_input_id())
+}
+
+/// Applies `message`, returning a `Task` (e.g. to scroll the selection into view) plus the
+/// picked command's `Message` (if any) for the caller to dispatch.
+pub fn update(state: &mut PaletteState, message: Message) -> (Task<Message>, Option<crate::Message>) {
     match message {
-        Message::Open => {
-            state.visible = true;
-            state.query.clear();
-            state.files = root.map(walk).unwrap_or_default();
-            state.refresh_results();
-            (iced::widget::operation::focus(query_input_id()), None)
-        }
         Message::Close => {
             state.visible = false;
             (Task::none(), None)
         }
         Message::QueryChanged(query) => {
             state.query = query;
-            state.refresh_results();
+            state.refresh();
             (Task::none(), None)
         }
         Message::MoveDown => {
@@ -125,45 +112,26 @@ pub fn update(
             (scroll_to_selected(state), None)
         }
         Message::Confirm => {
-            let path = state.results.get(state.selected).cloned();
-            if path.is_some() {
+            let picked = state
+                .results
+                .get(state.selected)
+                .and_then(|&i| state.commands.get(i))
+                .map(|cmd| cmd.message.clone());
+            if picked.is_some() {
                 state.visible = false;
             }
-            (Task::none(), path)
+            (Task::none(), picked)
         }
         Message::ResultClicked(i) => {
-            let path = state.results.get(i).cloned();
+            let picked = state.results.get(i).and_then(|&idx| state.commands.get(idx)).map(|cmd| cmd.message.clone());
             state.visible = false;
-            (Task::none(), path)
+            (Task::none(), picked)
         }
     }
 }
 
-fn walk(root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    walk_into(root, &mut files);
-    files
-}
-
-fn walk_into(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if IGNORED_DIRS.contains(&entry.file_name().to_string_lossy().as_ref()) {
-                continue;
-            }
-            walk_into(&path, out);
-        } else {
-            out.push(path);
-        }
-    }
-}
-
-pub fn view<'a>(state: &'a QuickOpenState, root: Option<&Path>) -> Element<'a, Message> {
-    let input = text_input("Search files by name...", &state.query)
+pub fn view(state: &PaletteState) -> Element<'_, Message> {
+    let input = text_input("Type a command...", &state.query)
         .id(query_input_id())
         .on_input(Message::QueryChanged)
         .on_submit(Message::Confirm)
@@ -171,25 +139,18 @@ pub fn view<'a>(state: &'a QuickOpenState, root: Option<&Path>) -> Element<'a, M
         .width(Length::Fill);
 
     let mut results_col = column![].spacing(2);
-    if state.results.is_empty() && !state.query.trim().is_empty() {
-        results_col = results_col.push(text("No matching files").size(13));
+    if state.results.is_empty() {
+        results_col = results_col.push(text("No matching commands").size(13));
     }
-    for (i, path) in state.results.iter().enumerate() {
-        let relative = root.and_then(|root| path.strip_prefix(root).ok()).unwrap_or(path);
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let is_selected = i == state.selected;
+    for (row, &i) in state.results.iter().enumerate() {
+        let Some(cmd) = state.commands.get(i) else { continue };
+        let is_selected = row == state.selected;
         results_col = results_col.push(
-            button(
-                column![text(name).size(13), text(relative.display().to_string()).size(11)]
-                    .spacing(1),
-            )
-            .width(Length::Fill)
-            .padding(6)
-            .style(move |theme, status| result_style(theme, status, is_selected))
-            .on_press(Message::ResultClicked(i)),
+            button(text(cmd.label.clone()).size(13))
+                .width(Length::Fill)
+                .padding(6)
+                .style(move |theme, status| result_style(theme, status, is_selected))
+                .on_press(Message::ResultClicked(row)),
         );
     }
 

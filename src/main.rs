@@ -1,6 +1,7 @@
 mod acp;
 mod chat;
 mod code_editor;
+mod command_palette;
 mod git;
 mod project_search;
 mod quick_open;
@@ -167,6 +168,8 @@ enum Message {
     ToggleProjectSearch,
     QuickOpen(quick_open::Message),
     ToggleQuickOpen,
+    CommandPalette(command_palette::Message),
+    ToggleCommandPalette,
     Git(git::Message),
     GitPanelToggle,
     TabSelected(usize),
@@ -221,6 +224,7 @@ struct State {
     sidebar_mode: SidebarMode,
     project_search: project_search::SearchState,
     quick_open: quick_open::QuickOpenState,
+    command_palette: command_palette::PaletteState,
     git: git::GitState,
 
     app_theme: iced::Theme,
@@ -295,6 +299,7 @@ impl State {
             sidebar_mode: SidebarMode::default(),
             project_search: project_search::SearchState::default(),
             quick_open: quick_open::QuickOpenState::default(),
+            command_palette: command_palette::PaletteState::default(),
             git: git::GitState::default(),
             app_theme,
             highlighter: code_editor::Highlighter::new(),
@@ -579,10 +584,27 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             let msg = if state.quick_open.visible {
                 quick_open::Message::Close
             } else {
+                let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
                 quick_open::Message::Open
             };
             let (t, _) = quick_open::update(&mut state.quick_open, msg, root.as_deref());
             task = t.map(Message::QuickOpen);
+        }
+        Message::CommandPalette(msg) => {
+            let (t, picked) = command_palette::update(&mut state.command_palette, msg);
+            task = t.map(Message::CommandPalette);
+            if let Some(picked) = picked {
+                task = Task::batch([task, update(state, picked)]);
+            }
+        }
+        Message::ToggleCommandPalette => {
+            if state.command_palette.visible {
+                let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
+            } else {
+                state.quick_open.visible = false;
+                let commands = command_list(state);
+                task = command_palette::open(&mut state.command_palette, commands).map(Message::CommandPalette);
+            }
         }
         Message::Git(msg) => {
             let cwd = state.root_or_cwd();
@@ -798,11 +820,26 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             );
                         }
                     }
+                    // Checked before the plain "p" arm below: Shift+P usually reports as
+                    // character "P", but match on either case defensively.
+                    keyboard::Key::Character(c)
+                        if modifiers.shift() && c.eq_ignore_ascii_case("p") =>
+                    {
+                        if state.command_palette.visible {
+                            let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
+                        } else {
+                            state.quick_open.visible = false;
+                            let commands = command_list(state);
+                            task = command_palette::open(&mut state.command_palette, commands)
+                                .map(Message::CommandPalette);
+                        }
+                    }
                     keyboard::Key::Character("p") => {
                         let root = state.root.clone();
                         let msg = if state.quick_open.visible {
                             quick_open::Message::Close
                         } else {
+                            let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
                             quick_open::Message::Open
                         };
                         let (t, _) = quick_open::update(&mut state.quick_open, msg, root.as_deref());
@@ -840,6 +877,21 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     if let Some(path) = opened {
                         state.open_path(path);
                         state.focus = Focus::Editor;
+                    }
+                }
+            } else if state.command_palette.visible {
+                // Same reasoning as the quick-open branch above: only unbound keys land here.
+                let msg = match key.as_ref() {
+                    keyboard::Key::Named(keyboard::key::Named::Escape) => Some(command_palette::Message::Close),
+                    keyboard::Key::Named(keyboard::key::Named::ArrowDown) => Some(command_palette::Message::MoveDown),
+                    keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Some(command_palette::Message::MoveUp),
+                    _ => None,
+                };
+                if let Some(msg) = msg {
+                    let (t, picked) = command_palette::update(&mut state.command_palette, msg);
+                    task = t.map(Message::CommandPalette);
+                    if let Some(picked) = picked {
+                        task = Task::batch([task, update(state, picked)]);
                     }
                 }
             } else if key.as_ref() == keyboard::Key::Named(keyboard::key::Named::Escape)
@@ -980,6 +1032,12 @@ fn view(state: &State) -> Element<'_, Message> {
             quick_open::view(&state.quick_open, state.root.as_deref()).map(Message::QuickOpen),
         ]
         .into()
+    } else if state.command_palette.visible {
+        iced::widget::stack![
+            base,
+            command_palette::view(&state.command_palette).map(Message::CommandPalette),
+        ]
+        .into()
     } else {
         base
     }
@@ -1104,6 +1162,58 @@ fn menu_button_maybe<'a>(label: String, msg: Option<Message>) -> iced::widget::b
         .on_press_maybe(msg)
 }
 
+/// Builds the command palette's action list from current state, gating Undo/Redo/Select
+/// All/Find on whether there's an active tab -- exactly like the Edit menu (`view_top_bar`)
+/// already does, so the two stay in sync.
+fn command_list(state: &State) -> Vec<command_palette::Command> {
+    use command_palette::Command;
+
+    let active_content = state.tabs.get(state.active_tab).map(|t| &t.content);
+    let can_undo = active_content.is_some_and(|c| c.can_undo());
+    let can_redo = active_content.is_some_and(|c| c.can_redo());
+    let has_active_tab = state.tabs.get(state.active_tab).is_some();
+
+    let mut commands = vec![
+        Command { label: FileAction::OpenFile.to_string(), message: Message::FileAction(FileAction::OpenFile) },
+        Command { label: FileAction::OpenFolder.to_string(), message: Message::FileAction(FileAction::OpenFolder) },
+        Command { label: FileAction::CloseFolder.to_string(), message: Message::FileAction(FileAction::CloseFolder) },
+        Command { label: FileAction::Save.to_string(), message: Message::FileAction(FileAction::Save) },
+        Command { label: "Quick Open (Cmd+P)".to_string(), message: Message::ToggleQuickOpen },
+        Command { label: "Find in Project (Cmd+Shift+F)".to_string(), message: Message::ToggleProjectSearch },
+        Command { label: ViewAction::ZoomIn.to_string(), message: Message::ViewAction(ViewAction::ZoomIn) },
+        Command { label: ViewAction::ZoomOut.to_string(), message: Message::ViewAction(ViewAction::ZoomOut) },
+        Command { label: ViewAction::ZoomReset.to_string(), message: Message::ViewAction(ViewAction::ZoomReset) },
+        Command { label: "Toggle Sidebar".to_string(), message: Message::SidebarToggle },
+        Command { label: "Toggle Git Panel".to_string(), message: Message::GitPanelToggle },
+        Command { label: "Toggle AI Panel".to_string(), message: Message::AiToggle },
+        Command { label: "Refresh File Tree".to_string(), message: Message::RefreshTree },
+        Command { label: "Refresh Git Status".to_string(), message: Message::Git(git::Message::Refresh) },
+    ];
+
+    if can_undo {
+        commands.push(Command { label: EditAction::Undo.to_string(), message: Message::EditAction(EditAction::Undo) });
+    }
+    if can_redo {
+        commands.push(Command { label: EditAction::Redo.to_string(), message: Message::EditAction(EditAction::Redo) });
+    }
+    if has_active_tab {
+        commands.push(Command {
+            label: EditAction::SelectAll.to_string(),
+            message: Message::EditAction(EditAction::SelectAll),
+        });
+        commands.push(Command {
+            label: "Find (Cmd+F)".to_string(),
+            message: Message::Search(code_editor::search::Message::Toggle),
+        });
+    }
+
+    for theme in iced::Theme::ALL.iter() {
+        commands.push(Command { label: format!("Theme: {theme}"), message: Message::AppThemeSelected(theme.clone()) });
+    }
+
+    commands
+}
+
 fn view_top_bar(state: &State) -> Element<'_, Message> {
     let menu_tpl = |items| Menu::new(items).width(200.0).offset(4.0).spacing(2.0);
 
@@ -1157,6 +1267,10 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
         (menu_button(
             "Quick Open (Cmd+P)".to_string(),
             Message::ToggleQuickOpen
+        )),
+        (menu_button(
+            "Command Palette (Cmd+Shift+P)".to_string(),
+            Message::ToggleCommandPalette
         )),
     );
 
@@ -1360,13 +1474,32 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         .into()
 }
 
+/// Like `iced::keyboard::listen()`, but lets Escape through even when a focused `text_input`
+/// captured it. `text_input` handles Escape internally by blurring itself first (see its
+/// `Status::Captured` branch for `Named::Escape`), and `keyboard::listen()` only forwards
+/// *ignored* events -- so without this, closing one of this app's overlays (quick open,
+/// command palette, ...) via Escape while the search box has focus takes two presses: one
+/// that just blurs the input, and a second one that finally reaches us. Every other key
+/// keeps the normal ignored-only behavior, so typing in text inputs still doesn't also
+/// trigger the tree/editor's global key routing.
+fn handle_raw_key_event(
+    event: iced::Event,
+    status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<Message> {
+    let iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event else {
+        return None;
+    };
+    let is_escape = key == keyboard::Key::Named(keyboard::key::Named::Escape);
+    if status == iced::event::Status::Ignored || is_escape {
+        Some(Message::KeyPressed(key, modifiers))
+    } else {
+        None
+    }
+}
+
 fn subscription(_state: &State) -> Subscription<Message> {
-    let keys = keyboard::listen().map(|event| match event {
-        keyboard::Event::KeyPressed {
-            key, modifiers, ..
-        } => Message::KeyPressed(key, modifiers),
-        _ => Message::Noop,
-    });
+    let keys = iced::event::listen_with(handle_raw_key_event);
     let tick = iced::time::every(Duration::from_millis(50)).map(|_| Message::Tick);
     let window_events = iced::window::events().map(|(id, event)| match event {
         iced::window::Event::Resized(size) => Message::WindowResized(id, size),

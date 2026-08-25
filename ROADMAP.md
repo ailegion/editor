@@ -15,6 +15,10 @@ for a "minimal, no-bloat" positioning.
 - Quick Open (Cmd+P): fuzzy file finder (`fuzzy-matcher`/skim algorithm) over every file
   under the project root, live filtering, arrow-key navigation, click or Enter to open,
   Escape or backdrop-click to dismiss, auto-focused search box
+- Command Palette (Cmd+Shift+P): fuzzy-searchable list of app actions (file/edit/view
+  actions, theme switching, panel toggles, refresh git/tree) built from the same
+  `EditAction`/`ViewAction`/`FileAction` labels the menus use, same overlay presentation
+  and keyboard handling as Quick Open
 - Git sidebar panel: current branch, working-tree status list, stage-all + commit, refresh
   — shells out to the `git` CLI
 - Sidebar is a collapsible "activity bar": Tree / Git / Search, toggled from status-bar
@@ -43,7 +47,7 @@ for a "minimal, no-bloat" positioning.
 
 | Category | VS Code / Sublime / Zed / JetBrains / Neovim | This editor |
 |---|---|---|
-| Command palette | ✅ Ctrl+Shift+P | ❌ none |
+| Command palette | ✅ Ctrl+Shift+P | ✅ Cmd+Shift+P (done) |
 | Quick open / fuzzy file switcher | ✅ Ctrl+P | ✅ Cmd+P (done) |
 | Go to line | ✅ Ctrl+G | ❌ no dedicated command (project-search jump-to-line exists, but no direct "go to line N" in the open file) |
 | Multi-cursor / column select | ✅ | ❌ single cursor only |
@@ -72,10 +76,11 @@ Ordered by (impact on daily editing) ÷ (implementation cost).
 ### Phase 1 — Navigation (highest remaining impact)
 1. ~~**Quick open / fuzzy file finder** (Cmd+P)~~ — done: `src/quick_open.rs`, overlay via
    `iced::widget::stack!`, `fuzzy-matcher` (skim algorithm) over a one-time directory walk.
-2. **Command palette** (Cmd+Shift+P) — searchable registry of existing `Message`s
-   (theme switch, AI toggle, save, zoom, git refresh, etc.). Can share `quick_open.rs`'s
-   fuzzy-match-and-overlay plumbing (`SkimMatcherV2`, the `stack!` + `mouse_area` backdrop
-   pattern, the `text_input::focus` auto-focus trick) almost directly.
+2. ~~**Command palette** (Cmd+Shift+P)~~ — done: `src/command_palette.rs`, action list
+   built from `command_list()` in `main.rs` (reuses `EditAction`/`ViewAction`/`FileAction`
+   `Display` labels so it can't drift from the menus), same overlay/fuzzy-match plumbing as
+   Quick Open. Picking a command dispatches its `Message` via a direct recursive call into
+   `main::update` rather than a round-trip `Task`.
 3. **Go to line** — small modal or extend the existing find bar with a `:line` shortcut,
    reusing `cosmic_text::Motion::GotoLine` (already used by project-search jump-to-line).
 4. **Recent files** — small MRU list, feeds into quick open.
