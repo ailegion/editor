@@ -3,6 +3,7 @@ use cosmic_text::{
     Shaping, Wrap,
 };
 
+use super::brackets;
 use super::highlight::Highlighter;
 
 /// Wraps a `cosmic_text::Buffer`, tracking cursor/selection state alongside it.
@@ -18,6 +19,10 @@ pub struct Buffer {
     cursor_pixel: Option<(i32, i32)>,
     /// `(line, x_start, x_end)` selection highlight rects, one per selected line.
     selection_pixels: Vec<(usize, f32, f32)>,
+    /// `(line, x_start, x_end)` rects for the bracket at the cursor and its match, if any
+    /// (0 or 2 entries -- same shape as `selection_pixels` so `render.rs` can treat them
+    /// alike, just with a different style).
+    matched_brackets: Vec<(usize, f32, f32)>,
     undo_stack: Vec<Change>,
     redo_stack: Vec<Change>,
 }
@@ -37,6 +42,7 @@ impl Buffer {
             selection: Selection::None,
             cursor_pixel: None,
             selection_pixels: Vec::new(),
+            matched_brackets: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
         };
@@ -117,6 +123,12 @@ impl Buffer {
     /// the buffer origin.
     pub fn selection_pixels(&self) -> &[(usize, f32, f32)] {
         &self.selection_pixels
+    }
+
+    /// `(line, x_start, x_end)` rects for the bracket next to the cursor and its match, if
+    /// any -- see the `matched_brackets` field doc.
+    pub fn matched_brackets(&self) -> &[(usize, f32, f32)] {
+        &self.matched_brackets
     }
 
     /// Applies a `cosmic_text::Action` (motion, insert, backspace, click, ...) to the buffer.
@@ -255,6 +267,20 @@ impl Buffer {
                 let x1 = editor.cursor_position().map_or(x0, |(x, _)| x as f32);
 
                 self.selection_pixels.push((line_i, x0, x1.max(x0)));
+            }
+        }
+
+        self.matched_brackets.clear();
+        if self.selection == Selection::None {
+            if let Some(positions) = brackets::find_match(&self.inner, self.cursor) {
+                let mut editor = Editor::new(&mut self.inner);
+                for (line, start, end) in positions {
+                    editor.set_cursor(Cursor::new(line, start));
+                    let x0 = editor.cursor_position().map_or(0.0, |(x, _)| x as f32);
+                    editor.set_cursor(Cursor::new(line, end));
+                    let x1 = editor.cursor_position().map_or(x0, |(x, _)| x as f32);
+                    self.matched_brackets.push((line, x0, x1.max(x0)));
+                }
             }
         }
     }

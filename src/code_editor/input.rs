@@ -3,6 +3,7 @@
 use cosmic_text::{Action, Motion, Selection};
 use iced::keyboard::{self, Key, Modifiers};
 
+use super::brackets;
 use super::buffer::Buffer;
 
 /// Applies a key press to the buffer. Returns `true` if the key was handled.
@@ -97,11 +98,59 @@ pub fn handle_key(buffer: &mut Buffer, key: &Key, modifiers: Modifiers) -> bool 
         }
         Key::Character(c) => match c.chars().next() {
             Some(ch) => {
-                buffer.perform(Action::Insert(ch));
+                insert_char(buffer, ch);
                 true
             }
             None => false,
         },
         _ => false,
     }
+}
+
+/// Inserts `ch`, with two conveniences when there's no active selection (typing over a
+/// selection should just replace it, like plain text editing -- no auto-close wrapping):
+/// auto-closing brackets/quotes by inserting the matching closer right after and leaving the
+/// cursor between them, and "type-over" -- typing a closer that's already the very next
+/// character just moves past it instead of inserting a duplicate.
+fn insert_char(buffer: &mut Buffer, ch: char) {
+    if buffer.selection == Selection::None {
+        if let Some(closer) = auto_close_partner(buffer, ch) {
+            buffer.perform(Action::Insert(ch));
+            buffer.perform(Action::Insert(closer));
+            buffer.perform(Action::Motion(Motion::Left));
+            return;
+        }
+        if is_closer(ch) && next_char_is(buffer, ch) {
+            buffer.perform(Action::Motion(Motion::Right));
+            return;
+        }
+    }
+    buffer.perform(Action::Insert(ch));
+}
+
+/// The auto-inserted closing character for `ch`, or `None` if `ch` shouldn't auto-close
+/// here. Brackets always close; quotes only when the cursor isn't mid-word, so typing the
+/// `'` in "don't" doesn't leave a stray closing quote right after it.
+fn auto_close_partner(buffer: &Buffer, ch: char) -> Option<char> {
+    if let Some(closer) = brackets::matching_closer(ch) {
+        return Some(closer);
+    }
+    if matches!(ch, '"' | '\'') && !preceded_by_word_char(buffer) {
+        return Some(ch);
+    }
+    None
+}
+
+fn is_closer(ch: char) -> bool {
+    matches!(ch, ')' | ']' | '}' | '"' | '\'')
+}
+
+fn next_char_is(buffer: &Buffer, ch: char) -> bool {
+    brackets::next_char(&buffer.inner, buffer.cursor.line, buffer.cursor.index)
+        .is_some_and(|(_, _, next)| next == ch)
+}
+
+fn preceded_by_word_char(buffer: &Buffer) -> bool {
+    brackets::prev_char(&buffer.inner, buffer.cursor.line, buffer.cursor.index)
+        .is_some_and(|(_, _, ch)| ch.is_alphanumeric() || ch == '_')
 }

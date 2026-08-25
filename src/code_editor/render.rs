@@ -1,5 +1,5 @@
 use cosmic_text::LayoutLine;
-use iced::widget::canvas::{Frame, Text};
+use iced::widget::canvas::{Frame, Stroke, Text};
 use iced::{Color, Point, Size};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -71,6 +71,19 @@ pub fn draw(buffer: &Buffer, frame: &mut Frame, style: &Style, scroll: f32) {
             ),
         }
         draw_line_number(frame, i + 1, y, gutter_width, style);
+    }
+
+    for &(line_i, x0, x1) in buffer.matched_brackets() {
+        let y = line_i as f32 * line_height - scroll;
+        if !is_visible(y) {
+            continue;
+        }
+        let width = (x1 - x0).max(4.0);
+        frame.stroke_rectangle(
+            Point::new(gutter_width + x0, y + 1.0),
+            Size::new(width, line_height - 2.0),
+            Stroke::default().with_color(style.bracket_match_color).with_width(1.0),
+        );
     }
 
     if blink_on() {

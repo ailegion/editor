@@ -6,6 +6,7 @@
 //! (6) undo/redo, (7) wiring into `Tab`/`State`, (8) polish. (1)-(6) are implemented;
 //! only app wiring and final polish remain.
 
+mod brackets;
 mod buffer;
 mod highlight;
 pub mod input;

@@ -93,10 +93,29 @@ Ordered by (impact on daily editing) ÷ (implementation cost).
    "Other files" split.
 
 ### Phase 2 — Editing polish
-5. **Word wrap toggle** — per-tab or global, persisted like zoom.
-6. **Bracket matching / auto-close** — highlight matching bracket at cursor; auto-insert
-   closing `)]}"'`.
-7. **Regex mode for find/replace** — opt-in toggle next to the existing find bar.
+5. **Word wrap toggle** — deferred, see note below; not a small toggle in this renderer.
+6. ~~**Bracket matching / auto-close**~~ — done: `src/code_editor/brackets.rs` (nesting-aware
+   matcher, walks across line boundaries), wired into `Buffer::sync` (a `matched_brackets`
+   rect list, same shape as `selection_pixels`) for the outline drawn in `render.rs`, and
+   into `input.rs`'s `insert_char` for auto-close (`()[]{}"''`, skipped when a selection is
+   active) + type-over (typing a closer that's already the next character just moves past
+   it) + a mid-word guard so typing `'` inside a word (e.g. "don't") doesn't auto-close.
+7. ~~**Regex mode for find/replace**~~ — done: `.* ` toggle next to the find bar
+   (`code_editor/search.rs`), using the `regex` crate. Replace expands `$1`/`$name` capture
+   references by re-matching the query against each match's own span. Matching stays
+   line-by-line in both modes (no `\n`-spanning matches), same as plain-text search already
+   was.
+
+**Word wrap note:** the custom canvas renderer (`code_editor/render.rs`) draws one row per
+`BufferLine` at a fixed `y = line_index * line_height`, and `Buffer::sync` (cursor/selection
+pixel math) assumes one `cosmic_text::LayoutLine` per buffer line -- both explicit,
+documented assumptions from when the renderer was built. Real word wrap needs cosmic-text's
+own wrap-aware layout iteration (`Buffer::layout_runs()`, which yields one `LayoutRun` per
+*visual* row with its own correct `line_top`, already accounting for wrapped continuations)
+instead of the current manual `index * line_height` math, plus reworking scrolling (currently
+a raw pixel `f32`) to work in visual rows rather than buffer lines, plus making gutter line
+numbers only draw on a buffer line's first visual row. That's a renderer-architecture change,
+not a toggle -- worth scoping as its own task rather than folding into "Phase 2 polish."
 
 ### Phase 3 — Deeper git integration
 8. **Diff gutter in editor** — added/modified/removed line markers vs. HEAD, via

@@ -1540,12 +1540,16 @@ fn handle_raw_key_event(
     status: iced::event::Status,
     _window: iced::window::Id,
 ) -> Option<Message> {
-    let iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event else {
+    // `key` is the *unmodified* key (iced_core::keyboard::Event's own doc comment: "The key
+    // pressed"); `modified_key` is "the key pressed with all keyboard modifiers applied,
+    // except Ctrl" -- i.e. the one that actually reflects Shift (Shift+`[` -> `{`, not `[`).
+    // Using `key` here silently drops Shift for every character key.
+    let iced::Event::Keyboard(keyboard::Event::KeyPressed { modified_key, modifiers, .. }) = event else {
         return None;
     };
-    let is_escape = key == keyboard::Key::Named(keyboard::key::Named::Escape);
+    let is_escape = modified_key == keyboard::Key::Named(keyboard::key::Named::Escape);
     if status == iced::event::Status::Ignored || is_escape {
-        Some(Message::KeyPressed(key, modifiers))
+        Some(Message::KeyPressed(modified_key, modifiers))
     } else {
         None
     }
