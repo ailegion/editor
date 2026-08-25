@@ -3,6 +3,7 @@ mod chat;
 mod code_editor;
 mod command_palette;
 mod git;
+mod goto_line;
 mod project_search;
 mod quick_open;
 
@@ -170,6 +171,8 @@ enum Message {
     ToggleQuickOpen,
     CommandPalette(command_palette::Message),
     ToggleCommandPalette,
+    GotoLine(goto_line::Message),
+    ToggleGotoLine,
     Git(git::Message),
     GitPanelToggle,
     TabSelected(usize),
@@ -225,6 +228,7 @@ struct State {
     project_search: project_search::SearchState,
     quick_open: quick_open::QuickOpenState,
     command_palette: command_palette::PaletteState,
+    goto_line: goto_line::GotoLineState,
     git: git::GitState,
 
     app_theme: iced::Theme,
@@ -300,6 +304,7 @@ impl State {
             project_search: project_search::SearchState::default(),
             quick_open: quick_open::QuickOpenState::default(),
             command_palette: command_palette::PaletteState::default(),
+            goto_line: goto_line::GotoLineState::default(),
             git: git::GitState::default(),
             app_theme,
             highlighter: code_editor::Highlighter::new(),
@@ -560,10 +565,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.open_path(path);
                 state.focus = Focus::Editor;
                 if let Some(tab) = state.tabs.get_mut(state.active_tab) {
-                    tab.content
-                        .perform(cosmic_text::Action::Motion(cosmic_text::Motion::GotoLine(
-                            line.saturating_sub(1),
-                        )));
+                    tab.content.goto_line(line.saturating_sub(1));
                 }
             }
         }
@@ -585,6 +587,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 quick_open::Message::Close
             } else {
                 let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
+                let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
                 quick_open::Message::Open
             };
             let (t, _) = quick_open::update(&mut state.quick_open, msg, root.as_deref());
@@ -602,8 +605,26 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
             } else {
                 state.quick_open.visible = false;
+                let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
                 let commands = command_list(state);
                 task = command_palette::open(&mut state.command_palette, commands).map(Message::CommandPalette);
+            }
+        }
+        Message::GotoLine(msg) => {
+            if let Some(line) = goto_line::update(&mut state.goto_line, msg) {
+                if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+                    tab.content.goto_line(line.saturating_sub(1));
+                }
+                state.focus = Focus::Editor;
+            }
+        }
+        Message::ToggleGotoLine => {
+            if state.goto_line.visible {
+                let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
+            } else if state.tabs.get(state.active_tab).is_some() {
+                state.quick_open.visible = false;
+                let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
+                task = goto_line::open(&mut state.goto_line).map(Message::GotoLine);
             }
         }
         Message::Git(msg) => {
@@ -829,9 +850,19 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
                         } else {
                             state.quick_open.visible = false;
+                            let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
                             let commands = command_list(state);
                             task = command_palette::open(&mut state.command_palette, commands)
                                 .map(Message::CommandPalette);
+                        }
+                    }
+                    keyboard::Key::Character("g") => {
+                        if state.goto_line.visible {
+                            let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
+                        } else if state.tabs.get(state.active_tab).is_some() {
+                            state.quick_open.visible = false;
+                            let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
+                            task = goto_line::open(&mut state.goto_line).map(Message::GotoLine);
                         }
                     }
                     keyboard::Key::Character("p") => {
@@ -840,6 +871,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             quick_open::Message::Close
                         } else {
                             let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
+                            let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
                             quick_open::Message::Open
                         };
                         let (t, _) = quick_open::update(&mut state.quick_open, msg, root.as_deref());
@@ -893,6 +925,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     if let Some(picked) = picked {
                         task = Task::batch([task, update(state, picked)]);
                     }
+                }
+            } else if state.goto_line.visible {
+                if key.as_ref() == keyboard::Key::Named(keyboard::key::Named::Escape) {
+                    let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
                 }
             } else if key.as_ref() == keyboard::Key::Named(keyboard::key::Named::Escape)
                 && state.sidebar_mode == SidebarMode::ProjectSearch
@@ -1036,6 +1072,13 @@ fn view(state: &State) -> Element<'_, Message> {
         iced::widget::stack![
             base,
             command_palette::view(&state.command_palette).map(Message::CommandPalette),
+        ]
+        .into()
+    } else if state.goto_line.visible {
+        let line_count = state.tabs.get(state.active_tab).map(|t| t.content.line_count()).unwrap_or(0);
+        iced::widget::stack![
+            base,
+            goto_line::view(&state.goto_line, line_count).map(Message::GotoLine),
         ]
         .into()
     } else {
@@ -1205,6 +1248,7 @@ fn command_list(state: &State) -> Vec<command_palette::Command> {
             label: "Find (Cmd+F)".to_string(),
             message: Message::Search(code_editor::search::Message::Toggle),
         });
+        commands.push(Command { label: "Go to Line (Cmd+G)".to_string(), message: Message::ToggleGotoLine });
     }
 
     for theme in iced::Theme::ALL.iter() {
@@ -1271,6 +1315,10 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
         (menu_button(
             "Command Palette (Cmd+Shift+P)".to_string(),
             Message::ToggleCommandPalette
+        )),
+        (menu_button_maybe(
+            "Go to Line (Cmd+G)".to_string(),
+            has_active_tab.then_some(Message::ToggleGotoLine),
         )),
     );
 

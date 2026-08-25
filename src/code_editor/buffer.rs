@@ -95,6 +95,19 @@ impl Buffer {
         self.perform(cosmic_text::Action::Motion(cosmic_text::Motion::BufferEnd));
     }
 
+    /// Moves the cursor to `line` (0-indexed), first collapsing any active selection.
+    /// `cosmic_text::Action::Motion` never touches the selection on its own (see
+    /// `code_editor::input::handle_key`'s doc comment on that) -- a plain jump like this
+    /// (used by Go to Line and Find in Project's jump-to-result) should discard whatever was
+    /// selected before it, not extend it from the old anchor to the new line, the way
+    /// arrow-key navigation already takes care to avoid.
+    pub fn goto_line(&mut self, line: usize) {
+        if self.selection != Selection::None {
+            self.perform(cosmic_text::Action::Escape);
+        }
+        self.perform(cosmic_text::Action::Motion(cosmic_text::Motion::GotoLine(line)));
+    }
+
     /// Pixel position of the top-left corner of the cursor, relative to the buffer origin.
     pub fn cursor_pixel(&self) -> Option<(i32, i32)> {
         self.cursor_pixel

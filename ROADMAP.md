@@ -49,7 +49,7 @@ for a "minimal, no-bloat" positioning.
 |---|---|---|
 | Command palette | ✅ Ctrl+Shift+P | ✅ Cmd+Shift+P (done) |
 | Quick open / fuzzy file switcher | ✅ Ctrl+P | ✅ Cmd+P (done) |
-| Go to line | ✅ Ctrl+G | ❌ no dedicated command (project-search jump-to-line exists, but no direct "go to line N" in the open file) |
+| Go to line | ✅ Ctrl+G | ✅ Cmd+G (done) |
 | Multi-cursor / column select | ✅ | ❌ single cursor only |
 | Find in file: regex | ✅ | ❌ plain substring only |
 | LSP (autocomplete, hover, diagnostics, go-to-def) | ✅ | ❌ none |
@@ -81,8 +81,10 @@ Ordered by (impact on daily editing) ÷ (implementation cost).
    `Display` labels so it can't drift from the menus), same overlay/fuzzy-match plumbing as
    Quick Open. Picking a command dispatches its `Message` via a direct recursive call into
    `main::update` rather than a round-trip `Task`.
-3. **Go to line** — small modal or extend the existing find bar with a `:line` shortcut,
-   reusing `cosmic_text::Motion::GotoLine` (already used by project-search jump-to-line).
+3. ~~**Go to line** (Cmd+G)~~ — done: `src/goto_line.rs`, same overlay chrome as
+   Quick Open/Command Palette (minus the fuzzy list -- just a digits-only field), applies
+   `cosmic_text::Motion::GotoLine` on confirm. Gated on there being an active tab, same as
+   Find in the Edit menu.
 4. **Recent files** — small MRU list, feeds into quick open.
 
 ### Phase 2 — Editing polish

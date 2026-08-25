@@ -140,6 +140,33 @@ See `quick_open.rs` / `command_palette.rs` for the full pattern (backdrop + cent
 panel + `mouse_area` wrapper), both close to copy-paste-able for a third overlay if one's ever
 needed.
 
+## `canvas::Program`: reacting to state that changed *outside* the widget
+
+A `canvas::Program`'s persistent `State` (here, `code_editor::State { dragging, scroll,
+last_cursor }`) can only be mutated from `Program::update(&mut self, state, event, bounds,
+cursor)`, which only runs in response to an `iced::Event`. `draw()` only gets `&State`
+(immutable). This is a real problem when something *outside* the widget changes app state
+the widget cares about (e.g. `main.rs` moves the cursor via `Buffer::perform` for a
+Go-to-Line jump, a search-result click, or even just a keypress routed in through
+`code_editor::input::handle_key` instead of through the canvas) — there's no direct channel
+for "the buffer changed, please re-scroll."
+
+The fix: `Widget::update` for `Canvas` (see `iced_widget::canvas::canvas.rs`) calls
+`Program::update` for **every** `Event`, including `Event::Window(window::Event::
+RedrawRequested(_))` — and this app already redraws every ~50ms regardless (the `Message::
+Tick` subscription, originally added so `render.rs`'s blinking cursor stays in sync without
+its own subscription). That makes `RedrawRequested` a reliable, already-existing hook to
+reconcile canvas `State` against the app-owned `Buffer` on a ~50ms cadence: read whatever
+you need off `self.content` (the `&Buffer` the widget already holds), compare against
+`state`, and correct `state` + `canvas::Action::request_redraw()` if it drifted.
+
+This is how `quick_open`-style Go-to-Line ended up able to scroll the (canvas-based, not a
+real `iced::widget::scrollable`) code editor into view — see `scroll_correction` in
+`code_editor/mod.rs`. One trap: don't unconditionally re-center on the cursor every
+`RedrawRequested`, or you'll fight the user the moment they manually scroll away from a
+*stationary* cursor to read elsewhere in the file. Track the last-seen cursor position in
+`State` and only correct when it actually changed since the previous check.
+
 ## Misc gotchas
 
 - **`iced::Padding` has no `From<[T; 4]>`.** Only `From<f32>` (all sides), `From<[f32; 2]>`

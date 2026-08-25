@@ -45,12 +45,41 @@ impl<'a, Message> CodeEditor<'a, Message> {
         self.on_action = Some(Box::new(f));
         self
     }
+
+    /// If the cursor moved since `state.last_cursor` and now falls outside
+    /// `[scroll, scroll + viewport_height)`, returns the corrected scroll offset to bring it
+    /// back into view. Always updates `state.last_cursor`. Returns `None` both when the
+    /// cursor hasn't moved (so a manual scroll-away is left alone) and when it moved but is
+    /// still visible.
+    fn scroll_correction(&self, state: &mut State, viewport_height: f32) -> Option<f32> {
+        let current = self.content.cursor_pixel();
+        let moved = current != state.last_cursor;
+        state.last_cursor = current;
+        if !moved {
+            return None;
+        }
+
+        let (_, y) = current?;
+        let y = y as f32;
+        let line_height = self.style.line_height;
+        if y < state.scroll {
+            Some(y)
+        } else if y + line_height > state.scroll + viewport_height {
+            Some(y + line_height - viewport_height)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct State {
     dragging: bool,
     scroll: f32,
+    /// The cursor pixel position as of the last redraw check, so scroll-into-view only
+    /// fires when the cursor itself moved -- not just because the user scrolled the
+    /// viewport away from a stationary cursor to read elsewhere in the file.
+    last_cursor: Option<(i32, i32)>,
 }
 
 impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
@@ -76,6 +105,19 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<canvas::Action<Message>> {
+        // `scroll` lives here in the canvas's own widget state rather than on `Buffer`
+        // (app-level state `main.rs` can see), so nothing outside this widget -- typing,
+        // arrow keys, a search/goto-line jump -- can tell it to re-center the viewport
+        // directly. Instead, treat every `RedrawRequested` (which fires at least once per
+        // animation tick, see `render::draw`'s blinking cursor) as a chance to notice the
+        // cursor drifted outside the visible window and correct `scroll` to bring it back in.
+        if let Event::Window(iced::window::Event::RedrawRequested(_)) = event {
+            return self.scroll_correction(state, bounds.height).map(|scroll| {
+                state.scroll = scroll;
+                canvas::Action::request_redraw()
+            });
+        }
+
         // Rendered text starts `gutter_width` pixels right of the canvas origin and `scroll`
         // pixels above wherever it's currently scrolled to (see `render.rs`), but
         // `cosmic_text`'s own coordinate space starts at (0, 0) -- so mouse positions need to
