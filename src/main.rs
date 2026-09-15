@@ -1391,6 +1391,7 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
         (view_menu_button, menu_tpl(view_items)),
         (theme_menu_button, menu_tpl(theme_items))
     )
+    .close_on_item_click_global(true)
     .close_on_background_click(true)
     .close_on_background_click_global(true);
 
