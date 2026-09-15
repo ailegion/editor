@@ -53,7 +53,7 @@ for a "minimal, no-bloat" positioning.
 | Multi-cursor / column select | ✅ | ❌ single cursor only |
 | Find in file: regex | ✅ | ❌ plain substring only |
 | LSP (autocomplete, hover, diagnostics, go-to-def) | ✅ | ❌ none |
-| Diff gutter in editor (vs. git HEAD) | ✅ | ❌ git panel shows file-level status only |
+| Diff gutter in editor (vs. git HEAD) | ✅ | ✅ (done) |
 | Stage individual files / hunks | ✅ | ❌ stage-all only |
 | Word wrap toggle | ✅ | ❌ none (code editor doesn't wrap) |
 | Bracket matching / auto-close | ✅ | ❌ none |
@@ -118,8 +118,16 @@ numbers only draw on a buffer line's first visual row. That's a renderer-archite
 not a toggle -- worth scoping as its own task rather than folding into "Phase 2 polish."
 
 ### Phase 3 — Deeper git integration
-8. **Diff gutter in editor** — added/modified/removed line markers vs. HEAD, via
-   `git diff` (same shell-out approach as `git.rs`).
+8. ~~**Diff gutter in editor**~~ — done: `src/git_diff.rs` shells out to `git diff -U0` and
+   parses hunk headers into per-line added/modified/removed markers (0-indexed, matching
+   `Buffer`'s line numbering), rendered as a thin colored bar in the gutter's left edge
+   (`code_editor/render.rs`). Computed async (`Task::perform` + `spawn_blocking`, same
+   pattern as `git.rs`) and refreshed on file open, save, git-panel refresh/open, and
+   whenever the AI agent edits files on disk (`reload_open_tabs`). Reflects on-disk content
+   like the git sidebar already does, not unsaved buffer edits. Known gap: untracked
+   (never-`git add`ed) new files show no markers, since `git diff` itself shows nothing for
+   them -- fixable later by detecting untracked status and marking the whole file Added, but
+   out of scope for the first pass.
 9. **Stage individual files** (not just stage-all) — `git.rs` already lists per-file
    status; add per-row stage/unstage buttons before touching hunk-level staging.
 

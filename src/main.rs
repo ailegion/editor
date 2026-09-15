@@ -3,6 +3,7 @@ mod chat;
 mod code_editor;
 mod command_palette;
 mod git;
+mod git_diff;
 mod goto_line;
 mod project_search;
 mod quick_open;
@@ -51,6 +52,10 @@ struct Tab {
     search: code_editor::search::SearchState,
     dirty: bool,
     line_ending: LineEnding,
+    /// Diff gutter markers vs. git HEAD, keyed by 0-indexed line number. Loaded
+    /// asynchronously (see `Message::GitDiffLoaded`) whenever the tab is opened or saved, so
+    /// it reflects on-disk content, same as the git sidebar panel.
+    diff: std::collections::HashMap<usize, git_diff::LineStatus>,
 }
 
 impl Tab {
@@ -176,6 +181,7 @@ enum Message {
     ToggleGotoLine,
     Git(git::Message),
     GitPanelToggle,
+    GitDiffLoaded(PathBuf, Vec<(usize, git_diff::LineStatus)>),
     TabSelected(usize),
     TabClosed(usize),
 
@@ -397,35 +403,38 @@ impl State {
 
 
     /// Reloads open, unmodified tabs from disk, in case the AI sidebar just edited them.
-    fn reload_open_tabs(&mut self) {
+    fn reload_open_tabs(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
         for tab in &mut self.tabs {
             if tab.dirty {
                 continue;
             }
-            let Some(path) = &tab.path else { continue };
-            if let Ok(text) = std::fs::read_to_string(path) {
+            let Some(path) = tab.path.clone() else { continue };
+            if let Ok(text) = std::fs::read_to_string(&path) {
                 if text != tab.content.text() {
                     let extension = tab.extension();
                     tab.content =
                         code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
                     tab.content.highlight(&self.highlighter, &extension, &self.app_theme);
+                    tasks.push(load_diff_task(self.root.clone(), path));
                 }
             }
         }
+        Task::batch(tasks)
     }
 
-    fn open_path(&mut self, path: PathBuf) {
+    fn open_path(&mut self, path: PathBuf) -> Task<Message> {
         if let Some(index) = self
             .tabs
             .iter()
             .position(|t| t.path.as_deref() == Some(path.as_path()))
         {
             self.active_tab = index;
-            recent_files::record(&mut self.recent_files, path);
-            return;
+            recent_files::record(&mut self.recent_files, path.clone());
+            return load_diff_task(self.root.clone(), path);
         }
         let Ok(text) = std::fs::read_to_string(&path) else {
-            return;
+            return Task::none();
         };
         let extension = path
             .extension()
@@ -436,14 +445,17 @@ impl State {
         let mut content = code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
         content.highlight(&self.highlighter, &extension, &self.app_theme);
         recent_files::record(&mut self.recent_files, path.clone());
+        let task = load_diff_task(self.root.clone(), path.clone());
         self.tabs.push(Tab {
             path: Some(path),
             content,
             search: code_editor::search::SearchState::default(),
             dirty: false,
             line_ending,
+            diff: std::collections::HashMap::new(),
         });
         self.active_tab = self.tabs.len() - 1;
+        task
     }
 
     fn close_tab(&mut self, index: usize) {
@@ -461,9 +473,9 @@ impl State {
         }
     }
 
-    fn save(&mut self) {
+    fn save(&mut self) -> Task<Message> {
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
-            return;
+            return Task::none();
         };
         let path = match &tab.path {
             Some(p) => Some(p.clone()),
@@ -471,10 +483,12 @@ impl State {
         };
         if let Some(path) = path {
             if std::fs::write(&path, tab.content.text()).is_ok() {
-                tab.path = Some(path);
+                tab.path = Some(path.clone());
                 tab.dirty = false;
+                return load_diff_task(self.root.clone(), path);
             }
         }
+        Task::none()
     }
 
     /// Routes a key press to the active tab's editor. Returns whether it was handled.
@@ -567,7 +581,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::ProjectSearch(msg) => {
             let root = state.root.clone();
             if let Some((path, line)) = project_search::update(&mut state.project_search, msg, root.as_deref()) {
-                state.open_path(path);
+                task = state.open_path(path);
                 state.focus = Focus::Editor;
                 if let Some(tab) = state.tabs.get_mut(state.active_tab) {
                     tab.content.goto_line(line.saturating_sub(1));
@@ -582,7 +596,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             let (t, opened) = quick_open::update(&mut state.quick_open, msg, root.as_deref(), &state.recent_files);
             task = t.map(Message::QuickOpen);
             if let Some(path) = opened {
-                state.open_path(path);
+                task = Task::batch([task, state.open_path(path)]);
                 state.focus = Focus::Editor;
             }
         }
@@ -634,12 +648,26 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Git(msg) => {
             let cwd = state.root_or_cwd();
+            let is_refresh = matches!(msg, git::Message::Refresh);
             task = git::update(&mut state.git, msg, cwd).map(Message::Git);
+            if is_refresh {
+                if let Some(path) = state.tabs.get(state.active_tab).and_then(|t| t.path.clone()) {
+                    task = Task::batch([task, load_diff_task(state.root.clone(), path)]);
+                }
+            }
         }
         Message::GitPanelToggle => {
             if state.toggle_sidebar_mode(SidebarMode::Git) {
                 let cwd = state.root_or_cwd();
                 task = git::update(&mut state.git, git::Message::Refresh, cwd).map(Message::Git);
+                if let Some(path) = state.tabs.get(state.active_tab).and_then(|t| t.path.clone()) {
+                    task = Task::batch([task, load_diff_task(state.root.clone(), path)]);
+                }
+            }
+        }
+        Message::GitDiffLoaded(path, diff) => {
+            if let Some(tab) = state.tabs.iter_mut().find(|t| t.path.as_deref() == Some(path.as_path())) {
+                tab.diff = diff.into_iter().collect();
             }
         }
         Message::TabSelected(i) => state.active_tab = i,
@@ -648,7 +676,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::FileAction(action) => match action {
             FileAction::OpenFile => {
                 if let Some(path) = rfd::FileDialog::new().pick_file() {
-                    state.open_path(path);
+                    task = state.open_path(path);
                     state.focus = Focus::Editor;
                 }
             }
@@ -668,7 +696,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     let _ = std::fs::remove_file(path);
                 }
             }
-            FileAction::Save => state.save(),
+            FileAction::Save => task = state.save(),
         },
 
         Message::EditAction(action) => {
@@ -691,13 +719,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 
         Message::Tree(event) => {
             state.focus = Focus::Tree;
+            let mut open_task = Task::none();
             if let DirectoryTreeEvent::Selected(path, is_dir, _) = &event {
                 if !*is_dir {
-                    state.open_path(path.clone());
+                    open_task = state.open_path(path.clone());
                 }
             }
             if let Some(tree) = &mut state.tree {
-                task = tree.update(event).map(Message::Tree);
+                task = Task::batch([open_task, tree.update(event).map(Message::Tree)]);
+            } else {
+                task = open_task;
             }
         }
         Message::RefreshTree => {
@@ -823,10 +854,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::KeyPressed(key, modifiers) => {
             if modifiers.command() {
                 match key.as_ref() {
-                    keyboard::Key::Character("s") => state.save(),
+                    keyboard::Key::Character("s") => task = state.save(),
                     keyboard::Key::Character("o") => {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
-                            state.open_path(path);
+                            task = state.open_path(path);
                             state.focus = Focus::Editor;
                         }
                     }
@@ -912,7 +943,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     let (t, opened) = quick_open::update(&mut state.quick_open, msg, root.as_deref(), &state.recent_files);
                     task = t.map(Message::QuickOpen);
                     if let Some(path) = opened {
-                        state.open_path(path);
+                        task = Task::batch([task, state.open_path(path)]);
                         state.focus = Focus::Editor;
                     }
                 }
@@ -953,13 +984,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 };
 
                 if let Some(event) = tree_event {
+                    let mut open_task = Task::none();
                     if let DirectoryTreeEvent::Selected(path, is_dir, _) = &event {
                         if !*is_dir {
-                            state.open_path(path.clone());
+                            open_task = state.open_path(path.clone());
                         }
                     }
                     if let Some(tree) = &mut state.tree {
-                        task = tree.update(event).map(Message::Tree);
+                        task = Task::batch([open_task, tree.update(event).map(Message::Tree)]);
+                    } else {
+                        task = open_task;
                     }
                 } else if state.focus == Focus::Editor {
                     state.handle_editor_key(&key, modifiers);
@@ -1014,12 +1048,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.chat.poll();
             state.acp.poll();
             if state.acp.take_finished() {
-                state.reload_open_tabs();
+                task = state.reload_open_tabs();
             }
             if state.chat.take_files_changed() {
-                state.reload_open_tabs();
+                let reload_task = state.reload_open_tabs();
                 if let Some(root) = state.root.clone() {
-                    task = refresh_dir_task(root);
+                    task = Task::batch([reload_task, refresh_dir_task(root)]);
+                } else {
+                    task = reload_task;
                 }
             }
         }
@@ -1507,6 +1543,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         editor_column = editor_column
             .push(code_editor::code_editor(
                 &tab.content,
+                &tab.diff,
                 &state.app_theme,
                 state.zoom,
                 Message::EditorAction,
@@ -1758,6 +1795,21 @@ fn refresh_dir_task(dir: PathBuf) -> Task<Message> {
         Task::done(Message::Tree(DirectoryTreeEvent::Toggled(dir.clone()))),
         Task::done(Message::Tree(DirectoryTreeEvent::Toggled(dir))),
     ])
+}
+
+/// Kicks off an async `git diff` for `path` against `root` (the open project folder),
+/// producing `Message::GitDiffLoaded` once it resolves. A no-op when there's no open project
+/// (nothing to diff against). A free function rather than a `State` method so callers already
+/// holding a `&mut` borrow of part of `state` (e.g. iterating `&mut self.tabs`) can still call
+/// it without a borrow conflict.
+fn load_diff_task(root: Option<PathBuf>, path: PathBuf) -> Task<Message> {
+    let Some(root) = root else {
+        return Task::none();
+    };
+    let for_message = path.clone();
+    Task::perform(git_diff::diff_for_file(root, path), move |diff| {
+        Message::GitDiffLoaded(for_message.clone(), diff)
+    })
 }
 
 fn confirm(title: &str, description: &str) -> bool {

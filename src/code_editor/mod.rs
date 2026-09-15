@@ -18,9 +18,13 @@ pub use buffer::Buffer;
 pub use highlight::Highlighter;
 pub use theme::{metrics_for_zoom, Style, ZOOM_DEFAULT, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP};
 
+use std::collections::HashMap;
+
 use iced::mouse;
 use iced::widget::canvas::{self, Canvas};
 use iced::{Element, Event, Length, Rectangle, Renderer, Theme};
+
+use crate::git_diff::LineStatus;
 
 /// Canvas-based `Program` that draws a [`Buffer`]'s contents and turns mouse clicks/drags
 /// into `cosmic_text::Action`s published as `Message`s (mirroring `text_editor`'s
@@ -29,14 +33,21 @@ use iced::{Element, Event, Length, Rectangle, Renderer, Theme};
 /// docs for why.
 pub struct CodeEditor<'a, Message> {
     content: &'a Buffer,
+    diff: &'a HashMap<usize, LineStatus>,
     style: Style,
     on_action: Option<Box<dyn Fn(cosmic_text::Action) -> Message + 'a>>,
 }
 
 impl<'a, Message> CodeEditor<'a, Message> {
-    pub fn new(content: &'a Buffer, theme: &Theme, zoom: f32) -> Self {
+    pub fn new(
+        content: &'a Buffer,
+        diff: &'a HashMap<usize, LineStatus>,
+        theme: &Theme,
+        zoom: f32,
+    ) -> Self {
         Self {
             content,
+            diff,
             style: Style::from_theme(theme, zoom),
             on_action: None,
         }
@@ -95,7 +106,7 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
         _cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
-        render::draw(self.content, &mut frame, &self.style, state.scroll);
+        render::draw(self.content, self.diff, &mut frame, &self.style, state.scroll);
         vec![frame.into_geometry()]
     }
 
@@ -188,6 +199,7 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
 
 pub fn code_editor<'a, Message>(
     content: &'a Buffer,
+    diff: &'a HashMap<usize, LineStatus>,
     theme: &Theme,
     zoom: f32,
     on_action: impl Fn(cosmic_text::Action) -> Message + 'a,
@@ -195,7 +207,7 @@ pub fn code_editor<'a, Message>(
 where
     Message: 'a,
 {
-    Canvas::new(CodeEditor::new(content, theme, zoom).on_action(on_action))
+    Canvas::new(CodeEditor::new(content, diff, theme, zoom).on_action(on_action))
         .width(Length::Fill)
         .height(Length::Fill)
         .into()

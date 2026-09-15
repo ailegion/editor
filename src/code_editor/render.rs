@@ -1,17 +1,26 @@
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use cosmic_text::LayoutLine;
 use iced::widget::canvas::{Frame, Stroke, Text};
 use iced::{Color, Point, Size};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::buffer::Buffer;
 use super::theme::Style;
+use crate::git_diff::LineStatus;
 
 /// Draws the buffer's text and a blinking cursor into `frame`, scrolled up by `scroll` pixels.
 ///
 /// The blink phase is derived from wall-clock time rather than stored per-widget state, so it
 /// stays in sync across redraws without needing its own subscription: the app already redraws
 /// on a timer (see `Message::Tick` in `main.rs`), which is enough to animate it.
-pub fn draw(buffer: &Buffer, frame: &mut Frame, style: &Style, scroll: f32) {
+pub fn draw(
+    buffer: &Buffer,
+    diff: &HashMap<usize, LineStatus>,
+    frame: &mut Frame,
+    style: &Style,
+    scroll: f32,
+) {
     frame.fill_rectangle(Point::ORIGIN, frame.size(), style.background);
 
     let gutter_width = style.gutter_width(buffer.line_count());
@@ -50,6 +59,27 @@ pub fn draw(buffer: &Buffer, frame: &mut Frame, style: &Style, scroll: f32) {
         Size::new(gutter_width, viewport_height),
         style.gutter_background,
     );
+
+    // A thin bar at the gutter's left edge for added/modified lines; a small notch for a
+    // pure deletion (the line no longer exists, so there's nothing to bar -- just mark the
+    // new-file line it now borders, per `git_diff::LineStatus::Removed`'s doc comment).
+    for (&line_i, status) in diff {
+        let y = line_i as f32 * line_height - scroll;
+        if !is_visible(y) {
+            continue;
+        }
+        match status {
+            LineStatus::Added => {
+                frame.fill_rectangle(Point::new(0.0, y), Size::new(3.0, line_height), style.diff_added_color);
+            }
+            LineStatus::Modified => {
+                frame.fill_rectangle(Point::new(0.0, y), Size::new(3.0, line_height), style.diff_modified_color);
+            }
+            LineStatus::Removed => {
+                frame.fill_rectangle(Point::new(0.0, y - 2.0), Size::new(6.0, 4.0), style.diff_removed_color);
+            }
+        }
+    }
 
     for (i, line) in buffer.inner.lines.iter().enumerate() {
         let y = i as f32 * line_height - scroll;
