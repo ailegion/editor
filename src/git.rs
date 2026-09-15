@@ -1,5 +1,5 @@
 //! Minimal git integration for the sidebar: current branch, working-tree file status, and a
-//! one-button "stage everything and commit". Shells out to the `git` CLI via
+//! per-file staging and commits of the index. Shells out to the `git` CLI via
 //! `std::process::Command` rather than a git library, the same approach `main.rs` already uses
 //! for "reveal in file manager".
 
@@ -12,6 +12,12 @@ pub struct ChangedFile {
     pub path: String,
     /// Raw two-character `git status --porcelain` code, e.g. `"M "`, `"??"`, `"A "`.
     pub status: String,
+    pub original: Option<String>,
+}
+
+impl ChangedFile {
+    fn staged(&self) -> bool { self.status.as_bytes()[0] != b' ' && self.status != "??" }
+    fn unstaged(&self) -> bool { self.status.as_bytes()[1] != b' ' }
 }
 
 #[derive(Default)]
@@ -27,6 +33,8 @@ pub struct GitState {
 pub enum Message {
     Refresh,
     OpenDiff(String),
+    Stage(ChangedFile, bool),
+    Staged(Result<(), String>),
     Refreshed(Result<(String, Vec<ChangedFile>), String>),
     CommitMessageChanged(String),
     Commit,
@@ -36,6 +44,21 @@ pub enum Message {
 pub fn update(state: &mut GitState, message: Message, cwd: PathBuf) -> Task<Message> {
     match message {
         Message::OpenDiff(_) => {},
+        Message::Stage(file, stage) => {
+            if state.committing { return Task::none(); }
+            state.committing = true;
+            return Task::perform(async move {
+                tokio::task::spawn_blocking(move || stage_file(&cwd, &file, stage))
+                    .await.map_err(|err| err.to_string())?
+            }, Message::Staged);
+        }
+        Message::Staged(result) => {
+            state.committing = false;
+            match result {
+                Ok(()) => return Task::perform(refresh(cwd), Message::Refreshed),
+                Err(err) => state.error = Some(err),
+            }
+        }
         Message::Refresh => return Task::perform(refresh(cwd), Message::Refreshed),
         Message::Refreshed(Ok((branch, files))) => {
             state.branch = branch;
@@ -45,11 +68,11 @@ pub fn update(state: &mut GitState, message: Message, cwd: PathBuf) -> Task<Mess
         Message::Refreshed(Err(err)) => state.error = Some(err),
         Message::CommitMessageChanged(text) => state.commit_message = text,
         Message::Commit => {
-            if state.commit_message.trim().is_empty() || state.committing || state.files.is_empty() {
+            if state.commit_message.trim().is_empty() || state.committing || !state.files.iter().any(ChangedFile::staged) {
                 return Task::none();
             }
             state.committing = true;
-            return Task::perform(commit_all(cwd, state.commit_message.clone()), Message::Committed);
+            return Task::perform(commit_staged(cwd, state.commit_message.clone()), Message::Committed);
         }
         Message::Committed(result) => {
             state.committing = false;
@@ -87,7 +110,10 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
     if state.files.is_empty() && state.error.is_none() {
         files_col = files_col.push(container(text("Working tree clean").size(13)).padding([16, 0]));
     }
-    for file in &state.files {
+    for (title, staged) in [("Staged changes", true), ("Unstaged changes", false)] {
+    let files: Vec<_> = state.files.iter().filter(|file| if staged { file.staged() } else { file.unstaged() }).collect();
+    files_col = files_col.push(text(format!("{title} ({})", files.len())).size(12));
+    for file in files {
         let is_selected = selected == Some(file.path.as_str());
         let path = Path::new(&file.path);
         let name = path.file_name().and_then(|name| name.to_str()).unwrap_or(&file.path);
@@ -96,8 +122,7 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
         if !parent.is_empty() {
             label = label.push(text(parent).size(11).style(iced::widget::text::secondary));
         }
-        files_col = files_col.push(
-            button(row![
+        let file_button = button(row![
                 label.width(Length::Fill),
                 text(file.status.trim()).size(12).style(|theme: &iced::Theme| {
                     let palette = theme.extended_palette();
@@ -121,8 +146,13 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
                 }
                 style
             })
-            .on_press(Message::OpenDiff(file.path.clone())),
-        );
+            .on_press(Message::OpenDiff(file.path.clone()));
+        files_col = files_col.push(row![file_button,
+            button(text(if staged { "Unstage" } else { "Stage" }).size(11))
+                .style(crate::flat_button_style)
+                .on_press_maybe((!state.committing).then(|| Message::Stage(file.clone(), !staged))),
+        ].spacing(4).align_y(iced::Alignment::Center));
+    }
     }
     let files_list = scrollable(files_col).height(Length::Fill);
 
@@ -130,14 +160,14 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
     if let Some(err) = &state.error {
         bottom = bottom.push(text(err.clone()).size(12).style(iced::widget::text::danger));
     }
-    let can_commit = !state.committing && !state.commit_message.trim().is_empty() && !state.files.is_empty();
+    let can_commit = !state.committing && !state.commit_message.trim().is_empty() && state.files.iter().any(ChangedFile::staged);
     bottom = bottom.push(
         text_input("Describe your changes", &state.commit_message)
             .on_input(Message::CommitMessageChanged)
             .on_submit(Message::Commit),
     );
     bottom = bottom.push(
-        button(text(if state.committing { "Committing..." } else { "Stage All & Commit" }).size(13))
+        button(text(if state.committing { "Committing..." } else { "Commit Staged" }).size(13))
             .width(Length::Fill)
             .padding([8, 12])
             .on_press_maybe(can_commit.then_some(Message::Commit)),
@@ -163,9 +193,8 @@ async fn refresh(cwd: PathBuf) -> Result<(String, Vec<ChangedFile>), String> {
         while let Some(entry) = entries.next() {
             if entry.len() < 4 { continue; }
             let code = &entry[..2];
-            files.push(ChangedFile { status: code.to_owned(), path: entry[3..].to_owned() });
-            // In -z mode a rename/copy includes the original path as a second entry.
-            if code.contains('R') || code.contains('C') { entries.next(); }
+            let original = if code.contains('R') || code.contains('C') { entries.next().map(str::to_owned) } else { None };
+            files.push(ChangedFile { status: code.to_owned(), path: entry[3..].to_owned(), original });
         }
         Ok((branch, files))
     })
@@ -173,14 +202,27 @@ async fn refresh(cwd: PathBuf) -> Result<(String, Vec<ChangedFile>), String> {
     .map_err(|err| err.to_string())?
 }
 
-async fn commit_all(cwd: PathBuf, message: String) -> Result<(), String> {
+async fn commit_staged(cwd: PathBuf, message: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        run_git(&cwd, &["add", "-A"])?;
         run_git(&cwd, &["commit", "-m", &message])?;
         Ok(())
     })
     .await
     .map_err(|err| err.to_string())?
+}
+
+fn stage_file(cwd: &Path, file: &ChangedFile, stage: bool) -> Result<(), String> {
+    let has_head = run_git(cwd, &["rev-parse", "--verify", "HEAD"]).is_ok();
+    let mut args = if stage {
+        vec!["--literal-pathspecs", "add", "-A", "--"]
+    } else if has_head {
+        vec!["--literal-pathspecs", "reset", "HEAD", "--"]
+    } else {
+        vec!["--literal-pathspecs", "rm", "--cached", "-f", "--"]
+    };
+    args.push(&file.path);
+    if let Some(original) = &file.original { args.push(original); }
+    run_git(cwd, &args).map(|_| ())
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
@@ -193,4 +235,36 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn stage_and_unstage_preserve_worktree_and_other_files() {
+        let root = std::env::temp_dir().join(format!("editor-staging-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        run_git(&root, &["init"]).unwrap();
+        std::fs::write(root.join("a [1].txt"), "initial\n").unwrap();
+        std::fs::write(root.join("b.txt"), "other\n").unwrap();
+        let file = ChangedFile { path: "a [1].txt".into(), status: "??".into(), original: None };
+        stage_file(&root, &file, true).unwrap();
+        assert_eq!(run_git(&root, &["diff", "--cached", "--name-only"]).unwrap().trim(), "a [1].txt");
+        stage_file(&root, &file, false).unwrap();
+        assert!(run_git(&root, &["ls-files"]).unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(root.join(&file.path)).unwrap(), "initial\n");
+        stage_file(&root, &file, true).unwrap();
+        run_git(&root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "Initial"]).unwrap();
+        std::fs::write(root.join(&file.path), "updated\n").unwrap();
+        stage_file(&root, &file, true).unwrap();
+        stage_file(&root, &file, false).unwrap();
+        assert!(run_git(&root, &["diff", "--cached"]).unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(root.join(&file.path)).unwrap(), "updated\n");
+        std::fs::remove_file(root.join(&file.path)).unwrap();
+        stage_file(&root, &file, true).unwrap();
+        assert!(run_git(&root, &["diff", "--cached", "--summary"]).unwrap().contains("delete mode"));
+        stage_file(&root, &file, false).unwrap();
+        assert!(!root.join(&file.path).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

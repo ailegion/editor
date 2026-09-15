@@ -187,6 +187,11 @@ enum Message {
     GitDiffLoaded(PathBuf, Vec<(usize, git_diff::LineStatus)>),
     TabSelected(usize),
     TabClosed(usize),
+    ReopenClosedTab,
+    RevealPath(PathBuf),
+    RevealStep(u64, DirectoryTreeEvent),
+    DismissNotice,
+    Exit,
 
     Tree(DirectoryTreeEvent),
     RefreshTree,
@@ -225,16 +230,30 @@ enum Message {
     WindowMaximizedChecked(bool),
 }
 
+#[derive(PartialEq, serde::Serialize, serde::Deserialize)]
+struct RecoveryBuffer {
+    path: Option<PathBuf>,
+    text: String,
+}
+
 #[derive(Default, PartialEq, serde::Serialize, serde::Deserialize)]
 struct EditorSession {
     root: Option<PathBuf>,
     tabs: Vec<PathBuf>,
     active: Option<PathBuf>,
+    #[serde(default)]
+    recovery: Vec<RecoveryBuffer>,
 }
 
 struct State {
     root: Option<PathBuf>,
     saved_session: EditorSession,
+    last_session_write: std::time::Instant,
+    closed_tabs: Vec<PathBuf>,
+    notice: Option<(String, std::time::Instant)>,
+    reveal_generation: u64,
+    reveal_queue: std::collections::VecDeque<PathBuf>,
+    reveal_target: Option<PathBuf>,
     tabs: Vec<Tab>,
     active_tab: usize,
     focus: Focus,
@@ -315,6 +334,12 @@ impl State {
         Self {
             root,
             saved_session: EditorSession::default(),
+            last_session_write: std::time::Instant::now() - Duration::from_secs(1),
+            closed_tabs: Vec::new(),
+            notice: None,
+            reveal_generation: 0,
+            reveal_queue: std::collections::VecDeque::new(),
+            reveal_target: None,
             tabs: Vec::new(),
             active_tab: 0,
             focus: Focus::Editor,
@@ -355,9 +380,23 @@ impl State {
             tasks.push(tree.update(DirectoryTreeEvent::Toggled(root.clone())).map(Message::Tree));
         }
         if session.root == state.root {
-            for path in session.tabs {
-                tasks.push(state.open_path(path));
+            for path in &session.tabs {
+                tasks.push(state.open_path(path.clone()));
             }
+            for recovery in session.recovery {
+                let mut content = code_editor::Buffer::new(&recovery.text, code_editor::metrics_for_zoom(state.zoom));
+                let extension = recovery.path.as_ref().and_then(|path| path.extension()).and_then(|ext| ext.to_str()).unwrap_or("txt");
+                content.highlight(&state.highlighter, extension, &state.app_theme);
+                let tab = Tab {
+                    path: recovery.path.clone(), content, dirty: true,
+                    search: Default::default(), line_ending: LineEnding::detect(&recovery.text), diff: Default::default(),
+                };
+                if let Some(index) = state.tabs.iter().position(|tab| tab.path == recovery.path) {
+                    state.tabs[index] = tab;
+                } else { state.tabs.push(tab); }
+                state.notify("Recovered unsaved edits");
+            }
+            state.tabs.sort_by_key(|tab| session.tabs.iter().position(|path| tab.path.as_ref() == Some(path)).unwrap_or(usize::MAX));
             if let Some(index) = state.tabs.iter().position(|tab| tab.path == session.active) {
                 state.active_tab = index;
             }
@@ -366,17 +405,29 @@ impl State {
         (state, Task::batch(tasks))
     }
 
+    fn notify(&mut self, message: impl Into<String>) {
+        self.notice = Some((message.into(), std::time::Instant::now()));
+    }
+
     fn persist_session(&mut self) {
+        if self.last_session_write.elapsed() < Duration::from_millis(500) { return; }
+        self.last_session_write = std::time::Instant::now();
         let session = EditorSession {
             root: self.root.clone(),
             tabs: self.tabs.iter().filter_map(|tab| tab.path.clone()).collect(),
             active: self.tabs.get(self.active_tab).and_then(|tab| tab.path.clone()),
+            recovery: self.tabs.iter().filter(|tab| tab.dirty).map(|tab| RecoveryBuffer {
+                path: tab.path.clone(), text: tab.content.text(),
+            }).collect(),
         };
         if session == self.saved_session { return; }
         if let Some(path) = config_path("session.json") {
             if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
             if let Ok(bytes) = serde_json::to_vec(&session) {
-                if std::fs::write(path, bytes).is_ok() { self.saved_session = session; }
+                match write_session(&path, &bytes) {
+                    Ok(()) => self.saved_session = session,
+                    Err(err) => self.notify(format!("Could not save recovery: {err}")),
+                }
             }
         }
     }
@@ -485,8 +536,9 @@ impl State {
             recent_files::record(&mut self.recent_files, path.clone());
             return load_diff_task(self.root.clone(), path);
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return Task::none();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => { self.notify(format!("Could not open {}: {err}", path.display())); return Task::none(); }
         };
         let extension = path
             .extension()
@@ -517,6 +569,7 @@ impl State {
         if self.tabs[index].dirty && !confirm("Unsaved changes", "Discard unsaved changes?") {
             return;
         }
+        if let Some(path) = self.tabs[index].path.clone() { self.closed_tabs.push(path); }
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             self.active_tab = 0;
@@ -535,11 +588,14 @@ impl State {
             None => rfd::FileDialog::new().save_file(),
         };
         if let Some(path) = path {
-            if std::fs::write(&path, tab.content.text()).is_ok() {
+            let result = std::fs::write(&path, tab.content.text());
+            if result.is_ok() {
                 tab.path = Some(path.clone());
                 tab.dirty = false;
+                self.notify(format!("Saved {}", path.file_name().unwrap_or_default().to_string_lossy()));
                 return load_diff_task(self.root.clone(), path);
             }
+            if let Err(err) = result { self.notify(format!("Save failed: {err}")); }
         }
         Task::none()
     }
@@ -599,14 +655,19 @@ impl State {
             std::fs::remove_file(path)
         };
         if result.is_ok() {
+            self.notify("Deleted successfully");
             if let Some(index) = self.tabs.iter().position(|t| t.path.as_deref() == Some(path)) {
                 self.close_tab(index);
             }
-        }
+        } else if let Err(err) = result { self.notify(format!("Delete failed: {err}")); }
     }
 }
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
+    if matches!(&message, Message::TabClosed(_) | Message::TabSelected(_) | Message::FileAction(_) | Message::ReopenClosedTab)
+        || matches!(&message, Message::KeyPressed(_, modifiers) if modifiers.command()) {
+        state.last_session_write = std::time::Instant::now() - Duration::from_secs(1);
+    }
     let mut task = Task::none();
     if state.git_preview.is_some() && matches!(&message,
         Message::EditorAction(_) | Message::EditAction(_) | Message::Search(_)
@@ -724,9 +785,23 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::CloseGitPreview => state.git_preview = None,
         Message::Git(msg) => {
+            match &msg {
+                git::Message::Committed(Ok(())) => state.notify("Commit created"),
+                git::Message::Staged(Ok(())) => state.notify("Staging updated"),
+                git::Message::Committed(Err(err)) | git::Message::Staged(Err(err)) | git::Message::Refreshed(Err(err)) => state.notify(format!("Git: {err}")),
+                _ => {},
+            }
             let cwd = state.root_or_cwd();
-            let is_refresh = matches!(msg, git::Message::Refresh);
-            task = git::update(&mut state.git, msg, cwd).map(Message::Git);
+            let is_refresh = matches!(msg, git::Message::Refresh | git::Message::Staged(Ok(())) | git::Message::Committed(Ok(())));
+            if is_refresh {
+                if let Some(preview) = &mut state.git_preview {
+                    let root = preview.root.clone();
+                    let path = preview.path.clone();
+                    preview.result = None;
+                    task = Task::perform(git_preview::load(root.clone(), path.clone()), move |result| Message::GitPreviewLoaded(root.clone(), path.clone(), result));
+                }
+            }
+            task = Task::batch([task, git::update(&mut state.git, msg, cwd).map(Message::Git)]);
             if is_refresh {
                 if let Some(path) = state.tabs.get(state.active_tab).and_then(|t| t.path.clone()) {
                     task = Task::batch([task, load_diff_task(state.root.clone(), path)]);
@@ -749,6 +824,56 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::TabSelected(i) => { state.git_preview = None; state.active_tab = i; },
         Message::TabClosed(i) => state.close_tab(i),
+        Message::DismissNotice => state.notice = None,
+        Message::Exit => {
+            state.last_session_write = std::time::Instant::now() - Duration::from_secs(1);
+            state.persist_session();
+            let recovery: Vec<_> = state.tabs.iter().filter(|tab| tab.dirty).map(|tab| RecoveryBuffer {
+                path: tab.path.clone(), text: tab.content.text(),
+            }).collect();
+            if recovery != state.saved_session.recovery {
+                state.notify("Could not save recovery. Save your files before closing.");
+                return Task::none();
+            }
+            return iced::exit();
+        }
+        Message::ReopenClosedTab => {
+            if let Some(path) = state.closed_tabs.pop() { task = state.open_path(path); }
+        }
+        Message::RevealPath(path) => {
+            if let Some(root) = state.root.clone().filter(|root| path.starts_with(root)) {
+                state.sidebar_mode = SidebarMode::Tree;
+                state.show_sidebar();
+                let mut dirs: Vec<_> = path.ancestors().skip(1).take_while(|parent| parent.starts_with(&root)).map(Path::to_path_buf).collect();
+                dirs.reverse();
+                if path.is_dir() { dirs.push(path.clone()); }
+                dirs.dedup();
+                state.reveal_queue = dirs.into();
+                state.reveal_target = Some(path);
+                state.reveal_generation += 1;
+                let generation = state.reveal_generation;
+                let mut tree = DirectoryTree::new(root).with_filter(DirectoryFilter::FilesAndFolders);
+                if let Some(dir) = state.reveal_queue.pop_front() {
+                    task = tree.update(DirectoryTreeEvent::Toggled(dir)).map(move |event| Message::RevealStep(generation, event));
+                }
+                state.tree = Some(tree);
+            } else { state.notify("This file is outside the open project"); }
+        }
+        Message::RevealStep(generation, event) => {
+            if generation == state.reveal_generation {
+                if let Some(tree) = &mut state.tree {
+                    let loaded = matches!(&event, DirectoryTreeEvent::Loaded(_));
+                    task = tree.update(event).map(move |event| Message::RevealStep(generation, event));
+                    if loaded {
+                        if let Some(dir) = state.reveal_queue.pop_front() {
+                            task = Task::batch([task, tree.update(DirectoryTreeEvent::Toggled(dir)).map(move |event| Message::RevealStep(generation, event))]);
+                        } else if let Some(path) = state.reveal_target.take() {
+                            task = Task::batch([task, tree.update(DirectoryTreeEvent::Selected(path.clone(), path.is_dir(), iced_swdir_tree::SelectionMode::Replace)).map(Message::Tree)]);
+                        }
+                    }
+                }
+            }
+        }
 
         Message::FileAction(action) => match action {
             FileAction::OpenFile => {
@@ -800,6 +925,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::ViewAction(action) => state.apply_zoom(action),
 
         Message::Tree(event) => {
+            if state.reveal_target.is_some() && matches!(&event, DirectoryTreeEvent::Loaded(_)) { return Task::none(); }
+            if !matches!(&event, DirectoryTreeEvent::Loaded(_)) {
+                state.reveal_generation += 1;
+                state.reveal_target = None;
+                state.reveal_queue.clear();
+            }
             state.focus = Focus::Tree;
             let mut open_task = Task::none();
             if let DirectoryTreeEvent::Selected(path, is_dir, _) = &event {
@@ -878,7 +1009,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         .parent()
                         .unwrap_or_else(|| Path::new("."))
                         .join(&new_name);
-                    if std::fs::rename(&old_path, &new_path).is_ok() {
+                    let renamed = std::fs::rename(&old_path, &new_path);
+                    if renamed.is_ok() {
+                        state.notify("Renamed successfully");
                         if let Some(tab) = state
                             .tabs
                             .iter_mut()
@@ -889,7 +1022,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         if let Some(parent) = old_path.parent() {
                             task = refresh_dir_task(parent.to_path_buf());
                         }
-                    }
+                    } else if let Err(err) = renamed { state.notify(format!("Rename failed: {err}")); }
                 }
             }
         }
@@ -909,8 +1042,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         std::fs::write(target, "")
                     };
                     if result.is_ok() {
+                        state.notify("Created successfully");
                         task = refresh_dir_task(dir);
-                    }
+                    } else if let Err(err) = result { state.notify(format!("Create failed: {err}")); }
                 }
             }
         }
@@ -936,6 +1070,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::KeyPressed(key, modifiers) => {
             if modifiers.command() {
                 match key.as_ref() {
+                    keyboard::Key::Character(c) if modifiers.shift() && c.eq_ignore_ascii_case("t") => {
+                        task = update(state, Message::ReopenClosedTab);
+                    }
+                    keyboard::Key::Character("q") => return update(state, Message::Exit),
+                    keyboard::Key::Character("w") => {
+                        if state.git_preview.is_some() { state.git_preview = None; }
+                        else { state.close_tab(state.active_tab); }
+                    }
+                    keyboard::Key::Character(c) if c.len() == 1 && matches!(c.as_bytes()[0], b'1'..=b'9') => {
+                        let index = (c.as_bytes()[0] - b'1') as usize;
+                        if index < state.tabs.len() { state.active_tab = index; state.git_preview = None; }
+                    }
                     keyboard::Key::Character("s") => task = state.save(),
                     keyboard::Key::Character("o") => {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
@@ -1127,6 +1273,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             task = acp::update(&mut state.acp, msg, cwd).map(Message::Acp);
         }
         Message::Tick => {
+            if state.notice.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(8)) { state.notice = None; }
             state.chat.poll();
             state.acp.poll();
             if state.acp.take_finished() {
@@ -1192,7 +1339,13 @@ fn view(state: &State) -> Element<'_, Message> {
     .on_resize(10, Message::PaneResized)
     .height(Length::Fill);
 
-    let base: Element<'_, Message> = column![top_bar, panes, status_bar].into();
+    let mut layout = column![top_bar, panes];
+    if let Some((message, _)) = &state.notice {
+        layout = layout.push(container(row![text(message).size(12), Space::new().width(Length::Fill),
+            button("×").style(flat_button_style).on_press(Message::DismissNotice),
+        ].spacing(8).align_y(iced::Alignment::Center)).padding([4, 12]).style(iced::widget::container::rounded_box));
+    }
+    let base: Element<'_, Message> = layout.push(status_bar).into();
 
     if state.quick_open.visible {
         iced::widget::stack![
@@ -1349,6 +1502,7 @@ fn command_list(state: &State) -> Vec<command_palette::Command> {
     let has_active_tab = state.tabs.get(state.active_tab).is_some();
 
     let mut commands = vec![
+        Command { label: "Reopen Closed Tab (Cmd+Shift+T)".into(), message: Message::ReopenClosedTab },
         Command { label: FileAction::OpenFile.to_string(), message: Message::FileAction(FileAction::OpenFile) },
         Command { label: FileAction::OpenFolder.to_string(), message: Message::FileAction(FileAction::OpenFolder) },
         Command { label: FileAction::CloseFolder.to_string(), message: Message::FileAction(FileAction::CloseFolder) },
@@ -1642,12 +1796,26 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             scrollable(tab_row).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())),
             header,
 
-            git_preview::view(preview),
+            git_preview::view(preview, &state.app_theme),
         ].width(Length::Fill).height(Length::Fill).into();
     }
     let mut editor_column = column![];
 
     if let Some(tab) = state.tabs.get(state.active_tab) {
+        if let Some(path) = &tab.path {
+            let mut crumbs = row![].spacing(2).align_y(iced::Alignment::Center);
+            let base = state.root.as_deref().filter(|root| path.starts_with(root));
+            let relative = base.and_then(|root| path.strip_prefix(root).ok()).unwrap_or(path);
+            let mut current = base.map(Path::to_path_buf).unwrap_or_default();
+            for part in relative.components() {
+                current.push(part);
+                crumbs = crumbs.push(button(text(part.as_os_str().to_string_lossy().to_string()).size(12))
+                    .style(flat_button_style).on_press(Message::RevealPath(current.clone()))).push(text("›").size(12));
+            }
+            crumbs = crumbs.push(Space::new().width(Length::Fill)).push(button(text("Reveal in Tree").size(12))
+                .style(flat_button_style).on_press(Message::RevealPath(path.clone())));
+            editor_column = editor_column.push(crumbs.padding([4, 8]));
+        }
         if tab.search.visible {
             editor_column = editor_column.push(code_editor::search::view(&tab.search).map(Message::Search));
         }
@@ -1660,7 +1828,15 @@ fn view_editor(state: &State) -> Element<'_, Message> {
                 Message::EditorAction,
             ));
     } else {
-        editor_column = editor_column.push(text("No file open"));
+        editor_column = editor_column.push(container(column![
+            text("Ready when you are").size(24),
+            text("Open a file or use a shortcut to get started.").size(14).style(iced::widget::text::secondary),
+            button("Open File     Cmd+O").style(flat_button_style).on_press(Message::FileAction(FileAction::OpenFile)),
+            button("Quick Open     Cmd+P").style(flat_button_style).on_press(Message::ToggleQuickOpen),
+            button("Command Palette     Cmd+Shift+P").style(flat_button_style).on_press(Message::ToggleCommandPalette),
+            button("Reopen Closed Tab     Cmd+Shift+T").style(flat_button_style).on_press(Message::ReopenClosedTab),
+            button("Open AI Assistant").style(flat_button_style).on_press(Message::AiToggle),
+        ].spacing(16)).padding(32));
     }
 
     let tab_strip = scrollable(tab_row)
@@ -1707,6 +1883,7 @@ fn subscription(_state: &State) -> Subscription<Message> {
     let keys = iced::event::listen_with(handle_raw_key_event);
     let tick = iced::time::every(Duration::from_millis(50)).map(|_| Message::Tick);
     let window_events = iced::window::events().map(|(id, event)| match event {
+        iced::window::Event::CloseRequested => Message::Exit,
         iced::window::Event::Resized(size) => Message::WindowResized(id, size),
         iced::window::Event::Moved(position) => Message::WindowMoved(position),
         _ => Message::Noop,
@@ -1726,6 +1903,15 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 
 pub(crate) fn config_path(name: &str) -> Option<PathBuf> {
     Some(home_dir()?.join(".config").join("editor").join(name))
+}
+
+fn write_session(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let pending = path.with_extension("pending");
+    let mut file = std::fs::File::create(&pending)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(pending, path)
 }
 
 fn last_project_path() -> Option<PathBuf> {
@@ -1976,7 +2162,29 @@ pub fn main() -> iced::Result {
             size: load_window_size(),
             position: load_window_position(),
             maximized: load_window_maximized(),
+            exit_on_close_request: false,
             ..Default::default()
         })
         .run()
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    #[test]
+    fn recovery_roundtrips_and_accepts_old_sessions() {
+        let legacy: EditorSession = serde_json::from_str(r#"{"root":null,"tabs":[],"active":null}"#).unwrap();
+        assert!(legacy.recovery.is_empty());
+        let session = EditorSession {
+            recovery: vec![RecoveryBuffer { path: Some(PathBuf::from("missing.txt")), text: "unsaved é\n".into() }],
+            ..Default::default()
+        };
+        let path = std::env::temp_dir().join(format!("editor-session-{}.json", std::process::id()));
+        write_session(&path, &serde_json::to_vec(&legacy).unwrap()).unwrap();
+        write_session(&path, &serde_json::to_vec(&session).unwrap()).unwrap();
+        let restored: EditorSession = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(restored == session);
+        assert!(!path.with_extension("pending").exists());
+        std::fs::remove_file(path).unwrap();
+    }
 }

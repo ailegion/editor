@@ -1,5 +1,5 @@
 //! Read-only, on-disk Git changes. Keep index and working-tree patches separate.
-use iced::widget::{column, container, responsive, row, scrollable, text};
+use iced::widget::{column, container, responsive, rich_text, row, scrollable, span, text};
 use iced::{Element, Length};
 use std::path::{Path, PathBuf};
 
@@ -128,15 +128,34 @@ pub fn summary(preview: &Preview) -> String {
     format!("+{added}  −{removed}")
 }
 
-fn cell<Message: 'static>(line: &Option<(usize, String)>, kind: u8, width: f32) -> Element<'static, Message> {
+/// Highlight the smallest differing middle after removing shared prefix/suffix.
+fn changed_range(content: &str, other: &str) -> std::ops::Range<usize> {
+    let prefix = content.chars().zip(other.chars()).take_while(|(a, b)| a == b)
+        .map(|(ch, _)| ch.len_utf8()).sum::<usize>();
+    let suffix = content[prefix..].chars().rev().zip(other[prefix..].chars().rev())
+        .take_while(|(a, b)| a == b).map(|(ch, _)| ch.len_utf8()).sum::<usize>();
+    prefix..content.len() - suffix
+}
+
+fn cell<Message: 'static>(line: &Option<(usize, String)>, other: &Option<(usize, String)>, kind: u8, width: f32, theme: &iced::Theme) -> Element<'static, Message> {
     let (number, content) = line.as_ref()
         .map(|(number, content)| (number.to_string(), content.replace('\t', "    ")))
         .unwrap_or_default();
+    let range = if kind == 0 { 0..0 } else {
+        other.as_ref().map(|(_, other)| changed_range(&content, &other.replace('\t', "    "))).unwrap_or(0..content.len())
+    };
+    let palette = theme.extended_palette();
+    let accent = if kind == 1 { palette.success.base.color } else { palette.danger.base.color };
+    let highlight = iced::Color { a: 0.35, ..accent };
+    let code: iced::widget::text::Rich<'_, (), Message> = rich_text(vec![
+        span(content[..range.start].to_owned()),
+        span(content[range.clone()].to_owned()).background(highlight),
+        span(content[range.end..].to_owned()),
+    ]).font(iced::Font::MONOSPACE).size(13).wrapping(iced::widget::text::Wrapping::None);
     container(row![
         container(text(number).font(iced::Font::MONOSPACE).size(12)
             .style(iced::widget::text::secondary)).width(42),
-        text(content).font(iced::Font::MONOSPACE).size(13)
-            .wrapping(iced::widget::text::Wrapping::None),
+        code,
     ].spacing(8))
     .padding([2, 8]).width(width).height(22).clip(true)
     .style(move |theme: &iced::Theme| {
@@ -160,7 +179,7 @@ fn cell<Message: 'static>(line: &Option<(usize, String)>, kind: u8, width: f32) 
     }).into()
 }
 
-pub fn view<Message: 'static>(preview: &Preview) -> Element<'_, Message> {
+pub fn view<'a, Message: 'static>(preview: &'a Preview, theme: &'a iced::Theme) -> Element<'a, Message> {
     let patch = match &preview.result {
         None => return container(text("Loading diff…")).padding(16).into(),
         Some(Err(err)) => return container(text(err).style(iced::widget::text::danger)).padding(16).into(),
@@ -190,8 +209,8 @@ pub fn view<Message: 'static>(preview: &Preview) -> Element<'_, Message> {
                     right = right.push(header(String::new()));
                 }
                 DiffRow::Lines { old, new, changed } => {
-                    left = left.push(cell(old, if *changed && old.is_some() { 2 } else { 0 }, content_width));
-                    right = right.push(cell(new, if *changed && new.is_some() { 1 } else { 0 }, content_width));
+                    left = left.push(cell(old, new, if *changed && old.is_some() { 2 } else { 0 }, content_width, theme));
+                    right = right.push(cell(new, old, if *changed && new.is_some() { 1 } else { 0 }, content_width, theme));
                 }
             }
         }
@@ -216,6 +235,14 @@ pub fn view<Message: 'static>(preview: &Preview) -> Element<'_, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn character_highlights_respect_unicode_and_insertions() {
+        assert_eq!(changed_range("news_intelx", "news_intel"), 10..11);
+        assert_eq!(changed_range("é猫x", "é犬x"), 2..5);
+        assert_eq!(changed_range("same", "same"), 4..4);
+        assert_eq!(changed_range("", "new"), 0..0);
+    }
+
     #[test]
     fn hides_patch_metadata_and_labels_omitted_context() {
         let rows = split_diff("Unstaged changes\ndiff --git a/f b/f\nindex abc..def 100644\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n a\n@@ -5 +5 @@\n-b\n+c\n");

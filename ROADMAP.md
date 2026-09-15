@@ -19,7 +19,7 @@ for a "minimal, no-bloat" positioning.
   actions, theme switching, panel toggles, refresh git/tree) built from the same
   `EditAction`/`ViewAction`/`FileAction` labels the menus use, same overlay presentation
   and keyboard handling as Quick Open
-- Git sidebar panel: current branch, working-tree status list, stage-all + commit, refresh
+- Git sidebar panel: current branch, staged/unstaged status lists, per-file stage/unstage, commit staged changes, refresh
   — shells out to the `git` CLI
 - Sidebar is a collapsible "activity bar": Tree / Git / Search, toggled from status-bar
   icons, click-active-icon-again to collapse
@@ -128,8 +128,9 @@ not a toggle -- worth scoping as its own task rather than folding into "Phase 2 
    (never-`git add`ed) new files show no markers, since `git diff` itself shows nothing for
    them -- fixable later by detecting untracked status and marking the whole file Added, but
    out of scope for the first pass.
-9. **Stage individual files** (not just stage-all) — `git.rs` already lists per-file
-   status; add per-row stage/unstage buttons before touching hunk-level staging.
+9. ~~**Stage individual files**~~ — done: separate staged/unstaged lists, per-file
+   stage/unstage actions, and commits restricted to staged content. Side-by-side diffs
+   include character-level highlights. Hunk-level staging remains a future extension.
 
 ### Phase 4 — Language intelligence (highest cost, highest ceiling)
 10. **LSP client** — spawn `rust-analyzer` (or similar) per project, wire diagnostics +

@@ -1,6 +1,6 @@
 # editor
 
-A minimal, no-bloat code editor in Rust, built on `egui`/`eframe`.
+A minimal, no-bloat code editor in Rust, built on `iced`.
 
 ## Features
 
@@ -8,7 +8,22 @@ A minimal, no-bloat code editor in Rust, built on `egui`/`eframe`.
 - Left sidebar: project file tree, create/rename/delete, keyboard navigation (arrows to move/open/expand/collapse)
 - Right sidebar: AI chat against any OpenAI-compatible endpoint (configurable base URL/key/model), with streaming and a stop button
 - Status bar with an AI sidebar visibility toggle
-- Reopens the last project folder on startup
+- Reopens the last project with only the root expanded; restores tabs and the active file
+- Recovers unsaved edits from atomic local snapshots (every 500 ms and on normal window close)
+- Git panel with staged/unstaged lists, per-file staging, and side-by-side diffs with character highlights
+- Clickable breadcrumbs and reveal-in-tree navigation
+- Notifications for saves, Git operations, and file-operation failures
+
+## Tab shortcuts
+
+- `Cmd+1`–`Cmd+9`: select a tab
+- `Cmd+W`: close the current tab or diff
+- `Cmd+Shift+T`: reopen the last closed file
+
+Recovery lives in `~/.config/editor/session.json`. Restored edits remain unsaved until
+explicitly saved. A crash can lose edits made since the most recent snapshot (up to
+about half a second). Missing saved files are skipped; missing files with recovered
+edits remain available as dirty tabs.
 
 ## Run
 
