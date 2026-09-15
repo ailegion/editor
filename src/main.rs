@@ -4,6 +4,7 @@ mod code_editor;
 mod command_palette;
 mod git;
 mod git_diff;
+mod git_preview;
 mod goto_line;
 mod project_search;
 mod quick_open;
@@ -181,6 +182,8 @@ enum Message {
     ToggleGotoLine,
     Git(git::Message),
     GitPanelToggle,
+    GitPreviewLoaded(PathBuf, String, Result<String, String>),
+    CloseGitPreview,
     GitDiffLoaded(PathBuf, Vec<(usize, git_diff::LineStatus)>),
     TabSelected(usize),
     TabClosed(usize),
@@ -238,6 +241,7 @@ struct State {
     goto_line: goto_line::GotoLineState,
     recent_files: Vec<PathBuf>,
     git: git::GitState,
+    git_preview: Option<git_preview::Preview>,
 
     app_theme: iced::Theme,
     highlighter: code_editor::Highlighter,
@@ -315,6 +319,7 @@ impl State {
             goto_line: goto_line::GotoLineState::default(),
             recent_files: recent_files::load(),
             git: git::GitState::default(),
+            git_preview: None,
             app_theme,
             highlighter: code_editor::Highlighter::new(),
             zoom,
@@ -424,6 +429,7 @@ impl State {
     }
 
     fn open_path(&mut self, path: PathBuf) -> Task<Message> {
+        self.git_preview = None;
         if let Some(index) = self
             .tabs
             .iter()
@@ -474,6 +480,7 @@ impl State {
     }
 
     fn save(&mut self) -> Task<Message> {
+        if self.git_preview.is_some() { return Task::none(); }
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
             return Task::none();
         };
@@ -493,6 +500,7 @@ impl State {
 
     /// Routes a key press to the active tab's editor. Returns whether it was handled.
     fn handle_editor_key(&mut self, key: &keyboard::Key, modifiers: keyboard::Modifiers) -> bool {
+        if self.git_preview.is_some() { return false; }
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
             return false;
         };
@@ -554,6 +562,11 @@ impl State {
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
     let mut task = Task::none();
+    if state.git_preview.is_some() && matches!(&message,
+        Message::EditorAction(_) | Message::EditAction(_) | Message::Search(_)
+        | Message::FileAction(FileAction::Save)) {
+        return Task::none();
+    }
     match message {
         Message::EditorAction(action) => {
             state.focus = Focus::Editor;
@@ -646,6 +659,24 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 task = goto_line::open(&mut state.goto_line).map(Message::GotoLine);
             }
         }
+        Message::Git(git::Message::OpenDiff(path)) => {
+            let root = state.root_or_cwd();
+            state.focus = Focus::Editor;
+            state.git_preview = Some(git_preview::Preview {
+                root: root.clone(), path: path.clone(), result: None,
+            });
+            task = Task::perform(git_preview::load(root.clone(), path.clone()), move |result| {
+                Message::GitPreviewLoaded(root.clone(), path.clone(), result)
+            });
+        }
+        Message::GitPreviewLoaded(root, path, result) => {
+            if let Some(preview) = &mut state.git_preview {
+                if preview.root == root && preview.path == path {
+                    preview.result = Some(result);
+                }
+            }
+        }
+        Message::CloseGitPreview => state.git_preview = None,
         Message::Git(msg) => {
             let cwd = state.root_or_cwd();
             let is_refresh = matches!(msg, git::Message::Refresh);
@@ -670,7 +701,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 tab.diff = diff.into_iter().collect();
             }
         }
-        Message::TabSelected(i) => state.active_tab = i,
+        Message::TabSelected(i) => { state.git_preview = None; state.active_tab = i; },
         Message::TabClosed(i) => state.close_tab(i),
 
         Message::FileAction(action) => match action {
@@ -686,10 +717,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     state.tree = Some(
                         DirectoryTree::new(path.clone()).with_filter(DirectoryFilter::FilesAndFolders),
                     );
+                    state.git_preview = None;
                     state.root = Some(path);
                 }
             }
             FileAction::CloseFolder => {
+                state.git_preview = None;
                 state.root = None;
                 state.tree = None;
                 if let Some(path) = last_project_path() {
@@ -868,7 +901,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     {
                         state.toggle_sidebar_mode(SidebarMode::ProjectSearch);
                     }
-                    keyboard::Key::Character("f") => {
+                    keyboard::Key::Character("f") if state.git_preview.is_none() => {
                         if let Some(tab) = state.tabs.get_mut(state.active_tab) {
                             code_editor::search::update(
                                 &mut tab.search,
@@ -892,7 +925,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                                 .map(Message::CommandPalette);
                         }
                     }
-                    keyboard::Key::Character("g") => {
+                    keyboard::Key::Character("g") if state.git_preview.is_none() => {
                         if state.goto_line.visible {
                             let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
                         } else if state.tabs.get(state.active_tab).is_some() {
@@ -1503,7 +1536,7 @@ fn view_tree(state: &State) -> Element<'_, Message> {
 fn view_editor(state: &State) -> Element<'_, Message> {
     let mut tab_row = row![].spacing(2).padding([4, 4]);
     for (i, tab) in state.tabs.iter().enumerate() {
-        let is_active = i == state.active_tab;
+        let is_active = state.git_preview.is_none() && i == state.active_tab;
         let tab_title = row![
             button(text(tab.title()))
                 .padding([4, 4])
@@ -1535,6 +1568,19 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         tab_row = tab_row.push(column![tab_title, underline].spacing(2));
     }
 
+    if let Some(preview) = &state.git_preview {
+        let header = row![
+            text(format!("Diff: {}", preview.path)).size(14),
+            Space::new().width(Length::Fill),
+            button("Close diff").on_press(Message::CloseGitPreview),
+        ].spacing(12).padding(8).align_y(iced::Alignment::Center);
+        return column![
+            scrollable(tab_row).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())),
+            header,
+            text("On-disk changes • staged and unstaged").size(12).style(iced::widget::text::secondary),
+            git_preview::view(preview),
+        ].width(Length::Fill).height(Length::Fill).into();
+    }
     let mut editor_column = column![];
 
     if let Some(tab) = state.tabs.get(state.active_tab) {
