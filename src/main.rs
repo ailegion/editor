@@ -1474,7 +1474,7 @@ fn view_sidebar(state: &State) -> Element<'_, Message> {
         SidebarMode::ProjectSearch => {
             project_search::view(&state.project_search, state.root.as_deref()).map(Message::ProjectSearch)
         }
-        SidebarMode::Git => git::view(&state.git).map(Message::Git),
+        SidebarMode::Git => git::view(&state.git, state.git_preview.as_ref().map(|preview| preview.path.as_str())).map(Message::Git),
     }
 }
 
@@ -1570,14 +1570,16 @@ fn view_editor(state: &State) -> Element<'_, Message> {
 
     if let Some(preview) = &state.git_preview {
         let header = row![
-            text(format!("Diff: {}", preview.path)).size(14),
+            text(preview.path.clone()).size(14),
+            text(git_preview::summary(preview)).size(12).style(iced::widget::text::secondary),
+            button("×").style(flat_button_style).on_press(Message::CloseGitPreview),
             Space::new().width(Length::Fill),
-            button("Close diff").on_press(Message::CloseGitPreview),
+            button(if state.ai_visible { "Hide AI panel" } else { "Show AI panel" }).style(flat_button_style).on_press(Message::AiToggle),
         ].spacing(12).padding(8).align_y(iced::Alignment::Center);
         return column![
             scrollable(tab_row).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())),
             header,
-            text("On-disk changes • staged and unstaged").size(12).style(iced::widget::text::secondary),
+
             git_preview::view(preview),
         ].width(Length::Fill).height(Length::Fill).into();
     }

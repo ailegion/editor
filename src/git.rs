@@ -65,7 +65,7 @@ pub fn update(state: &mut GitState, message: Message, cwd: PathBuf) -> Task<Mess
     Task::none()
 }
 
-pub fn view(state: &GitState) -> Element<'_, Message> {
+pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Message> {
     let refresh_icon: char = lucide_icons::Icon::RefreshCw.into();
     let header = row![
         text("SOURCE CONTROL").size(12),
@@ -88,6 +88,7 @@ pub fn view(state: &GitState) -> Element<'_, Message> {
         files_col = files_col.push(container(text("Working tree clean").size(13)).padding([16, 0]));
     }
     for file in &state.files {
+        let is_selected = selected == Some(file.path.as_str());
         let path = Path::new(&file.path);
         let name = path.file_name().and_then(|name| name.to_str()).unwrap_or(&file.path);
         let parent = path.parent().and_then(|path| path.to_str()).unwrap_or("");
@@ -112,7 +113,14 @@ pub fn view(state: &GitState) -> Element<'_, Message> {
             ].spacing(8).align_y(iced::Alignment::Center))
             .padding([6, 8])
             .width(Length::Fill)
-            .style(crate::flat_button_style)
+            .style(move |theme, status| {
+                let mut style = crate::flat_button_style(theme, status);
+                if is_selected {
+                    style.background = Some(theme.extended_palette().primary.weak.color.into());
+                    style.text_color = theme.extended_palette().primary.weak.text;
+                }
+                style
+            })
             .on_press(Message::OpenDiff(file.path.clone())),
         );
     }

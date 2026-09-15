@@ -57,8 +57,9 @@ enum DiffRow {
 
 fn split_diff(patch: &str) -> Vec<DiffRow> {
     let mut rows = Vec::new();
-    let (mut old_line, mut new_line) = (0, 0);
+    let (mut old_line, mut new_line) = (0usize, 0usize);
     let mut in_hunk = false;
+    let mut previous_end = 1usize;
     let mut removed = Vec::new();
     let mut added = Vec::new();
     fn flush(rows: &mut Vec<DiffRow>, removed: &mut Vec<(usize, String)>, added: &mut Vec<(usize, String)>) {
@@ -78,10 +79,14 @@ fn split_diff(patch: &str) -> Vec<DiffRow> {
                 new_line = rest.split([',', ' ']).next().unwrap_or("0").parse().unwrap_or(0);
                 in_hunk = true;
             }
-            rows.push(DiffRow::Header(line.to_owned()));
+            let skipped = old_line.saturating_sub(previous_end);
+            rows.push(DiffRow::Header(if skipped > 0 {
+                format!("⋯ {skipped} unchanged lines")
+            } else { "Changes".to_owned() }));
         } else if in_hunk && line.starts_with('-') {
             removed.push((old_line, line[1..].to_owned()));
             old_line += 1;
+            previous_end = old_line;
         } else if in_hunk && line.starts_with('+') {
             added.push((new_line, line[1..].to_owned()));
             new_line += 1;
@@ -93,16 +98,34 @@ fn split_diff(patch: &str) -> Vec<DiffRow> {
             });
             old_line += 1;
             new_line += 1;
+            previous_end = old_line;
         } else if line.starts_with("\\ No newline") {
             // This annotation does not consume a source line or break a replacement pair.
         } else {
             flush(&mut rows, &mut removed, &mut added);
             in_hunk = false;
-            if !line.is_empty() { rows.push(DiffRow::Header(line.to_owned())); }
+            if line.starts_with("diff --git") {
+                previous_end = 1;
+            }
+            if !line.is_empty() && !["diff --git", "index ", "--- ", "+++ "].iter().any(|prefix| line.starts_with(prefix)) {
+                rows.push(DiffRow::Header(line.to_owned()));
+            }
         }
     }
     flush(&mut rows, &mut removed, &mut added);
     rows
+}
+
+pub fn summary(preview: &Preview) -> String {
+    let Some(Ok(patch)) = &preview.result else { return String::new(); };
+    let (mut added, mut removed) = (0, 0);
+    for row in split_diff(patch) {
+        if let DiffRow::Lines { old, new, changed: true } = row {
+            added += usize::from(new.is_some());
+            removed += usize::from(old.is_some());
+        }
+    }
+    format!("+{added}  −{removed}")
 }
 
 fn cell<Message: 'static>(line: &Option<(usize, String)>, kind: u8, width: f32) -> Element<'static, Message> {
@@ -110,20 +133,28 @@ fn cell<Message: 'static>(line: &Option<(usize, String)>, kind: u8, width: f32) 
         .map(|(number, content)| (number.to_string(), content.replace('\t', "    ")))
         .unwrap_or_default();
     container(row![
-        text(number).font(iced::Font::MONOSPACE).size(12).width(52),
+        container(text(number).font(iced::Font::MONOSPACE).size(12)
+            .style(iced::widget::text::secondary)).width(42),
         text(content).font(iced::Font::MONOSPACE).size(13)
             .wrapping(iced::widget::text::Wrapping::None),
     ].spacing(8))
     .padding([2, 8]).width(width).height(22).clip(true)
     .style(move |theme: &iced::Theme| {
         let palette = theme.extended_palette();
-        let pair = match kind {
-            1 => palette.success.weak,
-            2 => palette.danger.weak,
-            _ => palette.background.base,
+        let base = palette.background.base;
+        let accent = match kind {
+            1 => palette.success.base.color,
+            2 => palette.danger.base.color,
+            _ => base.color,
+        };
+        let tint = iced::Color {
+            r: base.color.r * 0.88 + accent.r * 0.12,
+            g: base.color.g * 0.88 + accent.g * 0.12,
+            b: base.color.b * 0.88 + accent.b * 0.12,
+            a: 1.0,
         };
         iced::widget::container::Style {
-            background: Some(pair.color.into()), text_color: Some(pair.text),
+            background: Some(tint.into()), text_color: Some(base.text),
             ..Default::default()
         }
     }).into()
@@ -146,17 +177,17 @@ pub fn view<Message: 'static>(preview: &Preview) -> Element<'_, Message> {
         }).max().unwrap_or(0);
         let viewport_half = ((size.width - 16.0) / 2.0).max(80.0);
         let content_width = viewport_half.max(longest as f32 * 8.0 + 84.0);
-        let mut left = column![container(text("Previous • removed").size(13)).padding(8).height(34)];
-        let mut right = column![container(text("Updated • added").size(13)).padding(8).height(34)];
+        let mut left = column![container(text("Before").size(13)).padding(8).height(34)];
+        let mut right = column![container(text("After").size(13)).padding(8).height(34)];
         for entry in &rows {
             match entry {
                 DiffRow::Header(label) => {
-                    let header = || container(text(label.clone()).size(12)
+                    let header = |label: String| container(text(label).size(12)
                         .wrapping(iced::widget::text::Wrapping::None))
                         .padding([6, 8]).width(content_width).height(30).clip(true)
                         .style(iced::widget::container::rounded_box);
-                    left = left.push(header());
-                    right = right.push(header());
+                    left = left.push(header(label.clone()));
+                    right = right.push(header(String::new()));
                 }
                 DiffRow::Lines { old, new, changed } => {
                     left = left.push(cell(old, if *changed && old.is_some() { 2 } else { 0 }, content_width));
@@ -166,10 +197,14 @@ pub fn view<Message: 'static>(preview: &Preview) -> Element<'_, Message> {
         }
         // One vertical scroll keeps corresponding rows aligned. Each half can
         // scroll long lines horizontally without pushing the other offscreen.
+        let content_height = 34.0 + rows.iter().map(|entry| match entry {
+            DiffRow::Header(_) => 30.0, DiffRow::Lines { .. } => 22.0,
+        }).sum::<f32>();
         let halves = row![
             scrollable(left.width(content_width))
                 .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default()))
                 .width(viewport_half),
+            container(iced::widget::rule::vertical(1)).height(content_height),
             scrollable(right.width(content_width))
                 .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default()))
                 .width(viewport_half),
@@ -181,6 +216,15 @@ pub fn view<Message: 'static>(preview: &Preview) -> Element<'_, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hides_patch_metadata_and_labels_omitted_context() {
+        let rows = split_diff("Unstaged changes\ndiff --git a/f b/f\nindex abc..def 100644\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n a\n@@ -5 +5 @@\n-b\n+c\n");
+        let headers: Vec<_> = rows.iter().filter_map(|row| match row {
+            DiffRow::Header(label) => Some(label.as_str()), _ => None,
+        }).collect();
+        assert_eq!(headers, ["Unstaged changes", "Changes", "⋯ 3 unchanged lines"]);
+    }
+
     #[test]
     fn aligns_replacements_and_preserves_line_numbers() {
         let rows = split_diff("@@ -4,3 +4,4 @@\n same\n-old\n+new\n+extra\n end\n");
