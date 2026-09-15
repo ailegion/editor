@@ -25,6 +25,10 @@ pub struct Buffer {
     matched_brackets: Vec<(usize, f32, f32)>,
     undo_stack: Vec<Change>,
     redo_stack: Vec<Change>,
+    pub folds: std::collections::BTreeMap<usize, usize>,
+    pub collapsed: std::collections::BTreeSet<usize>,
+    visible_lines: Vec<usize>,
+    folding_text: String,
 }
 
 impl Buffer {
@@ -45,9 +49,42 @@ impl Buffer {
             matched_brackets: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            folds: Default::default(), collapsed: Default::default(),
+            visible_lines: Vec::new(), folding_text: String::new(),
         };
         buffer.sync();
         buffer
+    }
+
+    pub fn visible_count(&self) -> usize { self.visible_lines.len() }
+
+    pub fn visual_row(&self, line: usize) -> Option<usize> {
+        self.visible_lines.binary_search(&line).ok()
+    }
+
+    pub fn source_line(&self, row: usize) -> usize {
+        self.visible_lines.get(row).or_else(|| self.visible_lines.last()).copied().unwrap_or(0)
+    }
+
+    pub fn toggle_fold(&mut self, line: usize) {
+        if !self.folds.contains_key(&line) { return; }
+        if !self.collapsed.remove(&line) {
+            // Never leave an insertion point or a selection hidden inside a fold.
+            self.goto_line(line);
+            self.collapsed.insert(line);
+        }
+        self.rebuild_visible();
+    }
+
+    fn rebuild_visible(&mut self) {
+        self.visible_lines.clear();
+        let mut line = 0;
+        while line < self.line_count() {
+            self.visible_lines.push(line);
+            line = if self.collapsed.contains(&line) {
+                self.folds.get(&line).copied().unwrap_or(line) + 1
+            } else { line + 1 };
+        }
     }
 
     pub fn set_size(&mut self, width: f32, height: f32) {
@@ -238,6 +275,15 @@ impl Buffer {
     }
 
     fn sync(&mut self) {
+        let text = self.text();
+        if text != self.folding_text {
+            self.folds = super::folding::ranges(&text);
+            self.folding_text = text;
+            // Reopen on edits instead of keeping stale line ranges after insertion/deletion.
+            self.collapsed.clear();
+        }
+        self.collapsed.retain(|start| !self.folds.get(start).is_some_and(|end| self.cursor.line > *start && self.cursor.line <= *end));
+        self.rebuild_visible();
         self.inner.shape_until_scroll(&mut self.font_system, false);
 
         let selection_bounds = {
@@ -283,5 +329,32 @@ impl Buffer {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod folding_tests {
+    use super::*;
+    #[test]
+    fn folding_maps_rows_and_reveals_cursor_without_changing_text() {
+        let source = "{\n  [\n    1\n  ]\n}\nafter";
+        let mut buffer = Buffer::new(source, Metrics::new(14.0, 20.0));
+        buffer.toggle_fold(1);
+        assert_eq!(buffer.visible_count(), 4);
+        assert_eq!(buffer.source_line(2), 4);
+        assert_eq!(buffer.visual_row(3), None);
+        buffer.toggle_fold(0);
+        assert_eq!(buffer.visible_count(), 2);
+        assert_eq!(buffer.source_line(1), 5);
+        buffer.toggle_fold(0);
+        assert_eq!(buffer.visible_count(), 4); // nested fold preserved
+        buffer.goto_line(2);
+        assert_eq!(buffer.visible_count(), 6);
+        assert_eq!(buffer.text(), source);
+        assert!(!buffer.can_undo());
+        buffer.toggle_fold(0);
+        buffer.perform(cosmic_text::Action::Insert('x'));
+        assert!(buffer.collapsed.is_empty());
+        assert!(buffer.can_undo());
     }
 }

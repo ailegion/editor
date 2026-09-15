@@ -31,7 +31,7 @@ pub fn draw(
     // them since `Frame` clipping alone wouldn't save that work.
     let is_visible = |y: f32| y + line_height >= 0.0 && y <= viewport_height;
 
-    if let Some(cursor_line) = current_line_y(buffer, scroll) {
+    if let Some(cursor_line) = buffer.visual_row(buffer.cursor.line).map(|row| row as f32 * line_height - scroll) {
         if is_visible(cursor_line) {
             frame.fill_rectangle(
                 Point::new(gutter_width, cursor_line),
@@ -42,7 +42,8 @@ pub fn draw(
     }
 
     for &(line_i, x0, x1) in buffer.selection_pixels() {
-        let y = line_i as f32 * line_height - scroll;
+        let Some(row) = buffer.visual_row(line_i) else { continue; };
+        let y = row as f32 * line_height - scroll;
         if !is_visible(y) {
             continue;
         }
@@ -64,7 +65,8 @@ pub fn draw(
     // pure deletion (the line no longer exists, so there's nothing to bar -- just mark the
     // new-file line it now borders, per `git_diff::LineStatus::Removed`'s doc comment).
     for (&line_i, status) in diff {
-        let y = line_i as f32 * line_height - scroll;
+        let Some(row) = buffer.visual_row(line_i) else { continue; };
+        let y = row as f32 * line_height - scroll;
         if !is_visible(y) {
             continue;
         }
@@ -82,7 +84,8 @@ pub fn draw(
     }
 
     for (i, line) in buffer.inner.lines.iter().enumerate() {
-        let y = i as f32 * line_height - scroll;
+        let Some(row) = buffer.visual_row(i) else { continue; };
+        let y = row as f32 * line_height - scroll;
         if !is_visible(y) {
             continue;
         }
@@ -117,10 +120,27 @@ pub fn draw(
             ),
         }
         draw_line_number(frame, i + 1, y, gutter_width, style);
+        if let Some(end) = buffer.folds.get(&i) {
+            let collapsed = buffer.collapsed.contains(&i);
+            frame.fill_text(Text {
+                content: if collapsed { "▸" } else { "▾" }.into(),
+                position: Point::new(gutter_width - 16.0, y),
+                color: style.gutter_text_color, size: iced::Pixels(style.font_size), ..Default::default()
+            });
+            if collapsed {
+                let width = line.layout_opt().and_then(|lines| lines.first()).map(|line| line.w).unwrap_or(0.0);
+                frame.fill_text(Text {
+                    content: format!("  ⋯ {} lines", end - i),
+                    position: Point::new(gutter_width + width, y),
+                    color: style.gutter_text_color, size: iced::Pixels(style.font_size), ..Default::default()
+                });
+            }
+        }
     }
 
     for &(line_i, x0, x1) in buffer.matched_brackets() {
-        let y = line_i as f32 * line_height - scroll;
+        let Some(row) = buffer.visual_row(line_i) else { continue; };
+        let y = row as f32 * line_height - scroll;
         if !is_visible(y) {
             continue;
         }
@@ -133,8 +153,8 @@ pub fn draw(
     }
 
     if blink_on() {
-        if let Some((x, y)) = buffer.cursor_pixel() {
-            let y = y as f32 - scroll;
+        if let Some((x, _)) = buffer.cursor_pixel() {
+            let y = buffer.visual_row(buffer.cursor.line).unwrap_or(0) as f32 * line_height - scroll;
             if is_visible(y) {
                 frame.fill_rectangle(
                     Point::new(gutter_width + x as f32, y),
@@ -144,12 +164,6 @@ pub fn draw(
             }
         }
     }
-}
-
-fn current_line_y(buffer: &Buffer, scroll: f32) -> Option<f32> {
-    buffer
-        .cursor_pixel()
-        .map(|(_, y)| y as f32 - scroll)
 }
 
 fn draw_line_number(frame: &mut Frame, number: usize, y: f32, gutter_width: f32, style: &Style) {

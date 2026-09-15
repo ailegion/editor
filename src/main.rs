@@ -171,6 +171,7 @@ enum PaneKind {
 #[derive(Debug, Clone)]
 enum Message {
     EditorAction(cosmic_text::Action),
+    ToggleFold(usize),
     Search(code_editor::search::Message),
     ProjectSearch(project_search::Message),
     ToggleProjectSearch,
@@ -675,6 +676,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         return Task::none();
     }
     match message {
+        Message::ToggleFold(line) => {
+            if let Some(tab) = state.tabs.get_mut(state.active_tab) { tab.content.toggle_fold(line); }
+        }
         Message::EditorAction(action) => {
             state.focus = Focus::Editor;
             let before = state
@@ -1826,6 +1830,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
                 &state.app_theme,
                 state.zoom,
                 Message::EditorAction,
+                Message::ToggleFold,
             ));
     } else {
         editor_column = editor_column.push(container(column![

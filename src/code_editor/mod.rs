@@ -7,6 +7,7 @@
 //! only app wiring and final polish remain.
 
 mod brackets;
+mod folding;
 mod buffer;
 mod highlight;
 pub mod input;
@@ -35,6 +36,7 @@ pub struct CodeEditor<'a, Message> {
     content: &'a Buffer,
     diff: &'a HashMap<usize, LineStatus>,
     style: Style,
+    on_fold: Option<Box<dyn Fn(usize) -> Message + 'a>>,
     on_action: Option<Box<dyn Fn(cosmic_text::Action) -> Message + 'a>>,
 }
 
@@ -50,6 +52,7 @@ impl<'a, Message> CodeEditor<'a, Message> {
             diff,
             style: Style::from_theme(theme, zoom),
             on_action: None,
+            on_fold: None,
         }
     }
 
@@ -64,7 +67,9 @@ impl<'a, Message> CodeEditor<'a, Message> {
     /// cursor hasn't moved (so a manual scroll-away is left alone) and when it moved but is
     /// still visible.
     fn scroll_correction(&self, state: &mut State, viewport_height: f32) -> Option<f32> {
-        let current = self.content.cursor_pixel();
+        let current = self.content.cursor_pixel().and_then(|(x, _)| {
+            self.content.visual_row(self.content.cursor.line).map(|row| (x, (row as f32 * self.style.line_height) as i32))
+        });
         let moved = current != state.last_cursor;
         state.last_cursor = current;
         if !moved {
@@ -124,6 +129,8 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
         // animation tick, see `render::draw`'s blinking cursor) as a chance to notice the
         // cursor drifted outside the visible window and correct `scroll` to bring it back in.
         if let Event::Window(iced::window::Event::RedrawRequested(_)) = event {
+            let max_scroll = (self.content.visible_count() as f32 * self.style.line_height - bounds.height).max(0.0);
+            state.scroll = state.scroll.min(max_scroll);
             return self.scroll_correction(state, bounds.height).map(|scroll| {
                 state.scroll = scroll;
                 canvas::Action::request_redraw()
@@ -144,11 +151,19 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
             mouse::Event::ButtonPressed(mouse::Button::Left) => {
                 let on_action = self.on_action.as_ref()?;
                 let position = cursor.position_in(bounds)?;
+                let row = ((position.y + state.scroll) / self.style.line_height).max(0.0) as usize;
+                let line = self.content.source_line(row);
+                if position.x >= gutter_width - 18.0 && position.x < gutter_width {
+                    if self.content.folds.contains_key(&line) {
+                        return self.on_fold.as_ref().map(|on_fold| canvas::Action::publish(on_fold(line)).and_capture());
+                    }
+                }
                 state.dragging = true;
                 Some(
                     canvas::Action::publish(on_action(cosmic_text::Action::Click {
                         x: (position.x - gutter_width) as i32,
-                        y: (position.y + state.scroll) as i32,
+                        y: (self.content.source_line(((position.y + state.scroll) / self.style.line_height).max(0.0) as usize) as f32 * self.style.line_height
+                            + (position.y + state.scroll).rem_euclid(self.style.line_height)) as i32,
                     }))
                     .and_capture(),
                 )
@@ -159,7 +174,8 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
                 Some(
                     canvas::Action::publish(on_action(cosmic_text::Action::Drag {
                         x: (position.x - gutter_width) as i32,
-                        y: (position.y + state.scroll) as i32,
+                        y: (self.content.source_line(((position.y + state.scroll) / self.style.line_height).max(0.0) as usize) as f32 * self.style.line_height
+                            + (position.y + state.scroll).rem_euclid(self.style.line_height)) as i32,
                     }))
                     .and_capture(),
                 )
@@ -173,7 +189,7 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
                     mouse::ScrollDelta::Lines { y, .. } => y * self.style.line_height * 3.0,
                     mouse::ScrollDelta::Pixels { y, .. } => y,
                 };
-                let max_scroll = (self.content.line_count() as f32 * self.style.line_height
+                let max_scroll = (self.content.visible_count() as f32 * self.style.line_height
                     - bounds.height)
                     .max(0.0);
                 state.scroll = (state.scroll - dy).clamp(0.0, max_scroll);
@@ -203,11 +219,14 @@ pub fn code_editor<'a, Message>(
     theme: &Theme,
     zoom: f32,
     on_action: impl Fn(cosmic_text::Action) -> Message + 'a,
+    on_fold: impl Fn(usize) -> Message + 'a,
 ) -> Element<'a, Message>
 where
     Message: 'a,
 {
-    Canvas::new(CodeEditor::new(content, diff, theme, zoom).on_action(on_action))
+    let mut editor = CodeEditor::new(content, diff, theme, zoom).on_action(on_action);
+    editor.on_fold = Some(Box::new(on_fold));
+    Canvas::new(editor)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
