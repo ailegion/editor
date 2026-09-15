@@ -54,6 +54,6 @@ impl Style {
     /// Width in pixels of the line-number gutter, sized for `line_count`'s digit count.
     pub fn gutter_width(&self, line_count: usize) -> f32 {
         let digits = line_count.max(1).to_string().len().max(2);
-        digits as f32 * self.font_size * 0.62 + 16.0
+        digits as f32 * self.font_size * 0.62 + 28.0
     }
 }

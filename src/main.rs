@@ -225,8 +225,16 @@ enum Message {
     WindowMaximizedChecked(bool),
 }
 
+#[derive(Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct EditorSession {
+    root: Option<PathBuf>,
+    tabs: Vec<PathBuf>,
+    active: Option<PathBuf>,
+}
+
 struct State {
     root: Option<PathBuf>,
+    saved_session: EditorSession,
     tabs: Vec<Tab>,
     active_tab: usize,
     focus: Focus,
@@ -306,6 +314,7 @@ impl State {
 
         Self {
             root,
+            saved_session: EditorSession::default(),
             tabs: Vec::new(),
             active_tab: 0,
             focus: Focus::Editor,
@@ -332,6 +341,43 @@ impl State {
             ai_mode: AiMode::default(),
             chat: chat::ChatState::default(),
             acp: acp::AcpState::default(),
+        }
+    }
+
+    fn boot() -> (Self, Task<Message>) {
+        let mut state = Self::new();
+        let session: EditorSession = config_path("session.json")
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let mut tasks = Vec::new();
+        if let (Some(tree), Some(root)) = (&mut state.tree, &state.root) {
+            tasks.push(tree.update(DirectoryTreeEvent::Toggled(root.clone())).map(Message::Tree));
+        }
+        if session.root == state.root {
+            for path in session.tabs {
+                tasks.push(state.open_path(path));
+            }
+            if let Some(index) = state.tabs.iter().position(|tab| tab.path == session.active) {
+                state.active_tab = index;
+            }
+        }
+        state.persist_session();
+        (state, Task::batch(tasks))
+    }
+
+    fn persist_session(&mut self) {
+        let session = EditorSession {
+            root: self.root.clone(),
+            tabs: self.tabs.iter().filter_map(|tab| tab.path.clone()).collect(),
+            active: self.tabs.get(self.active_tab).and_then(|tab| tab.path.clone()),
+        };
+        if session == self.saved_session { return; }
+        if let Some(path) = config_path("session.json") {
+            if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
+            if let Ok(bytes) = serde_json::to_vec(&session) {
+                if std::fs::write(path, bytes).is_ok() { self.saved_session = session; }
+            }
         }
     }
 
@@ -718,6 +764,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         DirectoryTree::new(path.clone()).with_filter(DirectoryFilter::FilesAndFolders),
                     );
                     state.git_preview = None;
+                    if let Some(tree) = &mut state.tree {
+                        task = tree.update(DirectoryTreeEvent::Toggled(path.clone())).map(Message::Tree);
+                    }
                     state.root = Some(path);
                 }
             }
@@ -1105,6 +1154,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
     }
+    state.persist_session();
     task
 }
 
@@ -1130,6 +1180,14 @@ fn view(state: &State) -> Element<'_, Message> {
                 .into(),
         };
         pane_grid::Content::new(content)
+    })
+    .spacing(2)
+    .style(|theme: &iced::Theme| {
+        let mut style = pane_grid::default(theme);
+        style.hovered_split.color = theme.extended_palette().primary.base.color;
+        style.hovered_split.width = 3.0;
+        style.picked_split = style.hovered_split;
+        style
     })
     .on_resize(10, Message::PaneResized)
     .height(Length::Fill);
@@ -1188,7 +1246,7 @@ fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
         .width(Length::Shrink)
     };
 
-    let mode_row = row![mode_tab("HTTP", AiMode::Http), mode_tab("Claude Code", AiMode::Acp)]
+    let mode_row = row![mode_tab("HTTP", AiMode::Http), mode_tab("Claude Code", AiMode::Acp), Space::new().width(Length::Fill), button("×").style(flat_button_style).on_press(Message::AiToggle)]
         .spacing(2)
         .padding([4, 4]);
 
@@ -1538,12 +1596,12 @@ fn view_editor(state: &State) -> Element<'_, Message> {
     for (i, tab) in state.tabs.iter().enumerate() {
         let is_active = state.git_preview.is_none() && i == state.active_tab;
         let tab_title = row![
-            button(text(tab.title()))
-                .padding([4, 4])
+            button(text(tab.title()).size(13))
+                .padding([8, 10])
                 .style(move |theme, status| tab_button_style(theme, status, is_active))
                 .on_press(Message::TabSelected(i)),
-            button(text("x").size(12))
-                .padding([2, 6])
+            button(text("×").size(16))
+                .padding([6, 8])
                 .style(flat_button_style)
                 .on_press(Message::TabClosed(i)),
         ]
@@ -1565,7 +1623,11 @@ fn view_editor(state: &State) -> Element<'_, Message> {
                 ..iced::widget::container::Style::default()
             });
 
-        tab_row = tab_row.push(column![tab_title, underline].spacing(2));
+        tab_row = tab_row.push(container(column![tab_title, underline].spacing(2))
+            .style(move |theme: &iced::Theme| iced::widget::container::Style {
+                background: is_active.then(|| theme.extended_palette().background.weak.color.into()),
+                ..Default::default()
+            }));
     }
 
     if let Some(preview) = &state.git_preview {
@@ -1904,7 +1966,7 @@ fn reveal_in_file_manager(path: &Path) {
 
 pub fn main() -> iced::Result {
     let icon = iced::window::icon::from_file_data(include_bytes!("../icon.png"), None).ok();
-    iced::application(State::new, update, view)
+    iced::application(State::boot, update, view)
         .title("editor")
         .theme(|state: &State| state.app_theme.clone())
         .subscription(subscription)

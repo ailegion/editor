@@ -488,6 +488,17 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
     }
 
     let mut messages_col = column![].spacing(6);
+    if state.messages.is_empty() && !state.settings_open {
+        messages_col = messages_col.push(container(column![
+            text(if state.model.is_empty() { "Set up your assistant" } else { "Start a conversation" }).size(18),
+            text(if state.model.is_empty() {
+                "Connect a provider and choose a model to chat about your project."
+            } else { "Ask about your code, plan a change, or describe a problem." })
+                .size(13).style(iced::widget::text::secondary),
+            button(if state.model.is_empty() { "Choose a model" } else { "Model settings" })
+                .on_press(Message::ToggleSettings),
+        ].spacing(12)).padding([24, 12]));
+    }
     let last = state.messages.len().saturating_sub(1);
     for (i, message) in state.messages.iter().enumerate() {
         if message.content.is_empty() {
@@ -576,7 +587,7 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
                     let send_icon: char = lucide_icons::Icon::SendHorizonal.into();
                     button(text(send_icon).font(iced::Font::with_name("lucide")).size(14))
                         .padding([4, 8])
-                        .on_press(Message::Send)
+                        .on_press_maybe((!state.model.is_empty()).then_some(Message::Send))
                 },
             ]
             .align_y(iced::Alignment::Center),

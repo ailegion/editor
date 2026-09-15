@@ -87,6 +87,22 @@ pub fn draw(
             continue;
         }
         let text = line.text();
+        // Use shaped glyph positions, so guides follow actual spaces and tabs.
+        if let Some(layout) = line.layout_opt().and_then(|lines| lines.first()) {
+            let mut indent = 0usize;
+            for (offset, ch) in text.char_indices() {
+                if ch != ' ' && ch != '\t' { break; }
+                if indent > 0 && indent % 2 == 0 {
+                    if let Some(glyph) = layout.glyphs.iter().find(|glyph| glyph.start == offset) {
+                        frame.fill_rectangle(
+                            Point::new(gutter_width + glyph.x, y), Size::new(1.0, line_height),
+                            iced::Color { a: 0.14, ..style.text_color },
+                        );
+                    }
+                }
+                indent += if ch == '\t' { 4 } else { 1 };
+            }
+        }
         match line.layout_opt().and_then(|lines| lines.first()) {
             Some(layout_line) => draw_glyph_runs(frame, layout_line, text, y, gutter_width, style),
             None => fill_run(
@@ -139,7 +155,7 @@ fn current_line_y(buffer: &Buffer, scroll: f32) -> Option<f32> {
 fn draw_line_number(frame: &mut Frame, number: usize, y: f32, gutter_width: f32, style: &Style) {
     frame.fill_text(Text {
         content: number.to_string(),
-        position: Point::new(gutter_width - 10.0, y),
+        position: Point::new(gutter_width - 20.0, y),
         color: style.gutter_text_color,
         size: iced::Pixels(style.font_size),
         align_x: iced::advanced::text::Alignment::Right,
