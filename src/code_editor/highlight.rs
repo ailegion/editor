@@ -15,12 +15,18 @@ pub struct Highlighter {
 impl Highlighter {
     pub fn new() -> Self {
         Self {
-            syntax_set: SyntaxSet::load_defaults_nonewlines(),
+            syntax_set: two_face::syntax::extra_no_newlines(),
             theme_set: ThemeSet::load_defaults(),
         }
     }
 
     fn syntax_for(&self, extension: &str) -> &SyntaxReference {
+        let normalized = extension.to_ascii_lowercase();
+        let extension = match normalized.as_str() {
+            "mts" | "cts" => "ts",
+            "mjs" | "cjs" => "js",
+            other => other,
+        };
         self.syntax_set
             .find_syntax_by_extension(extension)
             .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text())
@@ -83,5 +89,38 @@ impl Highlighter {
 impl Default for Highlighter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_typescript_and_related_extensions() {
+        let highlighter = Highlighter::new();
+        for extension in ["ts", "mts", "cts", "TS"] {
+            assert_eq!(highlighter.language_name(extension), "TypeScript");
+        }
+        for extension in ["tsx", "jsx", "js", "mjs", "cjs", "json", "yaml", "yml", "toml", "rs"] {
+            assert_ne!(highlighter.language_name(extension), "Plain Text", "{extension}");
+        }
+        assert_eq!(highlighter.language_name("unknown-extension"), "Plain Text");
+    }
+
+    #[test]
+    fn typescript_and_tsx_get_colors_without_losing_text() {
+        let highlighter = Highlighter::new();
+        for (extension, source) in [
+            ("ts", "interface User { name: string }\nconst user: User = { name: \"Ada\" };\n"),
+            ("tsx", "export const View = () => <div title=\"hello\">{42}</div>;\n"),
+        ] {
+            for theme in [iced::Theme::Dark, iced::Theme::Light] {
+                let spans = highlighter.highlight(source, extension, &theme);
+                assert_eq!(spans.iter().map(|(text, _)| text.as_str()).collect::<String>(), source);
+                let colors: std::collections::HashSet<_> = spans.iter().filter_map(|(_, attrs)| attrs.color_opt).collect();
+                assert!(colors.len() > 2, "{extension} should color different token types");
+            }
+        }
     }
 }
