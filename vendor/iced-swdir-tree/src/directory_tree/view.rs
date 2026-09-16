@@ -48,6 +48,15 @@ impl DirectoryTree {
         Message: Clone + 'a,
         F: Fn(DirectoryTreeEvent) -> Message + Copy + 'a,
     {
+        self.view_with_entry(on_event, None)
+    }
+
+    /// Render an inline editor beneath a directory, or in place of an existing row.
+    pub fn view_with_entry<'a, Message, F>(
+        &'a self, on_event: F, mut entry: Option<(&'a Path, bool, Element<'a, Message>)>,
+    ) -> Element<'a, Message>
+    where Message: Clone + 'a, F: Fn(DirectoryTreeEvent) -> Message + Copy + 'a,
+    {
         // Recurse over the tree and collect rows into a single column
         // inside a scrollable. `column` accepts an iterator, but we
         // build a Vec explicitly because the recursion depth can
@@ -72,6 +81,7 @@ impl DirectoryTree {
             icon_theme,
             on_event,
             &mut rows,
+            &mut entry,
         );
 
         let list = column(rows).spacing(2).padding(4).width(Length::Fill);
@@ -97,6 +107,7 @@ fn render_node<'a, Message, F>(
     icon_theme: &dyn IconTheme,
     on_event: F,
     out: &mut Vec<Element<'a, Message>>,
+    entry: &mut Option<(&'a Path, bool, Element<'a, Message>)>,
 ) where
     Message: Clone + 'a,
     F: Fn(DirectoryTreeEvent) -> Message + Copy + 'a,
@@ -108,13 +119,18 @@ fn render_node<'a, Message, F>(
         return;
     }
     let is_drop_target = drop_target == Some(node.path.as_path());
-    out.push(render_row(
-        node,
-        depth,
-        is_drop_target,
-        icon_theme,
-        on_event,
-    ));
+    let is_entry_parent = entry.as_ref().is_some_and(|(path, replace, _)| *path == node.path && !replace);
+    let replace = entry.as_ref().is_some_and(|(path, replace, _)| *path == node.path && *replace);
+    if replace {
+        let (_, _, editor) = entry.take().unwrap();
+        out.push(row![Space::new().width(depth as f32 * INDENT_STEP + 26.0), editor].into());
+    } else {
+        out.push(render_row(node, depth, is_drop_target, icon_theme, on_event));
+    }
+    if is_entry_parent {
+        let (_, _, editor) = entry.take().unwrap();
+        out.push(row![Space::new().width((depth + 1) as f32 * INDENT_STEP + 26.0), editor].into());
+    }
 
     // Descent rule:
     //   - Search active: always descend (children are gated by the
@@ -135,6 +151,7 @@ fn render_node<'a, Message, F>(
                 icon_theme,
                 on_event,
                 out,
+                entry,
             );
         }
     }

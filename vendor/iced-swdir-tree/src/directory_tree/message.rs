@@ -58,6 +58,9 @@ pub enum DirectoryTreeEvent {
     /// Rescan a directory without toggling its expansion state.
     Refresh(PathBuf),
 
+    /// Ensure a directory is expanded without collapsing an open directory.
+    Expand(PathBuf),
+
     /// A row was selected.
     ///
     /// The `bool` indicates whether the path is a directory (`true`)

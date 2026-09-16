@@ -53,6 +53,11 @@ impl DirectoryTree {
     pub fn update(&mut self, msg: DirectoryTreeEvent) -> Task<DirectoryTreeEvent> {
         match msg {
             DirectoryTreeEvent::Toggled(path) => self.on_toggled(path),
+            DirectoryTreeEvent::Expand(path) => {
+                if self.root.find_mut(&path).is_some_and(|node| node.is_dir && !node.is_expanded) {
+                    self.on_toggled(path)
+                } else { Task::none() }
+            }
             DirectoryTreeEvent::Refresh(path) => {
                 if !self.root.find_mut(&path).is_some_and(|node| node.is_dir) { return Task::none(); }
                 self.prefetching_paths.remove(&path);

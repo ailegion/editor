@@ -958,12 +958,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::ContextNewFile => {
             if let Some(dir) = state.context_target_dir() {
+                state.renaming = None;
+                let expand = state.tree.as_mut().map(|tree| tree.update(DirectoryTreeEvent::Expand(dir.clone())).map(Message::Tree)).unwrap_or_else(Task::none);
                 state.creating = Some((dir, false, String::new()));
+                task = Task::batch([expand, iced::widget::operation::focus("tree-name")]);
             }
         }
         Message::ContextNewFolder => {
             if let Some(dir) = state.context_target_dir() {
+                state.renaming = None;
+                let expand = state.tree.as_mut().map(|tree| tree.update(DirectoryTreeEvent::Expand(dir.clone())).map(Message::Tree)).unwrap_or_else(Task::none);
                 state.creating = Some((dir, true, String::new()));
+                task = Task::batch([expand, iced::widget::operation::focus("tree-name")]);
             }
         }
         Message::ContextRename => {
@@ -972,7 +978,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
+                state.creating = None;
                 state.renaming = Some((path, name));
+                task = iced::widget::operation::focus("tree-name");
             }
         }
         Message::ContextDelete => {
@@ -1010,14 +1018,24 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::RenameSubmit => {
-            if let Some((old_path, new_name)) = state.renaming.take() {
+            if let Some((old_path, new_name)) = state.renaming.clone() {
                 if !new_name.is_empty() {
+                    if !valid_entry_name(&new_name) {
+                        state.notify("Enter a name without path separators");
+                        return iced::widget::operation::focus("tree-name");
+                    }
                     let new_path = old_path
                         .parent()
                         .unwrap_or_else(|| Path::new("."))
                         .join(&new_name);
+                    if new_path == old_path { state.renaming = None; return Task::none(); }
+                    if std::fs::symlink_metadata(&new_path).is_ok() {
+                        state.notify("That name already exists");
+                        return iced::widget::operation::focus("tree-name");
+                    }
                     let renamed = std::fs::rename(&old_path, &new_path);
                     if renamed.is_ok() {
+                        state.renaming = None;
                         state.notify("Renamed successfully");
                         if let Some(tab) = state
                             .tabs
@@ -1040,15 +1058,20 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::CreateSubmit => {
-            if let Some((dir, is_dir, name)) = state.creating.take() {
+            if let Some((dir, is_dir, name)) = state.creating.clone() {
                 if !name.is_empty() {
+                    if !valid_entry_name(&name) {
+                        state.notify("Enter a file or folder name without path separators");
+                        return iced::widget::operation::focus("tree-name");
+                    }
                     let target = dir.join(&name);
                     let result = if is_dir {
                         std::fs::create_dir(target)
                     } else {
-                        std::fs::write(target, "")
+                        std::fs::OpenOptions::new().write(true).create_new(true).open(target).map(|_| ())
                     };
                     if result.is_ok() {
+                        state.creating = None;
                         state.notify("Created successfully");
                         task = refresh_dir_task(dir);
                     } else if let Err(err) = result { state.notify(format!("Create failed: {err}")); }
@@ -1075,6 +1098,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
 
         Message::KeyPressed(key, modifiers) => {
+            if key == keyboard::Key::Named(keyboard::key::Named::Escape) && (state.creating.is_some() || state.renaming.is_some()) {
+                state.creating = None;
+                state.renaming = None;
+                return Task::none();
+            }
             if modifiers.command() {
                 match key.as_ref() {
                     keyboard::Key::Character(c) if modifiers.shift() && c.eq_ignore_ascii_case("t") => {
@@ -1346,13 +1374,23 @@ fn view(state: &State) -> Element<'_, Message> {
     .on_resize(10, Message::PaneResized)
     .height(Length::Fill);
 
-    let mut layout = column![top_bar, panes];
+    let mut base: Element<'_, Message> = column![top_bar, panes, status_bar].into();
     if let Some((message, _)) = &state.notice {
-        layout = layout.push(container(row![text(message).size(12), Space::new().width(Length::Fill),
+        let toast = container(row![text(message).size(13),
             button("×").style(flat_button_style).on_press(Message::DismissNotice),
-        ].spacing(8).align_y(iced::Alignment::Center)).padding([4, 12]).style(iced::widget::container::rounded_box));
+        ].spacing(12).align_y(iced::Alignment::Center))
+            .padding(12).max_width(440).style(|theme: &iced::Theme| {
+                let palette = theme.extended_palette();
+                iced::widget::container::Style {
+                    background: Some(palette.background.weak.color.into()),
+                    border: iced::Border { color: palette.background.strong.color, width: 1.0, radius: 6.0.into() },
+                    shadow: iced::Shadow { color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.25), offset: iced::Vector::new(0.0, 3.0), blur_radius: 12.0 },
+                    ..Default::default()
+                }
+            });
+        base = iced::widget::stack![base, container(toast).padding(16)
+            .align_right(Length::Fill).align_bottom(Length::Fill)].into();
     }
-    let base: Element<'_, Message> = layout.push(status_bar).into();
 
     if state.quick_open.visible {
         iced::widget::stack![
@@ -1702,7 +1740,23 @@ fn view_tree(state: &State) -> Element<'_, Message> {
         return text("No folder open (File > Open Folder)").into();
     };
 
-    let content = ContextMenu::new(tree.view(Message::Tree), || {
+    let entry = if let Some((dir, is_dir, buf)) = &state.creating {
+        let icon: char = if *is_dir { lucide_icons::Icon::Folder } else { lucide_icons::Icon::File }.into();
+        Some((dir.as_path(), false, row![
+            text(icon).font(iced::Font::with_name("lucide")).size(14),
+            text_input(if *is_dir { "Folder name" } else { "File name" }, buf)
+                .id("tree-name").size(13).padding([3, 5])
+                .on_input(Message::CreateInput).on_submit(Message::CreateSubmit),
+            button("×").style(flat_button_style).on_press(Message::CreateCancel),
+        ].spacing(4).align_y(iced::Alignment::Center).into()))
+    } else if let Some((path, buf)) = &state.renaming {
+        Some((path.as_path(), true, row![
+            text_input("Name", buf).id("tree-name").size(13).padding([3, 5])
+                .on_input(Message::RenameInput).on_submit(Message::RenameSubmit),
+            button("×").style(flat_button_style).on_press(Message::RenameCancel),
+        ].spacing(4).into()))
+    } else { None };
+    let content = ContextMenu::new(tree.view_with_entry(Message::Tree, entry), || {
         container(
             column![
                 menu_button("New File".to_string(), Message::ContextNewFile),
@@ -1728,28 +1782,7 @@ fn view_tree(state: &State) -> Element<'_, Message> {
         .into()
     });
 
-    let mut col = column![Element::from(content)].spacing(6);
-
-    if let Some((_, is_dir, buf)) = &state.creating {
-        let hint = if *is_dir { "new folder name" } else { "new file name" };
-        col = col.push(row![
-            text_input(hint, buf)
-                .on_input(Message::CreateInput)
-                .on_submit(Message::CreateSubmit),
-            button(text("x")).on_press(Message::CreateCancel),
-        ]);
-    }
-
-    if let Some((_, buf)) = &state.renaming {
-        col = col.push(row![
-            text_input("new name", buf)
-                .on_input(Message::RenameInput)
-                .on_submit(Message::RenameSubmit),
-            button(text("x")).on_press(Message::RenameCancel),
-        ]);
-    }
-
-    col.into()
+    content.into()
 }
 
 fn view_editor(state: &State) -> Element<'_, Message> {
@@ -1911,6 +1944,11 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 
 pub(crate) fn config_path(name: &str) -> Option<PathBuf> {
     Some(home_dir()?.join(".config").join("editor").join(name))
+}
+
+fn valid_entry_name(name: &str) -> bool {
+    !name.trim().is_empty() && name != "." && name != ".."
+        && !name.contains(['/', '\\', '\0'])
 }
 
 fn write_session(path: &Path, bytes: &[u8]) -> std::io::Result<()> {

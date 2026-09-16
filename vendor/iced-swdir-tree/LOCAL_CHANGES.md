@@ -12,3 +12,7 @@ Unlike toggling, it bypasses the loaded-state cache. Loaded results retain exist
 child nodes when their path and kind match, preserving expanded subtrees.
 
 When upgrading, retain these changes or migrate to equivalent upstream functionality.
+
+`view_with_entry` places a caller-owned name editor inside the tree, either below
+a parent directory or in place of a row. `Expand(path)` opens a directory without
+collapsing one that is already expanded.

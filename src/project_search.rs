@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use iced::widget::{button, column, scrollable, text, text_input};
+use iced::widget::{button, column, container, row, rich_text, span, scrollable, text, text_input, Space};
 use iced::{Element, Length, Task};
 
 /// Directories skipped during the walk. Not `.gitignore`-aware -- just the usual noisy,
@@ -175,27 +175,56 @@ pub fn view<'a>(state: &'a SearchState, root: Option<&Path>) -> Element<'a, Mess
     } else if state.results.len() >= MAX_RESULTS {
         format!("{MAX_RESULTS}+ results (showing first {MAX_RESULTS})")
     } else {
-        format!("{} result(s)", state.results.len())
+        format!("{} matches", state.results.len())
     };
 
-    let mut results_col = column![].spacing(2);
-    for (i, result) in state.results.iter().enumerate() {
-        let relative = root
-            .and_then(|root| result.path.strip_prefix(root).ok())
-            .unwrap_or(&result.path);
-        let label = format!("{}:{}", relative.display(), result.line);
-        results_col = results_col.push(
-            button(column![text(label).size(13), text(result.preview.clone()).size(12)].spacing(1))
-                .width(Length::Fill)
-                .padding(4)
-                .style(crate::flat_button_style)
-                .on_press(Message::ResultClicked(i)),
-        );
+    let mut results_col = column![].spacing(10);
+    let mut groups = std::collections::BTreeMap::<&Path, Vec<(usize, &SearchResult)>>::new();
+    for (index, result) in state.results.iter().enumerate() {
+        groups.entry(&result.path).or_default().push((index, result));
+    }
+    let matcher = regex::RegexBuilder::new(&regex::escape(&state.query)).case_insensitive(true).build().ok();
+    for (path, results) in groups {
+        let relative = root.and_then(|root| path.strip_prefix(root).ok()).unwrap_or(path);
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let parent = relative.parent().filter(|parent| !parent.as_os_str().is_empty());
+        let mut title = column![row![
+            text(name).size(13), Space::new().width(Length::Fill),
+            text(results.len().to_string()).size(11).style(iced::widget::text::secondary),
+        ]].spacing(2);
+        if let Some(parent) = parent {
+            title = title.push(text(parent.display().to_string()).size(11).style(iced::widget::text::secondary));
+        }
+        let mut group = column![container(title).padding([6, 8])].spacing(1);
+        for (index, result) in results {
+            let mut pieces = Vec::new();
+            let mut offset = 0;
+            if let Some(matcher) = &matcher {
+                for matched in matcher.find_iter(&result.preview) {
+                    pieces.push(span(result.preview[offset..matched.start()].to_owned()));
+                    pieces.push(span(result.preview[matched.range()].to_owned())
+                        .background(iced::Color::from_rgba(0.8, 0.65, 0.15, 0.25)));
+                    offset = matched.end();
+                }
+            }
+            pieces.push(span(result.preview[offset..].to_owned()));
+            let preview: iced::widget::text::Rich<'_, (), Message> = rich_text(pieces);
+            group = group.push(button(row![
+                text(result.line.to_string()).size(11).width(32).style(iced::widget::text::secondary),
+                preview.size(12).font(iced::Font::MONOSPACE),
+            ].spacing(6)).width(Length::Fill).padding([5, 8])
+                .style(crate::flat_button_style).on_press(Message::ResultClicked(index)));
+        }
+        results_col = results_col.push(container(group).width(Length::Fill).style(iced::widget::container::rounded_box));
+    }
+    if state.query.is_empty() {
+        results_col = results_col.push(text("Search across files in this project.").size(12).style(iced::widget::text::secondary));
     }
 
     column![
+        text("SEARCH").size(12),
         input,
-        text(summary).size(12),
+        text(summary).size(12).style(iced::widget::text::secondary),
         scrollable(results_col).height(Length::Fill),
     ]
     .spacing(6)
