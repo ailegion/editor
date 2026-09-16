@@ -3,6 +3,7 @@
 //! themes come from `themes/` folders laid out like VS Code extensions.
 
 mod jsonc;
+pub mod openvsx;
 mod vscode;
 
 use std::path::{Path, PathBuf};
@@ -51,8 +52,6 @@ pub struct EditorColors {
 #[derive(Debug, Clone)]
 pub struct EditorTheme {
     pub name: String,
-    // Not read by the app yet (tests check it); needed for light/dark theme pairs.
-    #[allow(dead_code)]
     pub kind: Kind,
     /// For iced widgets, built from the theme's colors.
     pub iced: iced::Theme,
@@ -286,10 +285,25 @@ fn theme_dirs() -> Vec<(PathBuf, bool)> {
         // `cargo run` starts the binary from target/, away from the bundled theme files.
         dirs.push((Path::new(env!("CARGO_MANIFEST_DIR")).join("themes"), false));
     }
-    if let Some(user) = crate::config_path("themes") {
+    if let Some(user) = user_themes_dir() {
         dirs.push((user, true));
     }
     dirs
+}
+
+/// Where installed themes go.
+pub fn user_themes_dir() -> Option<PathBuf> {
+    crate::config_path("themes")
+}
+
+/// Names of the themes in an extension folder that load.
+fn loadable_themes(dir: &Path) -> Vec<String> {
+    let registry = ThemeRegistry { entries: scan_extension(dir) };
+    registry
+        .names()
+        .filter(|name| registry.load_theme(name).is_ok())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Extension folders (`<dir>/<extension>/package.json`) and loose theme files (`<dir>/*.json`).
@@ -299,6 +313,10 @@ fn scan(dir: &Path) -> Vec<ThemeEntry> {
     paths.sort();
     let mut entries = Vec::new();
     for path in paths {
+        // Dot folders are in-progress installs (see `openvsx::install`).
+        if path.file_name().is_some_and(|name| name.to_string_lossy().starts_with('.')) {
+            continue;
+        }
         if path.is_dir() {
             entries.extend(scan_extension(&path));
         } else if path.extension().is_some_and(|ext| ext == "json") {

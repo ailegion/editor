@@ -23,6 +23,9 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process"
 ureq = "3.3.0"
 portable-pty = "0.9.0"
 vt100 = "0.16.2"
+# Theme installs (.vsix). flate2's decoder backend comes from its default features, already
+# enabled elsewhere in the tree; `theme::openvsx` tests extract a deflated archive.
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
 
 [package.metadata.bundle]
 name = "editor"

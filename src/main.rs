@@ -12,6 +12,7 @@ mod project_search;
 mod quick_open;
 mod recent_files;
 mod theme;
+mod theme_install;
 
 use iced::keyboard;
 use iced::widget::{
@@ -202,6 +203,7 @@ enum Message {
     ToggleProjectSearch,
     QuickOpen(quick_open::Message),
     ToggleQuickOpen,
+    ThemeInstall(theme_install::Message),
     CommandPalette(command_palette::Message),
     ToggleCommandPalette,
     GotoLine(goto_line::Message),
@@ -302,6 +304,7 @@ struct State {
     sidebar_mode: SidebarMode,
     project_search: project_search::SearchState,
     quick_open: quick_open::QuickOpenState,
+    theme_install: theme_install::ThemeInstallState,
     command_palette: command_palette::PaletteState,
     goto_line: goto_line::GotoLineState,
     recent_files: Vec<PathBuf>,
@@ -398,6 +401,7 @@ impl State {
             sidebar_mode: SidebarMode::default(),
             project_search: project_search::SearchState::default(),
             quick_open: quick_open::QuickOpenState::default(),
+            theme_install: theme_install::ThemeInstallState::default(),
             command_palette: command_palette::PaletteState::default(),
             goto_line: goto_line::GotoLineState::default(),
             recent_files: recent_files::load(),
@@ -834,6 +838,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             } else {
                 let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
                 let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
+                state.theme_install.visible = false;
                 quick_open::Message::Open
             };
             let (t, _) = quick_open::update(&mut state.quick_open, msg, root.as_deref(), &state.recent_files);
@@ -851,6 +856,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
             } else {
                 state.quick_open.visible = false;
+                state.theme_install.visible = false;
                 let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
                 let commands = command_list(state);
                 task = command_palette::open(&mut state.command_palette, commands).map(Message::CommandPalette);
@@ -869,8 +875,43 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
             } else if state.tabs.get(state.active_tab).is_some() {
                 state.quick_open.visible = false;
+                state.theme_install.visible = false;
                 let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
                 task = goto_line::open(&mut state.goto_line).map(Message::GotoLine);
+            }
+        }
+        Message::ThemeInstall(msg) => {
+            if matches!(msg, theme_install::Message::Open(_)) {
+                state.quick_open.visible = false;
+                let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
+                let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
+            }
+            let (t, event) = theme_install::update(&mut state.theme_install, msg);
+            task = t.map(Message::ThemeInstall);
+            let next_theme = match event {
+                Some(theme_install::Event::Installed(names)) => {
+                    state.themes = theme::ThemeRegistry::load();
+                    state.notify(format!("Installed {}", names.join(", ")));
+                    names.into_iter().next()
+                }
+                Some(theme_install::Event::Uninstalled(name)) => {
+                    state.themes = theme::ThemeRegistry::load();
+                    state.notify(format!("Uninstalled {name}"));
+                    // Reload the current theme (a bundled copy may remain) or fall back.
+                    let current = &state.app_theme.name;
+                    Some(if state.themes.names().any(|name| name == current) {
+                        current.clone()
+                    } else {
+                        match state.app_theme.kind {
+                            theme::Kind::Dark => theme::DEFAULT_DARK.to_string(),
+                            theme::Kind::Light => theme::DEFAULT_LIGHT.to_string(),
+                        }
+                    })
+                }
+                None => None,
+            };
+            if let Some(name) = next_theme {
+                task = Task::batch([task, update(state, Message::AppThemeSelected(name))]);
             }
         }
         Message::Git(git::Message::OpenDiff(path)) => {
@@ -1236,6 +1277,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             if state.terminal_visible && state.terminal.focused()
                 && !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible
+                && !state.theme_install.visible
                 && key == keyboard::Key::Named(keyboard::key::Named::Escape) {
                 return Task::none();
             }
@@ -1290,6 +1332,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
                         } else {
                             state.quick_open.visible = false;
+                            state.theme_install.visible = false;
                             let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
                             let commands = command_list(state);
                             task = command_palette::open(&mut state.command_palette, commands)
@@ -1301,6 +1344,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
                         } else if state.tabs.get(state.active_tab).is_some() {
                             state.quick_open.visible = false;
+                            state.theme_install.visible = false;
                             let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
                             task = goto_line::open(&mut state.goto_line).map(Message::GotoLine);
                         }
@@ -1312,6 +1356,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         } else {
                             let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
                             let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
+                            state.theme_install.visible = false;
                             quick_open::Message::Open
                         };
                         let (t, _) = quick_open::update(&mut state.quick_open, msg, root.as_deref(), &state.recent_files);
@@ -1341,6 +1386,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     _ => {
                         state.handle_editor_key(&key, modifiers);
                     }
+                }
+            } else if state.theme_install.visible {
+                // Same as quick open below: the text input handles Enter and typing.
+                let msg = match key.as_ref() {
+                    keyboard::Key::Named(keyboard::key::Named::Escape) => Some(theme_install::Message::Close),
+                    keyboard::Key::Named(keyboard::key::Named::ArrowDown) => Some(theme_install::Message::MoveDown),
+                    keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Some(theme_install::Message::MoveUp),
+                    _ => None,
+                };
+                if let Some(msg) = msg {
+                    task = update(state, Message::ThemeInstall(msg));
                 }
             } else if state.quick_open.visible {
                 // Single-line `text_input` captures Enter (via `on_submit`) and character keys
@@ -1550,7 +1606,8 @@ fn view(state: &State) -> Element<'_, Message> {
     let panes = PaneGrid::new(&state.panes, |_id, kind, _is_maximized| {
         let content: Element<'_, Message> = match kind {
             PaneKind::Terminal => state.terminal.view(
-                !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible).map(Message::Terminal),
+                !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible
+                    && !state.theme_install.visible).map(Message::Terminal),
             PaneKind::Sidebar => container(view_sidebar(state))
                 .padding(0)
                 .width(Length::Fill)
@@ -1597,7 +1654,9 @@ fn view(state: &State) -> Element<'_, Message> {
             .align_right(Length::Fill).align_bottom(Length::Fill)].into();
     }
 
-    if state.quick_open.visible {
+    if state.theme_install.visible {
+        iced::widget::stack![base, theme_install::view(&state.theme_install).map(Message::ThemeInstall)].into()
+    } else if state.quick_open.visible {
         iced::widget::stack![
             base,
             quick_open::view(&state.quick_open, state.root.as_deref()).map(Message::QuickOpen),
@@ -1820,6 +1879,9 @@ fn command_list(state: &State) -> Vec<command_palette::Command> {
         commands.push(Command { label: "Go to Line (Cmd+G)".to_string(), message: Message::ToggleGotoLine });
     }
 
+    for (label, mode) in [("Install Theme...", theme_install::Mode::Install), ("Uninstall Theme...", theme_install::Mode::Uninstall)] {
+        commands.push(Command { label: label.to_string(), message: Message::ThemeInstall(theme_install::Message::Open(mode)) });
+    }
     for name in state.themes.names() {
         commands.push(Command { label: format!("Theme: {name}"), message: Message::AppThemeSelected(name.to_string()) });
     }
@@ -1921,11 +1983,16 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
     );
 
     let theme_menu_button = menu_button("Theme".to_string(), Message::Noop).width(Length::Shrink);
-    let theme_items: Vec<_> = state
-        .themes
-        .names()
-        .map(|name| Item::new(menu_button(name.to_string(), Message::AppThemeSelected(name.to_string()))))
-        .collect();
+    let mut theme_items = vec![
+        Item::new(menu_button("Install Theme...".into(), Message::ThemeInstall(theme_install::Message::Open(theme_install::Mode::Install)))),
+        Item::new(menu_button("Uninstall Theme...".into(), Message::ThemeInstall(theme_install::Message::Open(theme_install::Mode::Uninstall)))),
+    ];
+    theme_items.extend(
+        state
+            .themes
+            .names()
+            .map(|name| Item::new(menu_button(name.to_string(), Message::AppThemeSelected(name.to_string())))),
+    );
 
     let mb = menu_bar!(
         (file_menu_button, menu_tpl(file_items)),

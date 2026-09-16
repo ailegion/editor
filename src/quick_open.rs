@@ -251,7 +251,7 @@ pub fn view<'a>(state: &'a QuickOpenState, root: Option<&Path>) -> Element<'a, M
     .into()
 }
 
-fn result_style(theme: &iced::Theme, status: button::Status, selected: bool) -> button::Style {
+pub(crate) fn result_style(theme: &iced::Theme, status: button::Status, selected: bool) -> button::Style {
     use button::{Status, Style};
 
     let palette = theme.extended_palette();
