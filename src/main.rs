@@ -169,6 +169,19 @@ enum PaneKind {
     Ai,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TabCloseScope { Others, Left, Right, All }
+
+fn tabs_to_close(count: usize, anchor: usize, scope: TabCloseScope) -> Vec<usize> {
+    if anchor >= count { return Vec::new(); }
+    (0..count).rev().filter(|&index| match scope {
+        TabCloseScope::Others => index != anchor,
+        TabCloseScope::Left => index < anchor,
+        TabCloseScope::Right => index > anchor,
+        TabCloseScope::All => true,
+    }).collect()
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     EditorAction(cosmic_text::Action),
@@ -189,6 +202,7 @@ enum Message {
     GitDiffLoaded(PathBuf, Vec<(usize, git_diff::LineStatus)>),
     TabSelected(usize),
     TabClosed(usize),
+    CloseTabs(usize, TabCloseScope),
     ReopenClosedTab,
     RevealPath(PathBuf),
     RevealStep(u64, DirectoryTreeEvent),
@@ -571,6 +585,20 @@ impl State {
         if self.tabs[index].dirty && !confirm("Unsaved changes", "Discard unsaved changes?") {
             return;
         }
+        self.remove_tab(index);
+    }
+
+    fn close_tabs(&mut self, anchor: usize, scope: TabCloseScope) {
+        let indices = tabs_to_close(self.tabs.len(), anchor, scope);
+        let unsaved = indices.iter().filter(|&&index| self.tabs[index].dirty).count();
+        if unsaved > 0 && !confirm("Unsaved changes", &format!("Discard unsaved changes in {unsaved} tab(s) and close the selected tabs?")) {
+            return;
+        }
+        // Descending indices keep the remaining targets and active tab stable.
+        for index in indices { self.remove_tab(index); }
+    }
+
+    fn remove_tab(&mut self, index: usize) {
         if let Some(path) = self.tabs[index].path.clone() { self.closed_tabs.push(path); }
         self.tabs.remove(index);
         if self.tabs.is_empty() {
@@ -666,7 +694,7 @@ impl State {
 }
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
-    if matches!(&message, Message::TabClosed(_) | Message::TabSelected(_) | Message::FileAction(_) | Message::ReopenClosedTab)
+    if matches!(&message, Message::TabClosed(_) | Message::CloseTabs(_, _) | Message::TabSelected(_) | Message::FileAction(_) | Message::ReopenClosedTab)
         || matches!(&message, Message::KeyPressed(_, modifiers) if modifiers.command()) {
         state.last_session_write = std::time::Instant::now() - Duration::from_secs(1);
     }
@@ -831,6 +859,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::TabSelected(i) => { state.git_preview = None; state.active_tab = i; },
         Message::TabClosed(i) => state.close_tab(i),
+        Message::CloseTabs(anchor, scope) => state.close_tabs(anchor, scope),
         Message::DismissNotice => state.notice = None,
         Message::Exit => {
             state.last_session_write = std::time::Instant::now() - Duration::from_secs(1);
@@ -1817,11 +1846,26 @@ fn view_editor(state: &State) -> Element<'_, Message> {
                 ..iced::widget::container::Style::default()
             });
 
-        tab_row = tab_row.push(container(column![tab_title, underline].spacing(2))
+        let tab_content = container(column![tab_title, underline].spacing(2))
             .style(move |theme: &iced::Theme| iced::widget::container::Style {
                 background: is_active.then(|| theme.extended_palette().background.weak.color.into()),
                 ..Default::default()
-            }));
+            });
+        let tab_content = iced::widget::mouse_area(tab_content)
+            .on_middle_press(Message::TabClosed(i));
+        tab_row = tab_row.push(ContextMenu::new(tab_content, move || {
+            let count = state.tabs.len();
+            container(column![
+                menu_button("Close Tab".into(), Message::TabClosed(i)),
+                menu_button_maybe("Close Other Tabs".into(), (count > 1).then_some(Message::CloseTabs(i, TabCloseScope::Others))),
+                menu_button_maybe("Close Tabs to the Left".into(), (i > 0).then_some(Message::CloseTabs(i, TabCloseScope::Left))),
+                menu_button_maybe("Close Tabs to the Right".into(), (i + 1 < count).then_some(Message::CloseTabs(i, TabCloseScope::Right))),
+                iced::widget::rule::horizontal(1),
+                menu_button("Close All Tabs".into(), Message::CloseTabs(i, TabCloseScope::All)),
+                menu_button_maybe("Reopen Closed Tab".into(), (!state.closed_tabs.is_empty()).then_some(Message::ReopenClosedTab)),
+            ].spacing(2).width(220))
+            .padding(6).style(iced::widget::container::rounded_box).into()
+        }));
     }
 
     if let Some(preview) = &state.git_preview {
@@ -2271,5 +2315,24 @@ mod tree_refresh_tests {
         apply(&mut tree, DirectoryTreeEvent::Refresh(root.clone())).await;
         assert!(!iced_swdir_tree::__testing::root(&tree).children.iter().any(|child| child.path == root.join("renamed.ts")));
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tab_close_tests {
+    use super::*;
+    #[test]
+    fn bulk_close_targets_the_clicked_tab_and_removes_in_reverse_order() {
+        assert_eq!(tabs_to_close(5, 2, TabCloseScope::Left), vec![1, 0]);
+        assert_eq!(tabs_to_close(5, 2, TabCloseScope::Right), vec![4, 3]);
+        assert_eq!(tabs_to_close(5, 2, TabCloseScope::Others), vec![4, 3, 1, 0]);
+        assert_eq!(tabs_to_close(5, 2, TabCloseScope::All), vec![4, 3, 2, 1, 0]);
+        assert!(tabs_to_close(1, 0, TabCloseScope::Others).is_empty());
+        assert!(tabs_to_close(3, 0, TabCloseScope::Left).is_empty());
+        assert!(tabs_to_close(3, 2, TabCloseScope::Right).is_empty());
+        assert!(tabs_to_close(0, 0, TabCloseScope::All).is_empty());
+        let mut tabs = vec!["a", "b", "c", "d", "e"];
+        for index in tabs_to_close(tabs.len(), 2, TabCloseScope::Others) { tabs.remove(index); }
+        assert_eq!(tabs, ["c"]);
     }
 }
