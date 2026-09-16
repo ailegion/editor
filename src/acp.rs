@@ -621,16 +621,10 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
 
 pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
     let top_bar = row![
-        text("Claude Code").size(16),
+        text("Conversation").size(12),
         Space::new().width(Length::Fill),
-        button(text("New chat"))
-            .padding([4, 8])
-            .style(crate::flat_button_style)
-            .on_press_maybe((!state.streaming).then_some(Message::NewThread)),
-        button(text("History"))
-            .padding([4, 8])
-            .style(crate::flat_button_style)
-            .on_press(Message::ThreadMenuToggle),
+        crate::icon_control(lucide_icons::Icon::Plus, "New conversation", (!state.streaming).then_some(Message::NewThread), false),
+        crate::icon_control(lucide_icons::Icon::History, "Conversation history", Some(Message::ThreadMenuToggle), state.thread_menu_open),
     ]
     .spacing(4)
     .width(Length::Fill);
@@ -668,16 +662,13 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
     let labeled_copyable = |label: &'static str, content: &str| -> Element<'_, Message> {
         column![
             row![
-                text(label),
+                text(label).size(12),
                 Space::new().width(Length::Fill),
-                button(text("Copy"))
-                    .padding([2, 6])
-                    .style(crate::flat_button_style)
-                    .on_press(Message::Copy(content.to_string())),
+                crate::icon_control(lucide_icons::Icon::Copy, "Copy message", Some(Message::Copy(content.to_string())), false),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center),
-            text(content.to_string()),
+            text(content.to_string()).size(13),
         ]
         .into()
     };
@@ -762,25 +753,19 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
     }
 
     let awaiting_permission = state.pending_permission.is_some();
-    let send_icon: char = lucide_icons::Icon::SendHorizonal.into();
     let send_button = if state.streaming {
-        let stop_icon: char = lucide_icons::Icon::CircleStop.into();
-        button(text(stop_icon).font(iced::Font::with_name("lucide")).size(14))
-            .padding([4, 8])
-            .on_press_maybe((!state.stopping).then_some(Message::Stop))
-    } else if awaiting_permission {
-        button(text(send_icon).font(iced::Font::with_name("lucide")).size(14)).padding([4, 8])
+        crate::icon_control(lucide_icons::Icon::CircleStop, "Stop response", (!state.stopping).then_some(Message::Stop), false)
     } else {
-        button(text(send_icon).font(iced::Font::with_name("lucide")).size(14))
-            .padding([4, 8])
-            .on_press_maybe((!state.input.text().trim().is_empty()).then_some(Message::Send))
+        crate::icon_control(lucide_icons::Icon::SendHorizonal, "Send message (Cmd/Ctrl+Enter)",
+            (!awaiting_permission && !state.input.text().trim().is_empty()).then_some(Message::Send), false)
     };
     bottom = bottom.push(
         column![
             text_editor(&state.input)
+                .size(13)
                 .placeholder("Ask Claude… (Cmd/Ctrl+Enter to send)")
                 .on_action(Message::InputChanged)
-                .height(Length::Fixed(72.0))
+                .height(Length::Fixed(60.0))
                 .key_binding(|key_press| {
                     let is_enter =
                         key_press.key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter);
@@ -795,7 +780,7 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
         .spacing(4),
     );
 
-    container(column![header, messages, bottom.spacing(8)].spacing(12)).padding(12).height(Length::Fill).into()
+    container(column![header, messages, bottom.spacing(6)].spacing(8)).padding(8).height(Length::Fill).into()
 }
 
 fn threads_path(cwd: &Path) -> Option<PathBuf> {

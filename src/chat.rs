@@ -390,17 +390,11 @@ pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Mes
 }
 
 pub fn view(state: &ChatState) -> Element<'_, Message> {
-    let gear_icon: char = lucide_icons::Icon::Settings.into();
     let mut header = column![row![
-        text("Assistant").size(16),
+        text("Conversation").size(12),
         Space::new().width(Length::Fill),
-        button("New chat")
-            .style(crate::flat_button_style)
-            .on_press_maybe((!state.streaming && !state.messages.is_empty()).then_some(Message::NewConversation)),
-        button(text(gear_icon).font(iced::Font::with_name("lucide")))
-            .padding([4, 8])
-            .style(crate::flat_button_style)
-            .on_press(Message::ToggleSettings),
+        crate::icon_control(lucide_icons::Icon::Plus, "New conversation", (!state.streaming && !state.messages.is_empty()).then_some(Message::NewConversation), false),
+        crate::icon_control(lucide_icons::Icon::Settings, "Model settings", Some(Message::ToggleSettings), state.settings_open),
     ]]
     .spacing(4);
 
@@ -524,7 +518,7 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
         if message.content.is_empty() {
             if i == last && state.streaming {
                 messages_col = messages_col.push(column![
-                    text(message.role.label()),
+                    text(message.role.label()).size(12),
                     text("Waiting for response...").style(|theme: &iced::Theme| {
                         let palette = theme.extended_palette();
                         iced::widget::text::Style { color: Some(palette.background.strong.color) }
@@ -535,16 +529,13 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
         }
         messages_col = messages_col.push(column![
             row![
-                text(message.role.label()),
+                text(message.role.label()).size(12),
                 Space::new().width(Length::Fill),
-                button(text("Copy"))
-                    .padding([2, 6])
-                    .style(crate::flat_button_style)
-                    .on_press(Message::Copy(message.content.clone())),
+                crate::icon_control(lucide_icons::Icon::Copy, "Copy message", Some(Message::Copy(message.content.clone())), false),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center),
-            text(message.content.clone()),
+            text(message.content.clone()).size(13),
         ]);
     }
     let messages = scrollable(messages_col.spacing(16)).anchor_bottom().height(Length::Fill);
@@ -578,9 +569,10 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
     bottom = bottom.push(
         column![
             text_editor(&state.input)
+                .size(13)
                 .placeholder("Ask about your project… (Cmd/Ctrl+Enter to send)")
                 .on_action(Message::InputChanged)
-                .height(Length::Fixed(72.0))
+                .height(Length::Fixed(60.0))
                 .key_binding(|key_press| {
                     let is_enter =
                         key_press.key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter);
@@ -599,15 +591,10 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
                 .size(12),
                 Space::new().width(Length::Fill),
                 if state.streaming {
-                    let stop_icon: char = lucide_icons::Icon::CircleStop.into();
-                    button(text(stop_icon).font(iced::Font::with_name("lucide")).size(14))
-                        .padding([4, 8])
-                        .on_press(Message::Stop)
+                    crate::icon_control(lucide_icons::Icon::CircleStop, "Stop response", Some(Message::Stop), false)
                 } else {
-                    let send_icon: char = lucide_icons::Icon::SendHorizonal.into();
-                    button(text(send_icon).font(iced::Font::with_name("lucide")).size(14))
-                        .padding([4, 8])
-                        .on_press_maybe((!state.model.trim().is_empty() && !state.base_url.trim().is_empty() && !state.input.text().trim().is_empty()).then_some(Message::Send))
+                    crate::icon_control(lucide_icons::Icon::SendHorizonal, "Send message (Cmd/Ctrl+Enter)",
+                        (!state.model.trim().is_empty() && !state.base_url.trim().is_empty() && !state.input.text().trim().is_empty()).then_some(Message::Send), false)
                 },
             ]
             .align_y(iced::Alignment::Center),
@@ -615,8 +602,8 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
         .spacing(4),
     );
 
-    container(column![header, messages, bottom].spacing(12))
-        .padding(12)
+    container(column![header, messages, bottom].spacing(8))
+        .padding(8)
         .height(Length::Fill)
         .into()
 }

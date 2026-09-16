@@ -89,14 +89,10 @@ pub fn update(state: &mut GitState, message: Message, cwd: PathBuf) -> Task<Mess
 }
 
 pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Message> {
-    let refresh_icon: char = lucide_icons::Icon::RefreshCw.into();
     let header = row![
         text("SOURCE CONTROL").size(12),
         Space::new().width(Length::Fill),
-        button(text(refresh_icon).font(iced::Font::with_name("lucide")).size(14))
-            .padding([4, 8])
-            .style(crate::flat_button_style)
-            .on_press(Message::Refresh),
+        crate::icon_control(lucide_icons::Icon::RefreshCw, "Refresh source control", Some(Message::Refresh), false),
     ]
     .spacing(6)
     .align_y(iced::Alignment::Center);
@@ -178,8 +174,8 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
         text(state.files.len().to_string()).size(12).style(iced::widget::text::secondary),
     ];
 
-    container(column![header, branch, bottom, iced::widget::rule::horizontal(1), changes, files_list].spacing(12))
-        .padding(12)
+    container(column![header, branch, bottom, iced::widget::rule::horizontal(1), changes, files_list].spacing(8))
+        .padding(8)
         .height(Length::Fill)
         .into()
 }

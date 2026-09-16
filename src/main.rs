@@ -1472,7 +1472,7 @@ fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
             },
         );
         column![
-            button(text(label).wrapping(iced::widget::text::Wrapping::None))
+            button(text(label).size(12).wrapping(iced::widget::text::Wrapping::None))
                 .padding([4, 4])
                 .width(Length::Shrink)
                 .style(move |theme, status| tab_button_style(theme, status, is_active))
@@ -1483,7 +1483,7 @@ fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
         .width(Length::Shrink)
     };
 
-    let mode_row = row![mode_tab("Custom model", AiMode::Http), mode_tab("Claude Code", AiMode::Acp), Space::new().width(Length::Fill), button("×").style(flat_button_style).on_press(Message::AiToggle)]
+    let mode_row = row![mode_tab("Custom model", AiMode::Http), mode_tab("Claude Code", AiMode::Acp), Space::new().width(Length::Fill), icon_control(lucide_icons::Icon::X, "Close AI panel", Some(Message::AiToggle), false)]
         .spacing(2)
         .padding([4, 4]);
 
@@ -1493,6 +1493,29 @@ fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
     };
 
     column![mode_row, panel].height(Length::Fill).into()
+}
+
+/// Shared 26px toolbar target with a 14px glyph and a discoverable label.
+pub(crate) fn icon_control<'a, M: Clone + 'a>(
+    icon: lucide_icons::Icon,
+    label: &'a str,
+    message: Option<M>,
+    selected: bool,
+) -> Element<'a, M> {
+    let glyph: char = icon.into();
+    let control = button(container(text(glyph).font(iced::Font::with_name("lucide")).size(14))
+        .center_x(Length::Fill).center_y(Length::Fill))
+        .width(26).height(26).padding(0)
+        .style(move |theme: &iced::Theme, status| {
+            let mut style = flat_button_style(theme, status);
+            if selected && status != iced::widget::button::Status::Disabled {
+                style.background = Some(theme.extended_palette().primary.weak.color.into());
+                style.text_color = theme.extended_palette().primary.weak.text;
+            }
+            style
+        }).on_press_maybe(message);
+    iced::widget::tooltip(control, container(text(label).size(12)).padding([4, 8]).style(iced::widget::container::rounded_box),
+        iced::widget::tooltip::Position::FollowCursor).into()
 }
 
 /// Transparent-background button style, so a title + close button pair placed inside a
@@ -1557,7 +1580,7 @@ fn menu_button<'a>(label: String, msg: Message) -> iced::widget::button::Button<
 /// as disabled (greyed out, non-interactive) -- used for Undo/Redo when there's nothing to
 /// undo/redo.
 fn menu_button_maybe<'a>(label: String, msg: Option<Message>) -> iced::widget::button::Button<'a, Message> {
-    button(text(label))
+    button(text(label).size(13))
         .width(Length::Fill)
         .padding([4, 8])
         .style(|theme: &iced::Theme, status| {
@@ -1736,34 +1759,19 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
         mb,
         Space::new().width(Length::Fill),
         text(project).size(12).style(iced::widget::text::secondary),
-        button(text("Search files…").size(12)).padding([6, 12])
-            .style(flat_button_style).on_press(Message::ToggleQuickOpen),
-        button(text("Commands").size(12)).padding([6, 12])
-            .style(flat_button_style).on_press(Message::ToggleCommandPalette),
-    ].spacing(12).align_y(iced::Alignment::Center))
-        .padding([6, 8]).style(chrome_style).into()
+        icon_control(lucide_icons::Icon::Search, "Find a file", Some(Message::ToggleQuickOpen), false),
+        icon_control(lucide_icons::Icon::Command, "Command palette", Some(Message::ToggleCommandPalette), false),
+    ].spacing(4).align_y(iced::Alignment::Center))
+        .padding([2, 6]).style(chrome_style).into()
 }
 
 fn view_status_bar(state: &State) -> Element<'_, Message> {
-    let folder_icon: char = lucide_icons::Icon::Folder.into();
-    let git_icon: char = lucide_icons::Icon::GitBranch.into();
-    let find_icon: char = lucide_icons::Icon::Search.into();
     let mut bar = row![
-        button(row![text(folder_icon).font(iced::Font::with_name("lucide")).size(12), text("Files").size(11)].spacing(5).align_y(iced::Alignment::Center))
-            .padding([4, 8])
-            .style(flat_button_style)
-            .on_press(Message::SidebarToggle),
-        button(row![text(git_icon).font(iced::Font::with_name("lucide")).size(12), text("Git").size(11)].spacing(5).align_y(iced::Alignment::Center))
-            .padding([4, 8])
-            .style(flat_button_style)
-            .on_press(Message::GitPanelToggle),
-        button(row![text(find_icon).font(iced::Font::with_name("lucide")).size(12), text("Search").size(11)].spacing(5).align_y(iced::Alignment::Center))
-            .padding([4, 8])
-            .style(flat_button_style)
-            .on_press(Message::ToggleProjectSearch),
+        icon_control(lucide_icons::Icon::Folder, "Toggle files", Some(Message::SidebarToggle), state.sidebar_visible && state.sidebar_mode == SidebarMode::Tree),
+        icon_control(lucide_icons::Icon::GitBranch, "Toggle source control", Some(Message::GitPanelToggle), state.sidebar_visible && state.sidebar_mode == SidebarMode::Git),
+        icon_control(lucide_icons::Icon::Search, "Search project", Some(Message::ToggleProjectSearch), state.sidebar_visible && state.sidebar_mode == SidebarMode::ProjectSearch),
         Space::new().width(Length::Fill),
-    ]
-    .spacing(8);
+    ].spacing(6);
 
     if let Some(tab) = state.tabs.get(state.active_tab) {
         let (line, col) = tab.content.cursor_line_col();
@@ -1773,15 +1781,8 @@ fn view_status_bar(state: &State) -> Element<'_, Message> {
         bar = bar.push(text(language.to_string()).size(12).style(iced::widget::text::secondary));
     }
 
-    let ai_icon: char = lucide_icons::Icon::Sparkles.into();
-    let bar = bar.push(
-        button(row![text(ai_icon).font(iced::Font::with_name("lucide")).size(12), text("AI").size(11)].spacing(5).align_y(iced::Alignment::Center))
-            .padding([4, 8])
-            .style(flat_button_style)
-            .on_press(Message::AiToggle),
-    )
-    .align_y(iced::Alignment::Center)
-        .padding([4, 8]);
+    let bar = bar.push(icon_control(lucide_icons::Icon::Sparkles, "Toggle AI panel", Some(Message::AiToggle), state.ai_visible))
+        .align_y(iced::Alignment::Center).padding([0, 6]);
     container(bar).width(Length::Fill).style(chrome_style).into()
 }
 
@@ -1808,25 +1809,19 @@ pub(crate) fn overlay_style(theme: &iced::Theme) -> iced::widget::container::Sty
 }
 
 fn view_sidebar(state: &State) -> Element<'_, Message> {
-    let nav = [("Files", SidebarMode::Tree), ("Search", SidebarMode::ProjectSearch), ("Git", SidebarMode::Git)]
-        .into_iter().fold(row![].spacing(4), |nav, (label, mode)| {
-            let active = state.sidebar_mode == mode;
-            nav.push(button(text(label).size(12)).width(Length::Fill).padding([8, 6])
-                .style(move |theme: &iced::Theme, status| {
-                    let mut style = flat_button_style(theme, status);
-                    if active {
-                        style.background = Some(theme.extended_palette().primary.weak.color.into());
-                        style.text_color = theme.extended_palette().primary.weak.text;
-                    }
-                    style
-                }).on_press(Message::SidebarSelected(mode)))
-        });
+    let nav = [
+        ("Files", lucide_icons::Icon::Folder, SidebarMode::Tree),
+        ("Search", lucide_icons::Icon::Search, SidebarMode::ProjectSearch),
+        ("Source control", lucide_icons::Icon::GitBranch, SidebarMode::Git),
+    ].into_iter().fold(row![].spacing(2), |nav, (label, icon, mode)| {
+        nav.push(icon_control(icon, label, Some(Message::SidebarSelected(mode)), state.sidebar_mode == mode))
+    });
     let content = match state.sidebar_mode {
         SidebarMode::Tree => view_tree(state),
         SidebarMode::ProjectSearch => project_search::view(&state.project_search, state.root.as_deref()).map(Message::ProjectSearch),
         SidebarMode::Git => git::view(&state.git, state.git_preview.as_ref().map(|preview| preview.path.as_str())).map(Message::Git),
     };
-    column![container(nav).padding(8), iced::widget::rule::horizontal(1), content]
+    column![container(nav).padding([3, 6]), iced::widget::rule::horizontal(1), content]
         .height(Length::Fill).into()
 }
 
@@ -1887,25 +1882,32 @@ fn view_tree(state: &State) -> Element<'_, Message> {
         .map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Files".into());
     column![
         row![text(project).size(12), Space::new().width(Length::Fill),
-            button(text("Refresh").size(11)).style(flat_button_style).on_press(Message::RefreshTree),
-        ].padding([8, 12]).align_y(iced::Alignment::Center),
+            icon_control(lucide_icons::Icon::RefreshCw, "Refresh files", Some(Message::RefreshTree), false),
+        ].padding([2, 8]).align_y(iced::Alignment::Center),
         container(content).padding([0, 6]).height(Length::Fill),
     ].height(Length::Fill).into()
 }
 
 fn view_editor(state: &State) -> Element<'_, Message> {
-    let mut tab_row = row![].spacing(2).padding([4, 4]);
+    use iced_swdir_tree::IconTheme;
+    let mut tab_row = row![].spacing(1).padding([2, 4]);
     for (i, tab) in state.tabs.iter().enumerate() {
         let is_active = state.git_preview.is_none() && i == state.active_tab;
+        let path = tab.path.as_deref().unwrap_or_else(|| Path::new("Untitled"));
+        let spec = file_icons::FileIcons.file_glyph(path);
+        let color = file_icons::FileIcons.file_color(path);
+        let icon = text(spec.glyph.into_owned())
+            .font(spec.font.unwrap_or_default())
+            .size(spec.size.unwrap_or(14.0))
+            .style(move |theme: &iced::Theme| iced::widget::text::Style {
+                color: Some(color.unwrap_or(theme.extended_palette().background.base.text)),
+            });
         let tab_title = row![
-            button(text(tab.title()).size(13))
-                .padding([8, 10])
+            button(row![icon, text(tab.title()).size(13)].spacing(6).align_y(iced::Alignment::Center))
+                .padding([4, 8])
                 .style(move |theme, status| tab_button_style(theme, status, is_active))
                 .on_press(Message::TabSelected(i)),
-            button(text("×").size(16))
-                .padding([6, 8])
-                .style(flat_button_style)
-                .on_press(Message::TabClosed(i)),
+            icon_control(lucide_icons::Icon::X, "Close tab", Some(Message::TabClosed(i)), false),
         ]
         .spacing(2)
         .align_y(iced::Alignment::Center);
@@ -1978,9 +1980,8 @@ fn view_editor(state: &State) -> Element<'_, Message> {
                 crumbs = crumbs.push(button(text(part.as_os_str().to_string_lossy().to_string()).size(12))
                     .style(flat_button_style).on_press(Message::RevealPath(current.clone())));
             }
-            crumbs = crumbs.push(Space::new().width(Length::Fill)).push(button(text("Reveal in Tree").size(12))
-                .style(flat_button_style).on_press(Message::RevealPath(path.clone())));
-            editor_column = editor_column.push(scrollable(crumbs.padding([6, 10]))
+            crumbs = crumbs.push(Space::new().width(Length::Fill)).push(icon_control(lucide_icons::Icon::Folder, "Reveal in files", Some(Message::RevealPath(path.clone())), false));
+            editor_column = editor_column.push(scrollable(crumbs.padding([0, 8]))
                 .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())));
         }
         if tab.search.visible {
@@ -2000,11 +2001,11 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             button(row![text(label).size(14), Space::new().width(Length::Fill),
                 text(keys).size(12).style(iced::widget::text::secondary)]
                 .align_y(iced::Alignment::Center))
-                .width(Length::Fill).padding([12, 14]).style(flat_button_style).on_press(message)
+                .width(Length::Fill).padding([6, 10]).style(flat_button_style).on_press(message)
         };
         let cmd = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
         let welcome = column![
-            text("A little space to build.").size(30),
+            text("A little space to build.").size(24),
             text("Open your project and make something useful.").size(14).style(iced::widget::text::secondary),
             Space::new().height(12),
             button(text("Open Folder").size(14)).padding([10, 18])

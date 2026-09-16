@@ -163,6 +163,7 @@ pub fn view<'a>(state: &'a SearchState, root: Option<&Path>) -> Element<'a, Mess
     }
 
     let input = text_input("Find in project", &state.query)
+        .size(13).padding([5, 8])
         .on_input(Message::QueryChanged)
         .on_submit(Message::Submit);
 
