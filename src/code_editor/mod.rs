@@ -21,6 +21,7 @@ pub use theme::{metrics_for_zoom, Style, ZOOM_DEFAULT, ZOOM_MAX, ZOOM_MIN, ZOOM_
 
 use std::collections::HashMap;
 
+use iced::advanced::mouse::click::{Click, Kind as ClickKind};
 use iced::mouse;
 use iced::widget::canvas::{self, Canvas};
 use iced::{Element, Event, Length, Rectangle, Renderer, Theme};
@@ -97,6 +98,8 @@ pub struct State {
     /// fires when the cursor itself moved -- not just because the user scrolled the
     /// viewport away from a stationary cursor to read elsewhere in the file.
     last_cursor: Option<(i32, i32)>,
+    /// Previous left-click, so the next press can be recognized as a double/triple click.
+    last_click: Option<Click>,
 }
 
 impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
@@ -142,6 +145,16 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
         // `cosmic_text`'s own coordinate space starts at (0, 0) -- so mouse positions need to
         // be un-offset here before becoming a `Click`/`Drag` action.
         let gutter_width = self.style.gutter_width(self.content.line_count());
+        let scroll = state.scroll;
+        let buffer_position = |position: iced::Point| {
+            let y = position.y + scroll;
+            let row = (y / self.style.line_height).max(0.0) as usize;
+            (
+                (position.x - gutter_width) as i32,
+                (self.content.source_line(row) as f32 * self.style.line_height
+                    + y.rem_euclid(self.style.line_height)) as i32,
+            )
+        };
 
         let Event::Mouse(mouse_event) = event else {
             return None;
@@ -158,27 +171,22 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
                         return self.on_fold.as_ref().map(|on_fold| canvas::Action::publish(on_fold(line)).and_capture());
                     }
                 }
+                let click = Click::new(position, mouse::Button::Left, state.last_click);
+                state.last_click = Some(click);
                 state.dragging = true;
-                Some(
-                    canvas::Action::publish(on_action(cosmic_text::Action::Click {
-                        x: (position.x - gutter_width) as i32,
-                        y: (self.content.source_line(((position.y + state.scroll) / self.style.line_height).max(0.0) as usize) as f32 * self.style.line_height
-                            + (position.y + state.scroll).rem_euclid(self.style.line_height)) as i32,
-                    }))
-                    .and_capture(),
-                )
+                let (x, y) = buffer_position(position);
+                let action = match click.kind() {
+                    ClickKind::Single => cosmic_text::Action::Click { x, y },
+                    ClickKind::Double => cosmic_text::Action::DoubleClick { x, y },
+                    ClickKind::Triple => cosmic_text::Action::TripleClick { x, y },
+                };
+                Some(canvas::Action::publish(on_action(action)).and_capture())
             }
             mouse::Event::CursorMoved { .. } if state.dragging => {
                 let on_action = self.on_action.as_ref()?;
                 let position = cursor.position_in(bounds)?;
-                Some(
-                    canvas::Action::publish(on_action(cosmic_text::Action::Drag {
-                        x: (position.x - gutter_width) as i32,
-                        y: (self.content.source_line(((position.y + state.scroll) / self.style.line_height).max(0.0) as usize) as f32 * self.style.line_height
-                            + (position.y + state.scroll).rem_euclid(self.style.line_height)) as i32,
-                    }))
-                    .and_capture(),
-                )
+                let (x, y) = buffer_position(position);
+                Some(canvas::Action::publish(on_action(cosmic_text::Action::Drag { x, y })).and_capture())
             }
             mouse::Event::ButtonReleased(mouse::Button::Left) => {
                 state.dragging = false;
