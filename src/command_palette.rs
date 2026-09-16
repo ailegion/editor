@@ -155,18 +155,12 @@ pub fn view(state: &PaletteState) -> Element<'_, Message> {
     }
 
     let panel = container(
-        column![input, scrollable(results_col).id(results_id()).height(Length::Fixed(320.0))].spacing(8),
+        column![text("Run a command").size(14), input, scrollable(results_col).id(results_id()).height(Length::Fixed(320.0)), text("↑ ↓ Navigate    Enter Run    Esc Close").size(11).style(iced::widget::text::secondary)].spacing(12),
     )
-    .padding(12)
-    .width(Length::Fixed(560.0))
-    .style(|theme: &iced::Theme| {
-        let palette = theme.extended_palette();
-        container::Style {
-            background: Some(palette.background.base.color.into()),
-            border: iced::Border::default().rounded(8.0).color(palette.background.strong.color).width(1.0),
-            ..container::Style::default()
-        }
-    });
+    .padding(16)
+    .width(Length::Fill)
+    .max_width(560)
+    .style(crate::overlay_style);
 
     let backdrop = container(Space::new().width(Length::Fill).height(Length::Fill)).style(
         |theme: &iced::Theme| container::Style {

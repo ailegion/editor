@@ -64,18 +64,11 @@ pub fn view(state: &GotoLineState, line_count: usize) -> Element<'_, Message> {
         .width(Length::Fill);
 
     let panel = container(
-        column![input, text(format!("Go to line (1-{line_count})")).size(12)].spacing(8),
+        column![text("Go to line").size(14), input, text(format!("Line 1–{line_count} · Enter to jump · Esc to close")).size(12).style(iced::widget::text::secondary)].spacing(12),
     )
     .padding(12)
     .width(Length::Fixed(320.0))
-    .style(|theme: &iced::Theme| {
-        let palette = theme.extended_palette();
-        iced::widget::container::Style {
-            background: Some(palette.background.base.color.into()),
-            border: iced::Border::default().rounded(8.0).color(palette.background.strong.color).width(1.0),
-            ..iced::widget::container::Style::default()
-        }
-    });
+    .style(crate::overlay_style);
 
     let backdrop = container(Space::new().width(Length::Fill).height(Length::Fill)).style(
         |theme: &iced::Theme| iced::widget::container::Style {

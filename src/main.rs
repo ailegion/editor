@@ -235,6 +235,7 @@ enum Message {
     Noop,
 
     SidebarToggle,
+    SidebarSelected(SidebarMode),
     AiToggle,
     AiModeSelected(AiMode),
     Chat(chat::Message),
@@ -1294,6 +1295,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Noop => {}
 
+        Message::SidebarSelected(mode) => {
+            if state.sidebar_mode != mode || !state.sidebar_visible {
+                return update(state, match mode {
+                    SidebarMode::Tree => Message::SidebarToggle,
+                    SidebarMode::ProjectSearch => Message::ToggleProjectSearch,
+                    SidebarMode::Git => Message::GitPanelToggle,
+                });
+            }
+        }
         Message::SidebarToggle => {
             state.toggle_sidebar_mode(SidebarMode::Tree);
         }
@@ -1376,7 +1386,7 @@ fn view(state: &State) -> Element<'_, Message> {
     let panes = PaneGrid::new(&state.panes, |_id, kind, _is_maximized| {
         let content: Element<'_, Message> = match kind {
             PaneKind::Sidebar => container(view_sidebar(state))
-                .padding(8)
+                .padding(0)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .style(|theme: &iced::Theme| iced::widget::container::Style {
@@ -1387,7 +1397,7 @@ fn view(state: &State) -> Element<'_, Message> {
             PaneKind::Main => view_editor(state),
             PaneKind::Ai => container(view_ai_sidebar(state))
                 .height(Length::Fill)
-                .padding(8)
+                .style(chrome_style)
                 .into(),
         };
         pane_grid::Content::new(content)
@@ -1498,7 +1508,9 @@ pub(crate) fn flat_button_style(theme: &iced::Theme, status: iced::widget::butto
         ..Style::default()
     };
     match status {
-        Status::Active | Status::Disabled => base.with_background(iced::Color::TRANSPARENT),
+        Status::Disabled => Style { text_color: iced::Color { a: 0.35, ..base.text_color }, ..base }
+            .with_background(iced::Color::TRANSPARENT),
+        Status::Active => base.with_background(iced::Color::TRANSPARENT),
         Status::Hovered => base.with_background(palette.background.strong.color),
         Status::Pressed => base.with_background(palette.primary.strong.color),
     }
@@ -1529,7 +1541,9 @@ fn tab_button_style(
         ..Style::default()
     };
     match status {
-        Status::Active | Status::Disabled => base.with_background(iced::Color::TRANSPARENT),
+        Status::Disabled => Style { text_color: iced::Color { a: 0.35, ..base.text_color }, ..base }
+            .with_background(iced::Color::TRANSPARENT),
+        Status::Active => base.with_background(iced::Color::TRANSPARENT),
         Status::Hovered => base.with_background(palette.background.weak.color),
         Status::Pressed => base.with_background(palette.background.strong.color),
     }
@@ -1556,7 +1570,9 @@ fn menu_button_maybe<'a>(label: String, msg: Option<Message>) -> iced::widget::b
                 ..Style::default()
             };
             match status {
-                Status::Active | Status::Disabled => base.with_background(iced::Color::TRANSPARENT),
+                Status::Disabled => Style { text_color: iced::Color { a: 0.35, ..base.text_color }, ..base }
+            .with_background(iced::Color::TRANSPARENT),
+        Status::Active => base.with_background(iced::Color::TRANSPARENT),
                 Status::Hovered => base.with_background(palette.primary.weak.color),
                 Status::Pressed => base.with_background(palette.primary.strong.color),
             }
@@ -1714,7 +1730,18 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
     .close_on_background_click(true)
     .close_on_background_click_global(true);
 
-    row![mb].padding(4).into()
+    let project = state.root.as_ref().and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Editor".into());
+    container(row![
+        mb,
+        Space::new().width(Length::Fill),
+        text(project).size(12).style(iced::widget::text::secondary),
+        button(text("Search files…").size(12)).padding([6, 12])
+            .style(flat_button_style).on_press(Message::ToggleQuickOpen),
+        button(text("Commands").size(12)).padding([6, 12])
+            .style(flat_button_style).on_press(Message::ToggleCommandPalette),
+    ].spacing(12).align_y(iced::Alignment::Center))
+        .padding([6, 8]).style(chrome_style).into()
 }
 
 fn view_status_bar(state: &State) -> Element<'_, Message> {
@@ -1722,51 +1749,96 @@ fn view_status_bar(state: &State) -> Element<'_, Message> {
     let git_icon: char = lucide_icons::Icon::GitBranch.into();
     let find_icon: char = lucide_icons::Icon::Search.into();
     let mut bar = row![
-        button(text(folder_icon).font(iced::Font::with_name("lucide")).size(12))
-            .padding([2, 6])
+        button(row![text(folder_icon).font(iced::Font::with_name("lucide")).size(12), text("Files").size(11)].spacing(5).align_y(iced::Alignment::Center))
+            .padding([4, 8])
+            .style(flat_button_style)
             .on_press(Message::SidebarToggle),
-        button(text(git_icon).font(iced::Font::with_name("lucide")).size(12))
-            .padding([2, 6])
+        button(row![text(git_icon).font(iced::Font::with_name("lucide")).size(12), text("Git").size(11)].spacing(5).align_y(iced::Alignment::Center))
+            .padding([4, 8])
+            .style(flat_button_style)
             .on_press(Message::GitPanelToggle),
-        button(text(find_icon).font(iced::Font::with_name("lucide")).size(12))
-            .padding([2, 6])
+        button(row![text(find_icon).font(iced::Font::with_name("lucide")).size(12), text("Search").size(11)].spacing(5).align_y(iced::Alignment::Center))
+            .padding([4, 8])
+            .style(flat_button_style)
             .on_press(Message::ToggleProjectSearch),
         Space::new().width(Length::Fill),
     ]
-    .spacing(12);
+    .spacing(8);
 
     if let Some(tab) = state.tabs.get(state.active_tab) {
         let (line, col) = tab.content.cursor_line_col();
         let language = state.highlighter.language_name(&tab.extension());
-        bar = bar.push(text(format!("Ln {line}, Col {col}")));
-        bar = bar.push(text(tab.line_ending.to_string()));
-        bar = bar.push(text(language.to_string()));
+        bar = bar.push(text(format!("Ln {line}, Col {col}")).size(12));
+        bar = bar.push(text(tab.line_ending.to_string()).size(12).style(iced::widget::text::secondary));
+        bar = bar.push(text(language.to_string()).size(12).style(iced::widget::text::secondary));
     }
 
     let ai_icon: char = lucide_icons::Icon::Sparkles.into();
-    bar.push(
-        button(text(ai_icon).font(iced::Font::with_name("lucide")).size(12))
-            .padding([2, 6])
+    let bar = bar.push(
+        button(row![text(ai_icon).font(iced::Font::with_name("lucide")).size(12), text("AI").size(11)].spacing(5).align_y(iced::Alignment::Center))
+            .padding([4, 8])
+            .style(flat_button_style)
             .on_press(Message::AiToggle),
     )
     .align_y(iced::Alignment::Center)
-        .padding(4)
-        .into()
+        .padding([4, 8]);
+    container(bar).width(Length::Fill).style(chrome_style).into()
+}
+
+/// A shared, theme-aware surface for application chrome.
+fn chrome_style(theme: &iced::Theme) -> iced::widget::container::Style {
+    let palette = theme.extended_palette();
+    iced::widget::container::Style {
+        background: Some(palette.background.weak.color.into()),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn overlay_style(theme: &iced::Theme) -> iced::widget::container::Style {
+    let palette = theme.extended_palette();
+    iced::widget::container::Style {
+        background: Some(palette.background.base.color.into()),
+        border: iced::Border::default().rounded(12.0).color(palette.background.strong.color).width(1.0),
+        shadow: iced::Shadow {
+            color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.25),
+            offset: iced::Vector::new(0.0, 8.0), blur_radius: 24.0,
+        },
+        ..Default::default()
+    }
 }
 
 fn view_sidebar(state: &State) -> Element<'_, Message> {
-    match state.sidebar_mode {
+    let nav = [("Files", SidebarMode::Tree), ("Search", SidebarMode::ProjectSearch), ("Git", SidebarMode::Git)]
+        .into_iter().fold(row![].spacing(4), |nav, (label, mode)| {
+            let active = state.sidebar_mode == mode;
+            nav.push(button(text(label).size(12)).width(Length::Fill).padding([8, 6])
+                .style(move |theme: &iced::Theme, status| {
+                    let mut style = flat_button_style(theme, status);
+                    if active {
+                        style.background = Some(theme.extended_palette().primary.weak.color.into());
+                        style.text_color = theme.extended_palette().primary.weak.text;
+                    }
+                    style
+                }).on_press(Message::SidebarSelected(mode)))
+        });
+    let content = match state.sidebar_mode {
         SidebarMode::Tree => view_tree(state),
-        SidebarMode::ProjectSearch => {
-            project_search::view(&state.project_search, state.root.as_deref()).map(Message::ProjectSearch)
-        }
+        SidebarMode::ProjectSearch => project_search::view(&state.project_search, state.root.as_deref()).map(Message::ProjectSearch),
         SidebarMode::Git => git::view(&state.git, state.git_preview.as_ref().map(|preview| preview.path.as_str())).map(Message::Git),
-    }
+    };
+    column![container(nav).padding(8), iced::widget::rule::horizontal(1), content]
+        .height(Length::Fill).into()
 }
 
 fn view_tree(state: &State) -> Element<'_, Message> {
     let Some(tree) = &state.tree else {
-        return text("No folder open (File > Open Folder)").into();
+        return container(column![
+            text("Your workspace").size(16),
+            text("Open a folder to browse files, search your project, and review changes.")
+                .size(13).style(iced::widget::text::secondary),
+            button(text("Open Folder").size(13)).padding([8, 12])
+                .on_press(Message::FileAction(FileAction::OpenFolder)),
+        ].spacing(12)).padding(16).into();
     };
 
     let entry = if let Some((dir, is_dir, buf)) = &state.creating {
@@ -1811,7 +1883,14 @@ fn view_tree(state: &State) -> Element<'_, Message> {
         .into()
     });
 
-    content.into()
+    let project = state.root.as_ref().and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Files".into());
+    column![
+        row![text(project).size(12), Space::new().width(Length::Fill),
+            button(text("Refresh").size(11)).style(flat_button_style).on_press(Message::RefreshTree),
+        ].padding([8, 12]).align_y(iced::Alignment::Center),
+        container(content).padding([0, 6]).height(Length::Fill),
+    ].height(Length::Fill).into()
 }
 
 fn view_editor(state: &State) -> Element<'_, Message> {
@@ -1891,14 +1970,18 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             let base = state.root.as_deref().filter(|root| path.starts_with(root));
             let relative = base.and_then(|root| path.strip_prefix(root).ok()).unwrap_or(path);
             let mut current = base.map(Path::to_path_buf).unwrap_or_default();
-            for part in relative.components() {
+            for (index, part) in relative.components().enumerate() {
+                if index > 0 {
+                    crumbs = crumbs.push(text("›").size(12).style(iced::widget::text::secondary));
+                }
                 current.push(part);
                 crumbs = crumbs.push(button(text(part.as_os_str().to_string_lossy().to_string()).size(12))
-                    .style(flat_button_style).on_press(Message::RevealPath(current.clone()))).push(text("›").size(12));
+                    .style(flat_button_style).on_press(Message::RevealPath(current.clone())));
             }
             crumbs = crumbs.push(Space::new().width(Length::Fill)).push(button(text("Reveal in Tree").size(12))
                 .style(flat_button_style).on_press(Message::RevealPath(path.clone())));
-            editor_column = editor_column.push(crumbs.padding([4, 8]));
+            editor_column = editor_column.push(scrollable(crumbs.padding([6, 10]))
+                .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())));
         }
         if tab.search.visible {
             editor_column = editor_column.push(code_editor::search::view(&tab.search).map(Message::Search));
@@ -1913,15 +1996,27 @@ fn view_editor(state: &State) -> Element<'_, Message> {
                 Message::ToggleFold,
             ));
     } else {
-        editor_column = editor_column.push(container(column![
-            text("Ready when you are").size(24),
-            text("Open a file or use a shortcut to get started.").size(14).style(iced::widget::text::secondary),
-            button("Open File     Cmd+O").style(flat_button_style).on_press(Message::FileAction(FileAction::OpenFile)),
-            button("Quick Open     Cmd+P").style(flat_button_style).on_press(Message::ToggleQuickOpen),
-            button("Command Palette     Cmd+Shift+P").style(flat_button_style).on_press(Message::ToggleCommandPalette),
-            button("Reopen Closed Tab     Cmd+Shift+T").style(flat_button_style).on_press(Message::ReopenClosedTab),
-            button("Open AI Assistant").style(flat_button_style).on_press(Message::AiToggle),
-        ].spacing(16)).padding(32));
+        let shortcut = |label: &'static str, keys: &'static str, message: Message| {
+            button(row![text(label).size(14), Space::new().width(Length::Fill),
+                text(keys).size(12).style(iced::widget::text::secondary)]
+                .align_y(iced::Alignment::Center))
+                .width(Length::Fill).padding([12, 14]).style(flat_button_style).on_press(message)
+        };
+        let cmd = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
+        let welcome = column![
+            text("A little space to build.").size(30),
+            text("Open your project and make something useful.").size(14).style(iced::widget::text::secondary),
+            Space::new().height(12),
+            button(text("Open Folder").size(14)).padding([10, 18])
+                .on_press(Message::FileAction(FileAction::OpenFolder)),
+            Space::new().height(12),
+            shortcut("Open a file", if cmd == "⌘" { "⌘ O" } else { "Ctrl O" }, Message::FileAction(FileAction::OpenFile)),
+            shortcut("Find a file", if cmd == "⌘" { "⌘ P" } else { "Ctrl P" }, Message::ToggleQuickOpen),
+            shortcut("Run a command", if cmd == "⌘" { "⌘ Shift P" } else { "Ctrl Shift P" }, Message::ToggleCommandPalette),
+            shortcut("Ask your AI assistant", "", Message::AiToggle),
+        ].spacing(8).max_width(420);
+        editor_column = editor_column.push(container(scrollable(container(welcome).padding(32)))
+            .center_x(Length::Fill).center_y(Length::Fill));
     }
 
     let tab_strip = scrollable(tab_row)
@@ -1930,7 +2025,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         ))
         .width(Length::Fill);
 
-    column![tab_strip, editor_column.height(Length::Fill)]
+    column![container(tab_strip).style(chrome_style), iced::widget::rule::horizontal(1), editor_column.height(Length::Fill)]
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
