@@ -1,4 +1,5 @@
 //! A persistent PTY shell with a bounded VT screen and scrollback.
+pub mod panel;
 use iced::widget::{Space, canvas, column, container, row, text};
 use iced::{Color, Element, Event, Length, Point, Rectangle, Size, Task, keyboard, mouse};
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
@@ -10,8 +11,40 @@ const CELL_W: f32 = 8.0;
 const CELL_H: f32 = 18.0;
 const PAD: f32 = 6.0;
 
+#[derive(Default)]
+struct TerminalReplies(Vec<u8>);
+
+impl vt100::Callbacks for TerminalReplies {
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        i2: Option<u8>,
+        params: &[&[u16]],
+        command: char,
+    ) {
+        if i1.is_none() && i2.is_none() && command == 'n' {
+            match params {
+                [p] if *p == [6] => {
+                    // ConPTY waits for this reply before starting the Windows shell.
+                    let (row, col) = screen.cursor_position();
+                    self.0
+                        .extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
+                }
+                [p] if *p == [5] => self.0.extend_from_slice(b"\x1b[0n"),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn new_parser() -> vt100::Parser<TerminalReplies> {
+    vt100::Parser::new_with_callbacks(24, 80, 5000, TerminalReplies::default())
+}
+
 pub struct Terminal {
-    parser: vt100::Parser,
+    shell: Option<std::path::PathBuf>,
+    parser: vt100::Parser<TerminalReplies>,
     master: Option<Box<dyn MasterPty + Send>>,
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     input: Option<SyncSender<Vec<u8>>>,
@@ -23,7 +56,8 @@ pub struct Terminal {
 impl Default for Terminal {
     fn default() -> Self {
         Self {
-            parser: vt100::Parser::new(24, 80, 5000),
+            shell: None,
+            parser: new_parser(),
             master: None,
             child: None,
             input: None,
@@ -44,13 +78,12 @@ pub enum Message {
     Pasted(Option<String>),
     Copy,
     Restart,
-    Hide,
 }
 
 impl Terminal {
     pub fn start(&mut self, cwd: &Path) {
         self.shutdown();
-        self.parser = vt100::Parser::new(24, 80, 5000);
+        self.parser = new_parser();
         match self.spawn(cwd) {
             Ok(()) => self.focused = true,
             Err(error) => self.status = format!("Could not start shell: {error}"),
@@ -59,7 +92,10 @@ impl Terminal {
 
     fn spawn(&mut self, cwd: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let pair = portable_pty::native_pty_system().openpty(pty_size(24, 80))?;
-        let mut command = CommandBuilder::new_default_prog();
+        let mut command = match &self.shell {
+            Some(shell) => CommandBuilder::new(shell),
+            None => CommandBuilder::new_default_prog(),
+        };
         command.cwd(cwd);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
@@ -121,6 +157,14 @@ impl Terminal {
                     break;
                 };
                 self.parser.process(&bytes);
+                let replies = std::mem::take(&mut self.parser.callbacks_mut().0);
+                if !replies.is_empty() {
+                    if let Some(tx) = &self.input {
+                        if let Err(error) = tx.try_send(replies) {
+                            self.status = format!("Could not send terminal reply: {error}");
+                        }
+                    }
+                }
             }
         }
         if let Some(child) = &mut self.child {
@@ -234,12 +278,6 @@ pub fn view(terminal: &Terminal, enabled: bool) -> Element<'_, Message> {
             Icon::RefreshCw,
             "Restart shell (ends current session)",
             Some(Message::Restart),
-            false
-        ),
-        crate::icon_control(
-            Icon::X,
-            "Hide terminal (Ctrl+`)",
-            Some(Message::Hide),
             false
         ),
     ]
@@ -496,6 +534,55 @@ fn color(value: vt100::Color, default: Color) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_replies_to_fragmented_cursor_queries() {
+        let mut parser = new_parser();
+        parser.process(b"\x1b[4;9H\x1b[");
+        parser.process(b"6n\x1b[5n");
+        assert_eq!(parser.callbacks().0, b"\x1b[4;9R\x1b[0n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_starts_accepts_input_and_exits() {
+        let mut terminal = Terminal::default();
+        let cwd = std::env::current_dir().unwrap();
+        terminal.start(&cwd);
+        assert!(terminal.child.is_some(), "{}", terminal.status);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        // Wait for the initial prompt before sending input to the shell.
+        while !terminal.parser.screen().contents().contains('>') {
+            terminal.poll();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "No shell prompt: {}",
+                terminal.parser.screen().contents()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = terminal.update(Message::Resize(20, 100));
+        // Expansion ensures echoed input cannot satisfy the output assertion.
+        terminal.write(b"set EDITOR_PTY_TEST=ready\recho pty-%EDITOR_PTY_TEST%\rcd\r".to_vec());
+        loop {
+            terminal.poll();
+            let output = terminal.parser.screen().contents();
+            if output.contains("pty-ready") && output.contains(&cwd.display().to_string()) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Shell output: {output}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        terminal.write(b"exit\r".to_vec());
+        while terminal.child.is_some() {
+            terminal.poll();
+            assert!(std::time::Instant::now() < deadline, "Shell did not exit");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 
     #[test]
     fn terminal_keys_preserve_control_and_application_modes() {

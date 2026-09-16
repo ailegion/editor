@@ -187,7 +187,7 @@ fn tabs_to_close(count: usize, anchor: usize, scope: TabCloseScope) -> Vec<usize
 #[derive(Debug, Clone)]
 enum Message {
     TerminalToggle,
-    Terminal(terminal::Message),
+    Terminal(terminal::panel::Message),
     EditorAction(cosmic_text::Action),
     ToggleFold(usize),
     Search(code_editor::search::Message),
@@ -309,9 +309,8 @@ struct State {
     ai_mode: AiMode,
     chat: chat::ChatState,
     acp: acp::AcpState,
-    terminal: terminal::Terminal,
+    terminal: terminal::panel::Panel,
     terminal_visible: bool,
-    terminal_started: bool,
 }
 
 impl State {
@@ -390,9 +389,8 @@ impl State {
             ai_mode: AiMode::default(),
             chat: chat::ChatState::default(),
             acp: acp::AcpState::default(),
-            terminal: terminal::Terminal::default(),
+            terminal: terminal::panel::Panel::default(),
             terminal_visible: false,
-            terminal_started: false,
         }
     }
 
@@ -719,11 +717,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::TerminalToggle => {
             state.terminal_visible = !state.terminal_visible;
             if state.terminal_visible {
-                if !state.terminal_started {
-                    state.terminal.start(&state.root_or_cwd());
-                    state.terminal_started = true;
-                }
-                state.terminal.focused = true;
+                state.terminal.ensure_started(&state.root_or_cwd());
+                state.terminal.set_focused(true);
                 task = iced::widget::operation::focus("terminal-canvas");
                 let main = state.panes.iter().find(|(_, kind)| **kind == PaneKind::Main).map(|(pane, _)| *pane);
                 if let Some(main) = main {
@@ -733,16 +728,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
 
             } else {
-                state.terminal.focused = false;
+                state.terminal.set_focused(false);
                 let pane = state.panes.iter().find(|(_, kind)| **kind == PaneKind::Terminal).map(|(pane, _)| *pane);
                 if let Some(pane) = pane { state.panes.close(pane); }
             }
         }
-        Message::Terminal(terminal::Message::Hide) => return update(state, Message::TerminalToggle),
-        Message::Terminal(terminal::Message::Restart) => {
-            state.terminal.start(&state.root_or_cwd());
-        }
-        Message::Terminal(message) => task = state.terminal.update(message).map(Message::Terminal),
+        Message::Terminal(terminal::panel::Message::Hide) => return update(state, Message::TerminalToggle),
+        Message::Terminal(message) => task = state.terminal.update(message, &state.root_or_cwd()).map(Message::Terminal),
         Message::ToggleFold(line) => {
             if let Some(tab) = state.tabs.get_mut(state.active_tab) { tab.content.toggle_fold(line); }
         }
@@ -1169,7 +1161,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if modifiers.control() && key.as_ref() == keyboard::Key::Character("`") {
                 return update(state, Message::TerminalToggle);
             }
-            if state.terminal_visible && state.terminal.focused
+            if state.terminal_visible && state.terminal.focused()
                 && !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible
                 && key == keyboard::Key::Named(keyboard::key::Named::Escape) {
                 return Task::none();
@@ -1432,7 +1424,7 @@ fn view(state: &State) -> Element<'_, Message> {
 
     let panes = PaneGrid::new(&state.panes, |_id, kind, _is_maximized| {
         let content: Element<'_, Message> = match kind {
-            PaneKind::Terminal => terminal::view(&state.terminal,
+            PaneKind::Terminal => state.terminal.view(
                 !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible).map(Message::Terminal),
             PaneKind::Sidebar => container(view_sidebar(state))
                 .padding(0)
@@ -2239,7 +2231,16 @@ fn load_ai_ratio() -> f32 {
         .unwrap_or(0.65)
 }
 
+const MIN_WINDOW_SIZE: iced::Size = iced::Size::new(800.0, 600.0);
+
+fn valid_window_size(size: iced::Size) -> bool {
+    size.width.is_finite() && size.height.is_finite()
+        && size.width >= MIN_WINDOW_SIZE.width && size.height >= MIN_WINDOW_SIZE.height
+}
+
 fn save_window_size(size: iced::Size) {
+    // Minimized windows can report zero dimensions; preserve the last usable size.
+    if !valid_window_size(size) { return; }
     let Some(path) = config_path("window_size") else { return };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -2254,6 +2255,7 @@ fn load_window_size() -> iced::Size {
             let (w, h) = text.trim().split_once(',')?;
             Some(iced::Size::new(w.parse().ok()?, h.parse().ok()?))
         })
+        .filter(|size| valid_window_size(*size))
         .unwrap_or(iced::Size::new(1280.0, 800.0))
 }
 
@@ -2394,6 +2396,7 @@ pub fn main() -> iced::Result {
         .window(iced::window::Settings {
             icon,
             size: load_window_size(),
+            min_size: Some(MIN_WINDOW_SIZE),
             position: load_window_position(),
             maximized: load_window_maximized(),
             exit_on_close_request: false,
@@ -2405,6 +2408,21 @@ pub fn main() -> iced::Result {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+    #[test]
+    fn window_size_rejects_minimized_and_invalid_dimensions() {
+        assert!(valid_window_size(MIN_WINDOW_SIZE));
+        assert!(valid_window_size(iced::Size::new(1280.0, 800.0)));
+        for size in [
+            iced::Size::ZERO,
+            iced::Size::new(100.0, 800.0),
+            iced::Size::new(1280.0, 100.0),
+            iced::Size::new(f32::NAN, 800.0),
+            iced::Size::new(1280.0, f32::INFINITY),
+        ] {
+            assert!(!valid_window_size(size));
+        }
+    }
+
     #[test]
     fn recovery_roundtrips_and_accepts_old_sessions() {
         let legacy: EditorSession = serde_json::from_str(r#"{"root":null,"tabs":[],"active":null}"#).unwrap();
