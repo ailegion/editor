@@ -274,6 +274,40 @@ impl Buffer {
         self.sync();
     }
 
+    /// Text of the current selection, or `None` if nothing (or an empty range) is selected.
+    pub fn copy_selection(&mut self) -> Option<String> {
+        let mut editor = Editor::new(&mut self.inner);
+        editor.set_cursor(self.cursor);
+        editor.set_selection(self.selection);
+        editor.copy_selection().filter(|text| !text.is_empty())
+    }
+
+    /// Copies the selection and deletes it as a single undo step.
+    pub fn cut_selection(&mut self) -> Option<String> {
+        let text = self.copy_selection()?;
+        self.replace_selection("");
+        Some(text)
+    }
+
+    /// Replaces the selection (or inserts at the cursor if there is none) with `text` as a
+    /// single undo step -- used for paste and cut.
+    pub fn replace_selection(&mut self, text: &str) {
+        let mut editor = Editor::new(&mut self.inner);
+        editor.set_cursor(self.cursor);
+        editor.set_selection(self.selection);
+        editor.start_change();
+        if text.is_empty() {
+            editor.delete_selection();
+        } else {
+            editor.insert_string(text, None);
+        }
+        let change = editor.finish_change();
+        self.cursor = editor.cursor();
+        self.selection = editor.selection();
+        self.push_undo(change);
+        self.sync();
+    }
+
     fn sync(&mut self) {
         let text = self.text();
         if text != self.folding_text {
@@ -356,5 +390,26 @@ mod folding_tests {
         buffer.perform(cosmic_text::Action::Insert('x'));
         assert!(buffer.collapsed.is_empty());
         assert!(buffer.can_undo());
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+    #[test]
+    fn cut_and_paste_are_single_undo_steps() {
+        let mut buffer = Buffer::new("hello world", Metrics::new(14.0, 20.0));
+        assert_eq!(buffer.copy_selection(), None);
+        buffer.select_range(Cursor::new(0, 0), Cursor::new(0, 5));
+        assert_eq!(buffer.copy_selection().as_deref(), Some("hello"));
+        assert_eq!(buffer.cut_selection().as_deref(), Some("hello"));
+        assert_eq!(buffer.text(), " world");
+        buffer.replace_selection("hi\nthere");
+        assert_eq!(buffer.text(), "hi\nthere world");
+        assert_eq!(buffer.undo_count(), 2);
+        buffer.undo();
+        assert_eq!(buffer.text(), " world");
+        buffer.undo();
+        assert_eq!(buffer.text(), "hello world");
     }
 }

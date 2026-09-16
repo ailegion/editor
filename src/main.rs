@@ -124,6 +124,9 @@ impl std::fmt::Display for FileAction {
 enum EditAction {
     Undo,
     Redo,
+    Cut,
+    Copy,
+    Paste,
     SelectAll,
 }
 
@@ -132,6 +135,9 @@ impl std::fmt::Display for EditAction {
         let label = match self {
             EditAction::Undo => "Undo (Cmd+Z)",
             EditAction::Redo => "Redo (Cmd+Shift+Z)",
+            EditAction::Cut => "Cut (Cmd+X)",
+            EditAction::Copy => "Copy (Cmd+C)",
+            EditAction::Paste => "Paste (Cmd+V)",
             EditAction::SelectAll => "Select All (Cmd+A)",
         };
         write!(f, "{label}")
@@ -231,6 +237,8 @@ enum Message {
 
     FileAction(FileAction),
     EditAction(EditAction),
+    /// Clipboard contents read for `EditAction::Paste`.
+    EditorPasted(Option<String>),
     ViewAction(ViewAction),
     AppThemeSelected(iced::Theme),
     PaneResized(pane_grid::ResizeEvent),
@@ -992,10 +1000,36 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 match action {
                     EditAction::Undo => tab.content.undo(),
                     EditAction::Redo => tab.content.redo(),
+                    EditAction::Cut => {
+                        if let Some(text) = tab.content.cut_selection() {
+                            task = iced::clipboard::write(text);
+                        }
+                    }
+                    EditAction::Copy => {
+                        if let Some(text) = tab.content.copy_selection() {
+                            task = iced::clipboard::write(text);
+                        }
+                    }
+                    EditAction::Paste => task = iced::clipboard::read().map(Message::EditorPasted),
                     EditAction::SelectAll => tab.content.select_all(),
                 }
             }
             state.mark_edited_if_changed(before);
+        }
+
+        Message::EditorPasted(text) => {
+            if let (Some(text), None) = (text, &state.git_preview) {
+                let before = state
+                    .tabs
+                    .get(state.active_tab)
+                    .map(|t| t.content.undo_count())
+                    .unwrap_or(0);
+                if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+                    // Clipboard text from other Windows apps uses CRLF; the buffer uses LF.
+                    tab.content.replace_selection(&text.replace("\r\n", "\n"));
+                }
+                state.mark_edited_if_changed(before);
+            }
         }
 
         Message::ViewAction(action) => state.apply_zoom(action),
@@ -1262,6 +1296,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     }
                     keyboard::Key::Character("0") => {
                         state.apply_zoom(ViewAction::ZoomReset);
+                    }
+                    // Clipboard access is a `Task`, which `input::handle_key` can't return.
+                    keyboard::Key::Character("x") if state.git_preview.is_none() => {
+                        task = update(state, Message::EditAction(EditAction::Cut));
+                    }
+                    keyboard::Key::Character("c") if state.git_preview.is_none() => {
+                        task = update(state, Message::EditAction(EditAction::Copy));
+                    }
+                    keyboard::Key::Character("v") if state.git_preview.is_none() => {
+                        task = update(state, Message::EditAction(EditAction::Paste));
                     }
                     // Other command combos (undo/redo, ...) are the active editor's to handle.
                     _ => {
@@ -1717,6 +1761,9 @@ fn command_list(state: &State) -> Vec<command_palette::Command> {
         commands.push(Command { label: EditAction::Redo.to_string(), message: Message::EditAction(EditAction::Redo) });
     }
     if has_active_tab {
+        for action in [EditAction::Cut, EditAction::Copy, EditAction::Paste] {
+            commands.push(Command { label: action.to_string(), message: Message::EditAction(action) });
+        }
         commands.push(Command {
             label: EditAction::SelectAll.to_string(),
             message: Message::EditAction(EditAction::SelectAll),
@@ -1772,6 +1819,18 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
         (menu_button_maybe(
             EditAction::Redo.to_string(),
             can_redo.then_some(Message::EditAction(EditAction::Redo)),
+        )),
+        (menu_button_maybe(
+            EditAction::Cut.to_string(),
+            has_active_tab.then_some(Message::EditAction(EditAction::Cut)),
+        )),
+        (menu_button_maybe(
+            EditAction::Copy.to_string(),
+            has_active_tab.then_some(Message::EditAction(EditAction::Copy)),
+        )),
+        (menu_button_maybe(
+            EditAction::Paste.to_string(),
+            has_active_tab.then_some(Message::EditAction(EditAction::Paste)),
         )),
         (menu_button_maybe(
             EditAction::SelectAll.to_string(),
