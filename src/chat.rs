@@ -171,6 +171,8 @@ pub enum Message {
     DeleteConnection(usize),
     InputChanged(text_editor::Action),
     ToggleSettings,
+    NewConversation,
+    UsePrompt(String),
     Send,
     Stop,
     Copy(String),
@@ -243,7 +245,7 @@ impl ChatState {
 
     fn send(&mut self, cwd: PathBuf) {
         let text = self.input.text();
-        if text.trim().is_empty() || self.streaming {
+        if text.trim().is_empty() || self.streaming || self.model.trim().is_empty() || self.base_url.trim().is_empty() {
             return;
         }
         let text = text.trim_end().to_string();
@@ -351,11 +353,13 @@ pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Mes
         Message::ConnectionNameChanged(text) => state.connection_name = text,
         Message::BaseUrlChanged(text) => {
             state.base_url = text;
+            state.test_rx = None;
             state.connection_status = ConnectionStatus::Idle;
             state.models.clear();
         }
         Message::ApiKeyChanged(text) => {
             state.api_key = text;
+            state.test_rx = None;
             state.connection_status = ConnectionStatus::Idle;
             state.models.clear();
         }
@@ -366,6 +370,12 @@ pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Mes
         Message::LoadConnection(index) => state.load_connection(index),
         Message::DeleteConnection(index) => state.delete_connection(index),
         Message::InputChanged(action) => state.input.perform(action),
+        Message::NewConversation => {
+            if !state.streaming {
+                state.messages.clear();
+            }
+        }
+        Message::UsePrompt(prompt) => state.input = text_editor::Content::with_text(&prompt),
         Message::ToggleSettings => state.settings_open = !state.settings_open,
         Message::Send => state.send(cwd),
         Message::Stop => state.stop(),
@@ -382,7 +392,11 @@ pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Mes
 pub fn view(state: &ChatState) -> Element<'_, Message> {
     let gear_icon: char = lucide_icons::Icon::Settings.into();
     let mut header = column![row![
+        text("Assistant").size(16),
         Space::new().width(Length::Fill),
+        button("New chat")
+            .style(crate::flat_button_style)
+            .on_press_maybe((!state.streaming && !state.messages.is_empty()).then_some(Message::NewConversation)),
         button(text(gear_icon).font(iced::Font::with_name("lucide")))
             .padding([4, 8])
             .style(crate::flat_button_style)
@@ -495,6 +509,12 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
                 "Connect a provider and choose a model to chat about your project."
             } else { "Ask about your code, plan a change, or describe a problem." })
                 .size(13).style(iced::widget::text::secondary),
+            button("Explain this project")
+                .style(crate::flat_button_style)
+                .on_press(Message::UsePrompt("Explore this project and explain its structure and main entry points.".into())),
+            button("Review for bugs")
+                .style(crate::flat_button_style)
+                .on_press(Message::UsePrompt("Review this project for likely bugs. Explain your findings before making changes.".into())),
             button(if state.model.is_empty() { "Choose a model" } else { "Model settings" })
                 .on_press(Message::ToggleSettings),
         ].spacing(12)).padding([24, 12]));
@@ -527,7 +547,7 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
             text(message.content.clone()),
         ]);
     }
-    let messages = scrollable(messages_col).height(Length::Fill);
+    let messages = scrollable(messages_col.spacing(16)).anchor_bottom().height(Length::Fill);
 
     let mut bottom = column![].spacing(4);
     if let Some(pending) = &state.pending_permission {
@@ -558,7 +578,7 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
     bottom = bottom.push(
         column![
             text_editor(&state.input)
-                .placeholder("Message... (Cmd+Enter to send)")
+                .placeholder("Ask about your project… (Cmd/Ctrl+Enter to send)")
                 .on_action(Message::InputChanged)
                 .height(Length::Fixed(72.0))
                 .key_binding(|key_press| {
@@ -587,7 +607,7 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
                     let send_icon: char = lucide_icons::Icon::SendHorizonal.into();
                     button(text(send_icon).font(iced::Font::with_name("lucide")).size(14))
                         .padding([4, 8])
-                        .on_press_maybe((!state.model.is_empty()).then_some(Message::Send))
+                        .on_press_maybe((!state.model.trim().is_empty() && !state.base_url.trim().is_empty() && !state.input.text().trim().is_empty()).then_some(Message::Send))
                 },
             ]
             .align_y(iced::Alignment::Center),
@@ -595,7 +615,8 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
         .spacing(4),
     );
 
-    container(column![header, messages, bottom].spacing(8))
+    container(column![header, messages, bottom].spacing(12))
+        .padding(12)
         .height(Length::Fill)
         .into()
 }
@@ -1010,4 +1031,32 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
     let truncated: String = s.chars().take(max_chars).collect();
     format!("{truncated}\n... [truncated]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_without_model_preserves_draft() {
+        let mut state = ChatState::default();
+        state.input = text_editor::Content::with_text("Explain this project");
+        state.send(PathBuf::from("."));
+        assert_eq!(state.input.text(), "Explain this project");
+        assert!(state.messages.is_empty());
+        assert!(!state.streaming);
+    }
+
+    #[test]
+    fn changing_provider_discards_in_flight_model_discovery() {
+        let mut state = ChatState::default();
+        let (tx, rx) = mpsc::channel();
+        state.test_rx = Some(rx);
+        state.connection_status = ConnectionStatus::Testing;
+        let _ = update(&mut state, Message::BaseUrlChanged("http://localhost:1234/v1".into()), PathBuf::from("."));
+        assert!(tx.send(TestEvent::Success(vec!["stale-model".into()])).is_err());
+        state.poll();
+        assert!(state.models.is_empty());
+        assert!(matches!(state.connection_status, ConnectionStatus::Idle));
+    }
 }

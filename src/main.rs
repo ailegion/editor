@@ -1473,7 +1473,7 @@ fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
         .width(Length::Shrink)
     };
 
-    let mode_row = row![mode_tab("HTTP", AiMode::Http), mode_tab("Claude Code", AiMode::Acp), Space::new().width(Length::Fill), button("×").style(flat_button_style).on_press(Message::AiToggle)]
+    let mode_row = row![mode_tab("Custom model", AiMode::Http), mode_tab("Claude Code", AiMode::Acp), Space::new().width(Length::Fill), button("×").style(flat_button_style).on_press(Message::AiToggle)]
         .spacing(2)
         .padding([4, 4]);
 

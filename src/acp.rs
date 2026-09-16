@@ -26,10 +26,10 @@ enum ToolStatus {
 impl ToolStatus {
     fn icon(self) -> &'static str {
         match self {
-            ToolStatus::Pending => "...",
-            ToolStatus::InProgress => "*",
-            ToolStatus::Completed => "v",
-            ToolStatus::Failed => "x",
+            ToolStatus::Pending => "Queued",
+            ToolStatus::InProgress => "Running",
+            ToolStatus::Completed => "Done",
+            ToolStatus::Failed => "Failed",
         }
     }
 }
@@ -119,6 +119,8 @@ pub struct AcpState {
     pending_permission: Option<PendingPermission>,
     just_finished: bool,
     thread_menu_open: bool,
+    stopping: bool,
+    expanded_thinking: Vec<usize>,
 }
 
 impl Default for AcpState {
@@ -141,6 +143,8 @@ impl Default for AcpState {
             pending_permission: None,
             just_finished: false,
             thread_menu_open: false,
+            stopping: false,
+            expanded_thinking: Vec::new(),
         }
     }
 }
@@ -150,6 +154,8 @@ pub enum Message {
     NewThread,
     SwitchThread(usize),
     ThreadMenuToggle,
+    ToggleThinking(usize),
+    UsePrompt(String),
     InputChanged(text_editor::Action),
     Send,
     Stop,
@@ -208,13 +214,23 @@ impl AcpState {
                 }
             }
         }
+        let disconnected = self.prompt_tx.as_ref().is_some_and(|tx| tx.is_closed());
+        if disconnected {
+            self.started = false;
+            self.prompt_tx = None;
+            self.cancel_tx = None;
+            finished = true;
+        }
         if let Some(id) = new_session_id {
             if let Some(thread) = self.threads.get_mut(self.active_thread) {
                 thread.session_id = Some(id);
             }
         }
+        if disconnected { self.rx = None; }
         if finished {
             self.streaming = false;
+            self.stopping = false;
+            self.pending_permission = None;
             self.just_finished = true;
             self.save_current_thread();
             if let Some(cwd) = self.cwd.clone() {
@@ -306,6 +322,8 @@ impl AcpState {
     }
 
     fn reset_connection(&mut self) {
+        self.stopping = false;
+        self.expanded_thinking.clear();
         self.started = false;
         self.rx = None;
         self.prompt_tx = None;
@@ -536,10 +554,12 @@ impl AcpState {
         if let Some(tx) = &self.cancel_tx {
             let _ = tx.send(());
         }
-        self.streaming = false;
+        self.stopping = true;
+        self.pending_permission = None;
     }
 
     fn new_thread(&mut self, cwd: &Path) {
+        if self.streaming { return; }
         self.save_current_thread();
         self.persist(cwd);
         self.threads.push(Thread::default());
@@ -549,10 +569,11 @@ impl AcpState {
         self.assistant_index = None;
         self.usage = None;
         self.reset_connection();
+        self.persist(cwd);
     }
 
     fn switch_thread(&mut self, index: usize, cwd: &Path) {
-        if index == self.active_thread {
+        if self.streaming || index >= self.threads.len() || index == self.active_thread {
             return;
         }
         self.save_current_thread();
@@ -563,6 +584,7 @@ impl AcpState {
         self.assistant_index = None;
         self.usage = None;
         self.reset_connection();
+        self.persist(cwd);
     }
 }
 
@@ -574,6 +596,14 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
         Message::SwitchThread(i) => {
             state.switch_thread(i, &cwd);
             state.thread_menu_open = false;
+        }
+        Message::UsePrompt(prompt) => state.input = text_editor::Content::with_text(&prompt),
+        Message::ToggleThinking(index) => {
+            if state.expanded_thinking.contains(&index) {
+                state.expanded_thinking.retain(|i| *i != index);
+            } else {
+                state.expanded_thinking.push(index);
+            }
         }
         Message::ThreadMenuToggle => state.thread_menu_open = !state.thread_menu_open,
         Message::InputChanged(action) => state.input.perform(action),
@@ -591,12 +621,13 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
 
 pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
     let top_bar = row![
+        text("Claude Code").size(16),
         Space::new().width(Length::Fill),
-        button(text("+"))
+        button(text("New chat"))
             .padding([4, 8])
             .style(crate::flat_button_style)
-            .on_press(Message::NewThread),
-        button(text("..."))
+            .on_press_maybe((!state.streaming).then_some(Message::NewThread)),
+        button(text("History"))
             .padding([4, 8])
             .style(crate::flat_button_style)
             .on_press(Message::ThreadMenuToggle),
@@ -617,7 +648,7 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
                     .width(Length::Fill)
                     .padding([4, 8])
                     .style(crate::flat_button_style)
-                    .on_press(Message::SwitchThread(i)),
+                    .on_press_maybe((!state.streaming).then_some(Message::SwitchThread(i))),
             );
         }
         header = header.push(
@@ -631,7 +662,8 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
             }),
         );
     }
-    let _ = cwd;
+    let project = cwd.file_name().unwrap_or(cwd.as_os_str()).to_string_lossy().into_owned();
+    header = header.push(text(format!("Project · {project}")).size(12).style(iced::widget::text::secondary));
 
     let labeled_copyable = |label: &'static str, content: &str| -> Element<'_, Message> {
         column![
@@ -650,7 +682,20 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
         .into()
     };
 
-    let mut messages = column![].spacing(6);
+    let mut messages = column![].spacing(12);
+    if state.entries.is_empty() {
+        messages = messages.push(container(column![
+            text("What would you like to work on?").size(20),
+            text("Claude can explore your project, edit files, and help you work through a change.")
+                .size(13).style(iced::widget::text::secondary),
+            button("Explain this project").style(crate::flat_button_style)
+                .on_press(Message::UsePrompt("Explore this project and explain its structure and main entry points.".into())),
+            button("Find and fix a bug").style(crate::flat_button_style)
+                .on_press(Message::UsePrompt("Help me investigate a bug in this project: ".into())),
+            button("Review my changes").style(crate::flat_button_style)
+                .on_press(Message::UsePrompt("Review my current changes for bugs and regressions. Explain your findings before editing.".into())),
+        ].spacing(12)).padding([24, 8]));
+    }
     let last = state.entries.len().saturating_sub(1);
     for (i, entry) in state.entries.iter().enumerate() {
         if let Entry::Thinking { content } = entry {
@@ -663,7 +708,13 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
                 row![text(status.icon()), text(title.clone())].spacing(6).into()
             }
             Entry::User { content } => labeled_copyable("You", content),
-            Entry::Thinking { content } => labeled_copyable("Thinking", content),
+            Entry::Thinking { content } => {
+                let expanded = state.expanded_thinking.contains(&i);
+                let mut section = column![button(if expanded { "Hide thinking" } else { "Show thinking" })
+                    .style(crate::flat_button_style).on_press(Message::ToggleThinking(i))];
+                if expanded { section = section.push(text(content.clone()).size(13).style(iced::widget::text::secondary)); }
+                section.into()
+            },
             Entry::Assistant { content } => {
                 if content.is_empty() && i == last && state.streaming {
                     column![
@@ -681,12 +732,13 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
         };
         messages = messages.push(container(card).padding(6));
     }
-    let messages = scrollable(messages).height(Length::Fill);
+    let messages = scrollable(messages).anchor_bottom().height(Length::Fill);
 
     let mut bottom = column![];
     if let Some(pending) = &state.pending_permission {
-        bottom = bottom.push(text(pending.title.clone()));
-        let mut options = row![].spacing(4);
+        bottom = bottom.push(text("Approval needed").size(14));
+        bottom = bottom.push(text(pending.title.clone()).size(13));
+        let mut options = column![].spacing(4);
         for (option_id, name) in &pending.options {
             options = options
                 .push(button(text(name.clone())).on_press(Message::PermissionChosen(option_id.clone())));
@@ -715,18 +767,18 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
         let stop_icon: char = lucide_icons::Icon::CircleStop.into();
         button(text(stop_icon).font(iced::Font::with_name("lucide")).size(14))
             .padding([4, 8])
-            .on_press(Message::Stop)
+            .on_press_maybe((!state.stopping).then_some(Message::Stop))
     } else if awaiting_permission {
         button(text(send_icon).font(iced::Font::with_name("lucide")).size(14)).padding([4, 8])
     } else {
         button(text(send_icon).font(iced::Font::with_name("lucide")).size(14))
             .padding([4, 8])
-            .on_press(Message::Send)
+            .on_press_maybe((!state.input.text().trim().is_empty()).then_some(Message::Send))
     };
     bottom = bottom.push(
         column![
             text_editor(&state.input)
-                .placeholder("Message... (Cmd+Enter to send)")
+                .placeholder("Ask Claude… (Cmd/Ctrl+Enter to send)")
                 .on_action(Message::InputChanged)
                 .height(Length::Fixed(72.0))
                 .key_binding(|key_press| {
@@ -738,12 +790,12 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
                         text_editor::Binding::from_key_press(key_press)
                     }
                 }),
-            row![Space::new().width(Length::Fill), send_button],
+            row![text(if state.stopping { "Stopping…" } else if awaiting_permission { "Waiting for approval" } else if state.streaming { "Working…" } else { "Ready" }).size(12).style(iced::widget::text::secondary), Space::new().width(Length::Fill), send_button],
         ]
         .spacing(4),
     );
 
-    column![header, messages, bottom].height(Length::Fill).into()
+    container(column![header, messages, bottom.spacing(8)].spacing(12)).padding(12).height(Length::Fill).into()
 }
 
 fn threads_path(cwd: &Path) -> Option<PathBuf> {
@@ -767,5 +819,46 @@ fn format_tokens(n: u64) -> String {
         format!("{}k", n / 1_000)
     } else {
         n.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_waits_for_completion_and_dismisses_permission() {
+        let mut state = AcpState::default();
+        let (tx, rx) = mpsc::channel();
+        let (respond, _) = tokio::sync::oneshot::channel();
+        state.rx = Some(rx);
+        state.streaming = true;
+        state.pending_permission = Some(PendingPermission {
+            title: "Run command".into(), options: vec![], respond,
+        });
+        state.stop();
+        assert!(state.streaming);
+        assert!(state.stopping);
+        assert!(state.pending_permission.is_none());
+        tx.send(Event::Done).unwrap();
+        state.poll();
+        assert!(!state.streaming);
+        assert!(!state.stopping);
+    }
+
+    #[test]
+    fn closed_agent_connection_can_restart() {
+        let mut state = AcpState::default();
+        let (_tx, rx) = mpsc::channel();
+        let (prompt_tx, prompt_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(prompt_rx);
+        state.rx = Some(rx);
+        state.prompt_tx = Some(prompt_tx);
+        state.started = true;
+        state.streaming = true;
+        state.poll();
+        assert!(!state.started);
+        assert!(!state.streaming);
+        assert!(state.rx.is_none());
     }
 }
