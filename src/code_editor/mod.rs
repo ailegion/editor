@@ -209,14 +209,23 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
 
     fn mouse_interaction(
         &self,
-        _state: &Self::State,
+        state: &Self::State,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
-        if cursor.is_over(bounds) {
-            mouse::Interaction::Text
+        let Some(position) = cursor.position_in(bounds) else {
+            return mouse::Interaction::default();
+        };
+        // Same hit area as the fold toggle in `update`.
+        let gutter_width = self.style.gutter_width(self.content.line_count());
+        let row = ((position.y + state.scroll) / self.style.line_height).max(0.0) as usize;
+        if position.x >= gutter_width - 18.0
+            && position.x < gutter_width
+            && self.content.folds.contains_key(&self.content.source_line(row))
+        {
+            mouse::Interaction::Pointer
         } else {
-            mouse::Interaction::default()
+            mouse::Interaction::Text
         }
     }
 }
