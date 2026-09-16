@@ -213,6 +213,10 @@ enum Message {
     TabSelected(usize),
     TabClosed(usize),
     CloseTabs(usize, TabCloseScope),
+    /// "Yes" answers from `ask` dialogs.
+    CloseTabConfirmed(usize),
+    CloseTabsConfirmed(usize, TabCloseScope),
+    DeleteConfirmed(PathBuf),
     ReopenClosedTab,
     RevealPath(PathBuf),
     RevealStep(u64, DirectoryTreeEvent),
@@ -318,6 +322,10 @@ struct State {
     window_revealed: bool,
     startup_maximized: bool,
     startup_window: Option<u64>,
+    /// The main window's native handle (HWND on Windows), used to parent native dialogs so
+    /// they open in front of the app.
+    window_handle: Option<u64>,
+    started_at: std::time::Instant,
 
     ai_visible: bool,
     ai_mode: AiMode,
@@ -402,6 +410,8 @@ impl State {
             window_revealed: !cfg!(windows),
             startup_maximized: load_window_maximized(),
             startup_window: None,
+            window_handle: None,
+            started_at: std::time::Instant::now(),
             ai_visible,
             ai_mode: AiMode::default(),
             chat: chat::ChatState::default(),
@@ -604,24 +614,30 @@ impl State {
         task
     }
 
-    fn close_tab(&mut self, index: usize) {
+    fn close_tab(&mut self, index: usize) -> Task<Message> {
         if index >= self.tabs.len() {
-            return;
+            return Task::none();
         }
-        if self.tabs[index].dirty && !confirm("Unsaved changes", "Discard unsaved changes?") {
-            return;
+        if self.tabs[index].dirty {
+            return ask(self.window_handle, "Unsaved changes", "Discard unsaved changes?".into(), Message::CloseTabConfirmed(index));
         }
         self.remove_tab(index);
+        Task::none()
     }
 
-    fn close_tabs(&mut self, anchor: usize, scope: TabCloseScope) {
+    fn close_tabs(&mut self, anchor: usize, scope: TabCloseScope) -> Task<Message> {
         let indices = tabs_to_close(self.tabs.len(), anchor, scope);
         let unsaved = indices.iter().filter(|&&index| self.tabs[index].dirty).count();
-        if unsaved > 0 && !confirm("Unsaved changes", &format!("Discard unsaved changes in {unsaved} tab(s) and close the selected tabs?")) {
-            return;
+        if unsaved > 0 {
+            return ask(self.window_handle, "Unsaved changes", format!("Discard unsaved changes in {unsaved} tab(s) and close the selected tabs?"), Message::CloseTabsConfirmed(anchor, scope));
         }
+        self.remove_tabs(anchor, scope);
+        Task::none()
+    }
+
+    fn remove_tabs(&mut self, anchor: usize, scope: TabCloseScope) {
         // Descending indices keep the remaining targets and active tab stable.
-        for index in indices { self.remove_tab(index); }
+        for index in tabs_to_close(self.tabs.len(), anchor, scope) { self.remove_tab(index); }
     }
 
     fn remove_tab(&mut self, index: usize) {
@@ -698,13 +714,13 @@ impl State {
         save_zoom(self.zoom);
     }
 
-    fn delete_path(&mut self, path: &Path) {
-        if !confirm(
-            "Delete",
-            &format!("Delete \"{}\"? This cannot be undone.", path.display()),
-        ) {
-            return;
-        }
+    fn delete_path(&self, path: PathBuf) -> Task<Message> {
+        let description = format!("Delete \"{}\"? This cannot be undone.", path.display());
+        ask(self.window_handle, "Delete", description, Message::DeleteConfirmed(path))
+    }
+
+    fn delete_confirmed(&mut self, path: &Path) -> Task<Message> {
+        let mut task = Task::none();
         let result = if path.is_dir() {
             std::fs::remove_dir_all(path)
         } else {
@@ -713,14 +729,18 @@ impl State {
         if result.is_ok() {
             self.notify("Deleted successfully");
             if let Some(index) = self.tabs.iter().position(|t| t.path.as_deref() == Some(path)) {
-                self.close_tab(index);
+                task = self.close_tab(index);
             }
         } else if let Err(err) = result { self.notify(format!("Delete failed: {err}")); }
+        if let Some(parent) = path.parent() {
+            task = Task::batch([task, refresh_dir_task(parent.to_path_buf())]);
+        }
+        task
     }
 }
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
-    if matches!(&message, Message::TabClosed(_) | Message::CloseTabs(_, _) | Message::TabSelected(_) | Message::FileAction(_) | Message::ReopenClosedTab)
+    if matches!(&message, Message::TabClosed(_) | Message::CloseTabs(_, _) | Message::CloseTabConfirmed(_) | Message::CloseTabsConfirmed(_, _) | Message::TabSelected(_) | Message::FileAction(_) | Message::ReopenClosedTab)
         || matches!(&message, Message::KeyPressed(_, modifiers) if modifiers.command()) {
         state.last_session_write = std::time::Instant::now() - Duration::from_secs(1);
     }
@@ -905,8 +925,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::TabSelected(i) => { state.git_preview = None; state.active_tab = i; },
-        Message::TabClosed(i) => state.close_tab(i),
-        Message::CloseTabs(anchor, scope) => state.close_tabs(anchor, scope),
+        Message::TabClosed(i) => task = state.close_tab(i),
+        Message::CloseTabs(anchor, scope) => task = state.close_tabs(anchor, scope),
+        Message::CloseTabConfirmed(i) => {
+            if i < state.tabs.len() { state.remove_tab(i); }
+        }
+        Message::CloseTabsConfirmed(anchor, scope) => state.remove_tabs(anchor, scope),
+        Message::DeleteConfirmed(path) => task = state.delete_confirmed(&path),
         Message::DismissNotice => state.notice = None,
         Message::Exit => {
             state.last_session_write = std::time::Instant::now() - Duration::from_secs(1);
@@ -1088,10 +1113,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::ContextDelete => {
             if let Some(path) = state.context_target_path() {
-                state.delete_path(&path);
-                if let Some(parent) = path.parent() {
-                    task = refresh_dir_task(parent.to_path_buf());
-                }
+                task = state.delete_path(path);
             }
         }
         Message::ContextCopyPath => {
@@ -1222,7 +1244,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     keyboard::Key::Character("q") => return update(state, Message::Exit),
                     keyboard::Key::Character("w") => {
                         if state.git_preview.is_some() { state.git_preview = None; }
-                        else { state.close_tab(state.active_tab); }
+                        else { task = state.close_tab(state.active_tab); }
                     }
                     keyboard::Key::Character(c) if c.len() == 1 && matches!(c.as_bytes()[0], b'1'..=b'9') => {
                         let index = (c.as_bytes()[0] - b'1') as usize;
@@ -1453,6 +1475,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     task = reload_task;
                 }
             }
+            if !state.window_revealed && state.started_at.elapsed() > Duration::from_secs(2) {
+                // Safety net in case the frame after `PaintInitialWindow` never arrives: a
+                // brief flicker beats an invisible app.
+                state.window_revealed = true;
+                if let Some(raw) = state.startup_window.take() {
+                    cloak_startup_window(raw, false);
+                }
+                let reveal = iced::window::latest()
+                    .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Windowed));
+                task = Task::batch([task, reveal]);
+            }
         }
 
         Message::WindowOpened(id) => {
@@ -1462,6 +1495,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::PaintInitialWindow(id, raw) => {
             state.startup_window = Some(raw);
+            state.window_handle = Some(raw);
             if !paint_hidden_window(raw, state.startup_maximized) {
                 // Do not leave the app invisible if the native paint request fails.
                 cloak_startup_window(raw, false);
@@ -1470,14 +1504,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::WindowFrameDrawn(id) => {
+            // A frame drawn before `PaintInitialWindow` ran predates the cloak/maximize (slow
+            // first launches can deliver it that early), so ignore it -- the WM_PAINT that
+            // `PaintInitialWindow` posts produces another frame to reveal on.
             if !state.window_revealed {
-                state.window_revealed = true;
-                // Redraw subscriptions are delivered after the renderer submits
-                // the frame, so Windows never shows an unpainted client area.
                 if let Some(raw) = state.startup_window.take() {
+                    state.window_revealed = true;
+                    // Redraw subscriptions are delivered after the renderer submits
+                    // the frame, so Windows never shows an unpainted client area.
                     cloak_startup_window(raw, false);
+                    task = iced::window::set_mode(id, iced::window::Mode::Windowed);
                 }
-                task = iced::window::set_mode(id, iced::window::Mode::Windowed);
             }
         }
         Message::WindowResized(id, size) => {
@@ -2126,15 +2163,33 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         if tab.search.visible {
             editor_column = editor_column.push(code_editor::search::view(&tab.search).map(Message::Search));
         }
-        editor_column = editor_column
-            .push(code_editor::code_editor(
-                &tab.content,
-                &tab.diff,
-                &state.app_theme,
-                state.zoom,
-                Message::EditorAction,
-                Message::ToggleFold,
-            ));
+        let editor = code_editor::code_editor(
+            &tab.content,
+            &tab.diff,
+            &state.app_theme,
+            state.zoom,
+            Message::EditorAction,
+            Message::ToggleFold,
+        );
+        let can_undo = tab.content.can_undo();
+        let can_redo = tab.content.can_redo();
+        let has_selection = tab.content.has_selection();
+        editor_column = editor_column.push(ContextMenu::new(editor, move || {
+            let item = |action: EditAction, enabled: bool| {
+                menu_button_maybe(action.to_string(), enabled.then_some(Message::EditAction(action)))
+            };
+            container(column![
+                item(EditAction::Undo, can_undo),
+                item(EditAction::Redo, can_redo),
+                iced::widget::rule::horizontal(1),
+                item(EditAction::Cut, has_selection),
+                item(EditAction::Copy, has_selection),
+                item(EditAction::Paste, true),
+                iced::widget::rule::horizontal(1),
+                item(EditAction::SelectAll, true),
+            ].spacing(2).width(220))
+            .padding(6).style(iced::widget::container::rounded_box).into()
+        }));
     } else {
         let shortcut = |label: &'static str, keys: &'static str, message: Message| {
             button(row![text(label).size(14), Space::new().width(Length::Fill),
@@ -2450,7 +2505,50 @@ fn load_diff_task(root: Option<PathBuf>, path: PathBuf) -> Task<Message> {
     })
 }
 
-fn confirm(title: &str, description: &str) -> bool {
+/// Asks a Yes/No question and produces `on_yes` if confirmed. On Windows the dialog runs on
+/// a background thread: shown from inside `update` it blocked the event loop and stayed
+/// unpainted (invisible until Alt was pressed).
+fn ask(parent: Option<u64>, title: &str, description: String, on_yes: Message) -> Task<Message> {
+    #[cfg(windows)]
+    {
+        let title = title.to_string();
+        // `spawn_blocking` inside the future so it runs on Iced's tokio runtime.
+        Task::perform(
+            async move { tokio::task::spawn_blocking(move || confirm(parent, &title, &description)).await },
+            move |answer| if matches!(answer, Ok(true)) { on_yes } else { Message::Noop },
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        if confirm(parent, title, &description) { Task::done(on_yes) } else { Task::none() }
+    }
+}
+
+/// Same call rfd makes on Windows, plus MB_SETFOREGROUND (which rfd can't pass), since
+/// `ask` shows it from a background thread.
+#[cfg(windows)]
+fn confirm(parent: Option<u64>, title: &str, description: &str) -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MessageBoxW(window: *mut std::ffi::c_void, text: *const u16, caption: *const u16, flags: u32) -> i32;
+    }
+    const MB_YESNO: u32 = 0x4;
+    const MB_ICONWARNING: u32 = 0x30;
+    const MB_SETFOREGROUND: u32 = 0x1_0000;
+    const IDYES: i32 = 6;
+    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (text, caption) = (wide(description), wide(title));
+    let owner = parent.map_or(std::ptr::null_mut(), |raw| raw as usize as *mut std::ffi::c_void);
+    // SAFETY: `owner` is Iced's live main window or null; both strings are
+    // NUL-terminated UTF-16 buffers that outlive the call.
+    unsafe {
+        MessageBoxW(owner, text.as_ptr(), caption.as_ptr(), MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND) == IDYES
+    }
+}
+
+#[cfg(not(windows))]
+fn confirm(parent: Option<u64>, title: &str, description: &str) -> bool {
+    let _ = parent; // Only set on Windows (see `State::window_handle`).
     rfd::MessageDialog::new()
         .set_title(title)
         .set_description(description)

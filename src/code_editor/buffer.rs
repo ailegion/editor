@@ -274,6 +274,12 @@ impl Buffer {
         self.sync();
     }
 
+    /// Whether a non-empty range is selected (based on the last `sync`).
+    pub fn has_selection(&self) -> bool {
+        self.selection_pixels.len() > 1
+            || self.selection_pixels.first().is_some_and(|(_, x0, x1)| x1 > x0)
+    }
+
     /// Text of the current selection, or `None` if nothing (or an empty range) is selected.
     pub fn copy_selection(&mut self) -> Option<String> {
         let mut editor = Editor::new(&mut self.inner);
