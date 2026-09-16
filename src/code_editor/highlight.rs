@@ -10,6 +10,8 @@ use syntect::parsing::{SyntaxReference, SyntaxSet};
 pub struct Highlighter {
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
+    /// `two_face`'s extra themes, for app themes that have a same-named syntax theme.
+    extra_themes: two_face::theme::EmbeddedLazyThemeSet,
 }
 
 impl Highlighter {
@@ -17,6 +19,7 @@ impl Highlighter {
         Self {
             syntax_set: two_face::syntax::extra_no_newlines(),
             theme_set: ThemeSet::load_defaults(),
+            extra_themes: two_face::theme::extra(),
         }
     }
 
@@ -38,10 +41,22 @@ impl Highlighter {
         &self.syntax_for(extension).name
     }
 
-    /// `syntect`'s bundled themes have no 1:1 mapping to the app's 22 named `iced::Theme`s,
-    /// so (matching `highlighter_theme_for` in main.rs) this maps by background brightness
-    /// instead of guessing per-name.
+    /// Uses the same-named syntax theme when `two_face` has one (like VS Code/Zed, where a
+    /// theme carries its own syntax colors); otherwise falls back by background brightness.
     fn theme_for(&self, app_theme: &iced::Theme) -> &Theme {
+        use two_face::theme::EmbeddedThemeName as Name;
+        let matching = match app_theme {
+            iced::Theme::Dracula => Some(Name::Dracula),
+            iced::Theme::Nord => Some(Name::Nord),
+            iced::Theme::SolarizedLight => Some(Name::SolarizedLight),
+            iced::Theme::SolarizedDark => Some(Name::SolarizedDark),
+            iced::Theme::GruvboxLight => Some(Name::GruvboxLight),
+            iced::Theme::GruvboxDark => Some(Name::GruvboxDark),
+            _ => None,
+        };
+        if let Some(name) = matching {
+            return self.extra_themes.get(name);
+        }
         let bg = app_theme.palette().background;
         let brightness = bg.r + bg.g + bg.b;
         let name = if brightness < 1.5 {
@@ -115,8 +130,8 @@ mod tests {
             ("ts", "interface User { name: string }\nconst user: User = { name: \"Ada\" };\n"),
             ("tsx", "export const View = () => <div title=\"hello\">{42}</div>;\n"),
         ] {
-            for theme in [iced::Theme::Dark, iced::Theme::Light] {
-                let spans = highlighter.highlight(source, extension, &theme);
+            for theme in iced::Theme::ALL {
+                let spans = highlighter.highlight(source, extension, theme);
                 assert_eq!(spans.iter().map(|(text, _)| text.as_str()).collect::<String>(), source);
                 let colors: std::collections::HashSet<_> = spans.iter().filter_map(|(_, attrs)| attrs.color_opt).collect();
                 assert!(colors.len() > 2, "{extension} should color different token types");
