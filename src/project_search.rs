@@ -1,15 +1,11 @@
 //! "Find in Project": recursive text search across every file under the open folder.
 //!
-//! Search runs on `Submit` (Enter), not live-as-you-type -- walking + reading every file in
-//! a large repo on every keystroke would jank the UI, and this app has no background-thread
-//! plumbing for it yet (unlike `acp.rs`, which does exactly that for the AI agent). If this
-//! ever feels too slow to use, that's the place to add: move `search()` onto a thread and
-//! stream results back like `acp::AcpState` does.
+//! Searches run off the UI thread after a short typing delay, or immediately on Enter.
 
 use std::path::{Path, PathBuf};
 
 use iced::widget::{button, column, scrollable, text, text_input};
-use iced::{Element, Length};
+use iced::{Element, Length, Task};
 
 /// Directories skipped during the walk. Not `.gitignore`-aware -- just the usual noisy,
 /// huge, or binary-heavy directories that would otherwise dominate both the walk time and
@@ -29,6 +25,7 @@ const IGNORED_DIRS: &[&str] = &[
 
 const MAX_RESULTS: usize = 500;
 
+#[derive(Debug, Clone)]
 pub struct SearchResult {
     pub path: PathBuf,
     pub line: usize,
@@ -39,30 +36,68 @@ pub struct SearchResult {
 pub struct SearchState {
     pub query: String,
     pub results: Vec<SearchResult>,
+    generation: u64,
+    searching: bool,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     QueryChanged(String),
     Submit,
+    Run(u64),
+    Finished(u64, PathBuf, Result<Vec<SearchResult>, String>),
     ResultClicked(usize),
 }
 
-/// Applies `message`. Returns `Some((path, line))` when a result was clicked, for the
-/// caller to open and jump to; `root` is `None` when no folder is open, in which case
-/// `Submit` is a no-op (there's nothing to walk).
-pub fn update(state: &mut SearchState, message: Message, root: Option<&Path>) -> Option<(PathBuf, usize)> {
+/// Returns background search work and an optional clicked result to open.
+/// No scan is started without an open project; outdated completions are ignored.
+pub fn update(state: &mut SearchState, message: Message, root: Option<&Path>) -> (Task<Message>, Option<(PathBuf, usize)>) {
     match message {
         Message::QueryChanged(query) => {
             state.query = query;
-            None
+            state.results.clear();
+            state.error = None;
+            state.generation += 1;
+            state.searching = root.is_some() && !state.query.trim().is_empty();
+            if state.searching {
+                let generation = state.generation;
+                return (Task::perform(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    generation
+                }, Message::Run), None);
+            }
         }
         Message::Submit => {
-            state.results = root.map(|root| search(root, &state.query)).unwrap_or_default();
-            None
+            state.generation += 1;
+            return update(state, Message::Run(state.generation), root);
         }
-        Message::ResultClicked(i) => state.results.get(i).map(|r| (r.path.clone(), r.line)),
+        Message::Run(generation) if generation == state.generation => {
+            let Some(root) = root else { state.searching = false; return (Task::none(), None); };
+            if state.query.trim().is_empty() { state.searching = false; state.results.clear(); return (Task::none(), None); }
+            let root = root.to_path_buf();
+            let target = root.clone();
+            let query = state.query.clone();
+            state.searching = true;
+            state.error = None;
+            return (Task::perform(async move {
+                tokio::task::spawn_blocking(move || {
+                    std::fs::read_dir(&target).map_err(|err| format!("Cannot search {}: {err}", target.display()))?;
+                    Ok(search(&target, &query))
+                }).await.map_err(|err| err.to_string())?
+            }, move |result| Message::Finished(generation, root.clone(), result)), None);
+        }
+        Message::Finished(generation, searched_root, result) if generation == state.generation && root == Some(searched_root.as_path()) => {
+            state.searching = false;
+            match result {
+                Ok(results) => { state.results = results; state.error = None; }
+                Err(err) => { state.results.clear(); state.error = Some(err); }
+            }
+        }
+        Message::ResultClicked(i) => return (Task::none(), state.results.get(i).map(|r| (r.path.clone(), r.line))),
+        _ => {},
     }
+    (Task::none(), None)
 }
 
 /// Case-insensitive substring search over every non-ignored file under `root`, capped at
@@ -104,12 +139,13 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(kind) = entry.file_type() else { continue; };
+        if kind.is_dir() {
             if IGNORED_DIRS.contains(&entry.file_name().to_string_lossy().as_ref()) {
                 continue;
             }
             walk(&path, out);
-        } else {
+        } else if kind.is_file() {
             out.push(path);
         }
     }
@@ -130,7 +166,11 @@ pub fn view<'a>(state: &'a SearchState, root: Option<&Path>) -> Element<'a, Mess
         .on_input(Message::QueryChanged)
         .on_submit(Message::Submit);
 
-    let summary = if state.query.trim().is_empty() {
+    let summary = if let Some(error) = &state.error {
+        error.clone()
+    } else if state.searching {
+        "Searching…".to_owned()
+    } else if state.query.trim().is_empty() {
         String::new()
     } else if state.results.len() >= MAX_RESULTS {
         format!("{MAX_RESULTS}+ results (showing first {MAX_RESULTS})")
@@ -161,4 +201,45 @@ pub fn view<'a>(state: &'a SearchState, root: Option<&Path>) -> Element<'a, Mess
     .spacing(6)
     .padding(6)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::futures::StreamExt;
+
+    async fn finish(state: &mut SearchState, task: Task<Message>, root: &Path) {
+        let mut tasks = vec![task];
+        while let Some(task) = tasks.pop() {
+            if let Some(mut stream) = iced_runtime::task::into_stream(task) {
+                while let Some(action) = stream.next().await {
+                    if let iced_runtime::Action::Output(message) = action {
+                        tasks.push(update(state, message, Some(root)).0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn typing_searches_nested_files_and_discards_old_results() {
+        let root = std::env::temp_dir().join(format!("editor-search-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("src/app.ts"), "const Example = 42;\n").unwrap();
+        std::fs::write(root.join("node_modules/skip.ts"), "Example").unwrap();
+        let mut state = SearchState::default();
+        let (task, _) = update(&mut state, Message::QueryChanged("example".into()), Some(&root));
+        assert!(state.searching);
+        finish(&mut state, task, &root).await;
+        assert_eq!(state.results.len(), 1);
+        assert_eq!(state.results[0].path, root.join("src/app.ts"));
+        assert_eq!(state.results[0].line, 1);
+        let old = state.generation;
+        let _ = update(&mut state, Message::QueryChanged("".into()), Some(&root));
+        let _ = update(&mut state, Message::Finished(old, root.clone(), Ok(search(&root, "example"))), Some(&root));
+        assert!(state.results.is_empty());
+        assert!(!state.searching);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

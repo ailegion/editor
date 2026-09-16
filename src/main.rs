@@ -3,6 +3,7 @@ mod chat;
 mod code_editor;
 mod command_palette;
 mod git;
+mod file_icons;
 mod git_diff;
 mod git_preview;
 mod goto_line;
@@ -296,7 +297,7 @@ impl State {
         let root = load_last_project();
         let tree = root
             .clone()
-            .map(|p| DirectoryTree::new(p).with_filter(DirectoryFilter::FilesAndFolders));
+            .map(|p| DirectoryTree::new(p).with_filter(DirectoryFilter::FilesAndFolders).with_icon_theme(std::sync::Arc::new(file_icons::FileIcons)));
         let sidebar_visible = load_sidebar_visible();
         let ai_visible = load_ai_visible();
         let app_theme = load_app_theme();
@@ -704,8 +705,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::ProjectSearch(msg) => {
             let root = state.root.clone();
-            if let Some((path, line)) = project_search::update(&mut state.project_search, msg, root.as_deref()) {
-                task = state.open_path(path);
+            let (search_task, opened) = project_search::update(&mut state.project_search, msg, root.as_deref());
+            task = search_task.map(Message::ProjectSearch);
+            if let Some((path, line)) = opened {
+                task = Task::batch([task, state.open_path(path)]);
                 state.focus = Focus::Editor;
                 if let Some(tab) = state.tabs.get_mut(state.active_tab) {
                     tab.content.goto_line(line.saturating_sub(1));
@@ -856,7 +859,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.reveal_target = Some(path);
                 state.reveal_generation += 1;
                 let generation = state.reveal_generation;
-                let mut tree = DirectoryTree::new(root).with_filter(DirectoryFilter::FilesAndFolders);
+                let mut tree = DirectoryTree::new(root).with_filter(DirectoryFilter::FilesAndFolders).with_icon_theme(std::sync::Arc::new(file_icons::FileIcons));
                 if let Some(dir) = state.reveal_queue.pop_front() {
                     task = tree.update(DirectoryTreeEvent::Toggled(dir)).map(move |event| Message::RevealStep(generation, event));
                 }
@@ -890,7 +893,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     save_last_project(&path);
                     state.tree = Some(
-                        DirectoryTree::new(path.clone()).with_filter(DirectoryFilter::FilesAndFolders),
+                        DirectoryTree::new(path.clone()).with_filter(DirectoryFilter::FilesAndFolders).with_icon_theme(std::sync::Arc::new(file_icons::FileIcons)),
                     );
                     state.git_preview = None;
                     if let Some(tree) = &mut state.tree {
@@ -2089,14 +2092,9 @@ fn load_sidebar_visible() -> bool {
         .unwrap_or(true)
 }
 
-/// Forces DirectoryTree to rescan `dir` without disturbing the rest of the tree's expand
-/// state: a collapse+re-expand round trip is the widget's documented cache-invalidation
-/// trick, and it leaves `dir`'s own displayed expand state unchanged either way.
+/// Rescan the directory's contents while preserving expansion state.
 fn refresh_dir_task(dir: PathBuf) -> Task<Message> {
-    Task::batch([
-        Task::done(Message::Tree(DirectoryTreeEvent::Toggled(dir.clone()))),
-        Task::done(Message::Tree(DirectoryTreeEvent::Toggled(dir))),
-    ])
+    Task::done(Message::Tree(DirectoryTreeEvent::Refresh(dir)))
 }
 
 /// Kicks off an async `git diff` for `path` against `root` (the open project folder),
@@ -2191,5 +2189,49 @@ mod session_tests {
         assert!(restored == session);
         assert!(!path.with_extension("pending").exists());
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tree_refresh_tests {
+    use super::*;
+    use iced::futures::StreamExt;
+
+    async fn apply(tree: &mut DirectoryTree, event: DirectoryTreeEvent) {
+        let mut tasks = vec![tree.update(event)];
+        while let Some(task) = tasks.pop() {
+            if let Some(mut stream) = iced_runtime::task::into_stream(task) {
+                while let Some(action) = stream.next().await {
+                    if let iced_runtime::Action::Output(event) = action { tasks.push(tree.update(event)); }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_discovers_create_rename_delete_and_preserves_expansion() {
+        let root = std::env::temp_dir().join(format!("editor-tree-refresh-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/keep.ts"), "").unwrap();
+        let mut tree = DirectoryTree::new(root.clone());
+        apply(&mut tree, DirectoryTreeEvent::Toggled(root.clone())).await;
+        apply(&mut tree, DirectoryTreeEvent::Toggled(root.join("nested"))).await;
+        std::fs::write(root.join("created.ts"), "").unwrap();
+        std::fs::create_dir(root.join("created-folder")).unwrap();
+        apply(&mut tree, DirectoryTreeEvent::Refresh(root.clone())).await;
+        let node = iced_swdir_tree::__testing::root(&tree);
+        assert!(node.children.iter().any(|child| child.path == root.join("created.ts")));
+        assert!(node.children.iter().any(|child| child.path == root.join("created-folder")));
+        let nested = node.children.iter().find(|child| child.path == root.join("nested")).unwrap();
+        assert!(nested.is_expanded && nested.is_loaded && nested.children.len() == 1);
+        std::fs::rename(root.join("created.ts"), root.join("renamed.ts")).unwrap();
+        apply(&mut tree, DirectoryTreeEvent::Refresh(root.clone())).await;
+        let node = iced_swdir_tree::__testing::root(&tree);
+        assert!(!node.children.iter().any(|child| child.path == root.join("created.ts")));
+        assert!(node.children.iter().any(|child| child.path == root.join("renamed.ts")));
+        std::fs::remove_file(root.join("renamed.ts")).unwrap();
+        apply(&mut tree, DirectoryTreeEvent::Refresh(root.clone())).await;
+        assert!(!iced_swdir_tree::__testing::root(&tree).children.iter().any(|child| child.path == root.join("renamed.ts")));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

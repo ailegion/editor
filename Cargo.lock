@@ -1022,6 +1022,7 @@ dependencies = [
  "iced_aw",
  "iced_core",
  "iced_highlighter",
+ "iced_runtime",
  "lucide-icons",
  "regex",
  "rfd",
@@ -1727,8 +1728,6 @@ dependencies = [
 [[package]]
 name = "iced-swdir-tree"
 version = "0.9.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f26e928bd25b33482c58b282c5a3c41ca4300f67460f9526ecde548ec1d27520"
 dependencies = [
  "iced",
  "lucide-icons",

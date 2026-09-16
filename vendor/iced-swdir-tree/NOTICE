@@ -1,0 +1,13 @@
+iced-swdir-tree
+Copyright 2026 nabbisen
+
+This product is licensed under the Apache License, Version 2.0.
+See the LICENSE file for the full license text, or
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+This product depends on third-party software, each under its own
+license. See the respective crates' license terms:
+
+  - swdir (https://crates.io/crates/swdir)
+  - iced  (https://crates.io/crates/iced)
