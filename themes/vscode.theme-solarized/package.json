@@ -1,0 +1,19 @@
+{
+  "name": "theme-solarized",
+  "publisher": "vscode",
+  "license": "MIT",
+  "contributes": {
+    "themes": [
+      {
+        "label": "Solarized Dark",
+        "uiTheme": "vs-dark",
+        "path": "./themes/solarized-dark-color-theme.json"
+      },
+      {
+        "label": "Solarized Light",
+        "uiTheme": "vs",
+        "path": "./themes/solarized-light-color-theme.json"
+      }
+    ]
+  }
+}

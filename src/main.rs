@@ -11,6 +11,7 @@ mod goto_line;
 mod project_search;
 mod quick_open;
 mod recent_files;
+mod theme;
 
 use iced::keyboard;
 use iced::widget::{
@@ -244,7 +245,8 @@ enum Message {
     /// Clipboard contents read for `EditAction::Paste`.
     EditorPasted(Option<String>),
     ViewAction(ViewAction),
-    AppThemeSelected(iced::Theme),
+    /// A theme name from `State::themes`.
+    AppThemeSelected(String),
     PaneResized(pane_grid::ResizeEvent),
 
     KeyPressed(keyboard::Key, keyboard::Modifiers),
@@ -306,7 +308,8 @@ struct State {
     git: git::GitState,
     git_preview: Option<git_preview::Preview>,
 
-    app_theme: iced::Theme,
+    app_theme: theme::EditorTheme,
+    themes: theme::ThemeRegistry,
     highlighter: code_editor::Highlighter,
     zoom: f32,
 
@@ -343,7 +346,8 @@ impl State {
             .map(|p| DirectoryTree::new(p).with_filter(DirectoryFilter::FilesAndFolders).with_icon_theme(std::sync::Arc::new(file_icons::FileIcons)));
         let sidebar_visible = load_sidebar_visible();
         let ai_visible = load_ai_visible();
-        let app_theme = load_app_theme();
+        let themes = theme::ThemeRegistry::load();
+        let app_theme = load_app_theme(&themes);
         let zoom = load_zoom();
         let sidebar_ratio = load_sidebar_ratio();
         let ai_ratio = load_ai_ratio();
@@ -400,6 +404,7 @@ impl State {
             git: git::GitState::default(),
             git_preview: None,
             app_theme,
+            themes,
             highlighter: code_editor::Highlighter::new(),
             zoom,
             panes,
@@ -438,7 +443,7 @@ impl State {
             for recovery in session.recovery {
                 let mut content = code_editor::Buffer::new(&recovery.text, code_editor::metrics_for_zoom(state.zoom));
                 let extension = recovery.path.as_ref().and_then(|path| path.extension()).and_then(|ext| ext.to_str()).unwrap_or("txt");
-                content.highlight(&state.highlighter, extension, &state.app_theme);
+                content.highlight(&state.highlighter, extension, &state.app_theme.syntax);
                 let tab = Tab {
                     path: recovery.path.clone(), content, dirty: true,
                     search: Default::default(), line_ending: LineEnding::detect(&recovery.text), diff: Default::default(),
@@ -569,7 +574,7 @@ impl State {
                     let extension = tab.extension();
                     tab.content =
                         code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
-                    tab.content.highlight(&self.highlighter, &extension, &self.app_theme);
+                    tab.content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
                     tasks.push(load_diff_task(self.root.clone(), path));
                 }
             }
@@ -599,7 +604,7 @@ impl State {
             .to_string();
         let line_ending = LineEnding::detect(&text);
         let mut content = code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
-        content.highlight(&self.highlighter, &extension, &self.app_theme);
+        content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
         recent_files::record(&mut self.recent_files, path.clone());
         let task = load_diff_task(self.root.clone(), path.clone());
         self.tabs.push(Tab {
@@ -696,7 +701,7 @@ impl State {
         }
         tab.dirty = true;
         let extension = tab.extension();
-        tab.content.highlight(&self.highlighter, &extension, &self.app_theme);
+        tab.content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
     }
 
     /// Applies `action` to `self.zoom`, then re-shapes every open tab's buffer at the new
@@ -1205,14 +1210,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::CreateCancel => state.creating = None,
 
-        Message::AppThemeSelected(theme) => {
-            save_app_theme(&theme);
-            state.app_theme = theme;
-            for tab in &mut state.tabs {
-                let extension = tab.extension();
-                tab.content.highlight(&state.highlighter, &extension, &state.app_theme);
+        Message::AppThemeSelected(name) => match state.themes.load_theme(&name) {
+            Ok(theme) => {
+                save_app_theme(&theme.name);
+                state.app_theme = theme;
+                for tab in &mut state.tabs {
+                    let extension = tab.extension();
+                    tab.content.highlight(&state.highlighter, &extension, &state.app_theme.syntax);
+                }
             }
-        }
+            Err(err) => state.notify(format!("Theme failed to load: {err}")),
+        },
         Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
             state.panes.resize(split, ratio);
             if Some(split) == state.sidebar_split {
@@ -1812,8 +1820,8 @@ fn command_list(state: &State) -> Vec<command_palette::Command> {
         commands.push(Command { label: "Go to Line (Cmd+G)".to_string(), message: Message::ToggleGotoLine });
     }
 
-    for theme in iced::Theme::ALL.iter() {
-        commands.push(Command { label: format!("Theme: {theme}"), message: Message::AppThemeSelected(theme.clone()) });
+    for name in state.themes.names() {
+        commands.push(Command { label: format!("Theme: {name}"), message: Message::AppThemeSelected(name.to_string()) });
     }
 
     commands
@@ -1913,9 +1921,10 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
     );
 
     let theme_menu_button = menu_button("Theme".to_string(), Message::Noop).width(Length::Shrink);
-    let theme_items: Vec<_> = iced::Theme::ALL
-        .iter()
-        .map(|t| Item::new(menu_button(t.to_string(), Message::AppThemeSelected(t.clone()))))
+    let theme_items: Vec<_> = state
+        .themes
+        .names()
+        .map(|name| Item::new(menu_button(name.to_string(), Message::AppThemeSelected(name.to_string()))))
         .collect();
 
     let mb = menu_bar!(
@@ -2137,7 +2146,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             scrollable(tab_row).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())),
             header,
 
-            git_preview::view(preview, &state.app_theme),
+            git_preview::view(preview, &state.app_theme.iced),
         ].width(Length::Fill).height(Length::Fill).into();
     }
     let mut editor_column = column![];
@@ -2166,7 +2175,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         let editor = code_editor::code_editor(
             &tab.content,
             &tab.diff,
-            &state.app_theme,
+            &state.app_theme.editor,
             state.zoom,
             Message::EditorAction,
             Message::ToggleFold,
@@ -2323,22 +2332,29 @@ fn load_last_project() -> Option<PathBuf> {
     path.is_dir().then_some(path)
 }
 
-fn save_app_theme(theme: &iced::Theme) {
+fn save_app_theme(name: &str) {
     let Some(path) = config_path("app_theme") else { return };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(path, theme.to_string());
+    let _ = std::fs::write(path, name);
 }
 
-fn load_app_theme() -> iced::Theme {
-    config_path("app_theme")
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| {
-            let name = text.trim();
-            iced::Theme::ALL.iter().find(|t| t.to_string() == name).cloned()
-        })
-        .unwrap_or(iced::Theme::Dark)
+fn load_app_theme(themes: &theme::ThemeRegistry) -> theme::EditorTheme {
+    let Some(saved) = config_path("app_theme").and_then(|path| std::fs::read_to_string(path).ok()) else {
+        return theme::EditorTheme::default_dark();
+    };
+    let saved = saved.trim();
+    if let Ok(theme) = themes.load_theme(theme::migrate_name(saved)) {
+        return theme;
+    }
+    // A theme that's gone, or an old iced built-in without a bundled equivalent: keep at
+    // least its brightness.
+    let light = iced::Theme::ALL
+        .iter()
+        .find(|theme| theme.to_string() == saved)
+        .is_some_and(|theme| !theme.extended_palette().is_dark);
+    if light { theme::EditorTheme::default_light() } else { theme::EditorTheme::default_dark() }
 }
 
 fn save_zoom(zoom: f32) {
@@ -2633,7 +2649,7 @@ pub fn main() -> iced::Result {
     let icon = iced::window::icon::from_file_data(include_bytes!("../icon.png"), None).ok();
     iced::application(State::boot, update, view)
         .title("editor")
-        .theme(|state: &State| state.app_theme.clone())
+        .theme(|state: &State| state.app_theme.iced.clone())
         .subscription(subscription)
         .font(iced_swdir_tree::LUCIDE_FONT_BYTES)
         .window(iced::window::Settings {

@@ -9,12 +9,12 @@ pub const ZOOM_MAX: f32 = 2.5;
 pub const ZOOM_STEP: f32 = 0.1;
 
 /// `Metrics` for a [`super::Buffer`] at the given zoom level, matching [`Style`]'s font
-/// size/line height (see `Style::from_theme`) so the two stay in sync.
+/// size/line height (see `Style::new`) so the two stay in sync.
 pub fn metrics_for_zoom(zoom: f32) -> cosmic_text::Metrics {
     cosmic_text::Metrics::new(FONT_SIZE * zoom, LINE_HEIGHT * zoom)
 }
 
-/// Visual style for [`super::CodeEditor`], derived from the app-wide [`iced::Theme`].
+/// Visual style for [`super::CodeEditor`], from the current theme's editor colors.
 pub struct Style {
     pub text_color: Color,
     pub background: Color,
@@ -32,20 +32,19 @@ pub struct Style {
 }
 
 impl Style {
-    pub fn from_theme(theme: &iced::Theme, zoom: f32) -> Self {
-        let palette = theme.extended_palette();
+    pub fn new(colors: &crate::theme::EditorColors, zoom: f32) -> Self {
         Self {
-            text_color: palette.background.base.text,
-            background: palette.background.base.color,
-            cursor_color: palette.primary.base.color,
-            selection_color: palette.primary.weak.color,
-            bracket_match_color: palette.primary.base.color,
-            diff_added_color: palette.success.base.color,
-            diff_modified_color: palette.warning.base.color,
-            diff_removed_color: palette.danger.base.color,
-            current_line_color: palette.background.weak.color,
-            gutter_background: palette.background.weak.color,
-            gutter_text_color: palette.background.strong.text,
+            text_color: colors.foreground,
+            background: colors.background,
+            cursor_color: colors.cursor,
+            selection_color: colors.selection,
+            bracket_match_color: colors.bracket_match,
+            diff_added_color: colors.gutter_added,
+            diff_modified_color: colors.gutter_modified,
+            diff_removed_color: colors.gutter_deleted,
+            current_line_color: colors.line_highlight,
+            gutter_background: colors.gutter_background,
+            gutter_text_color: colors.line_number,
             font_size: FONT_SIZE * zoom,
             line_height: LINE_HEIGHT * zoom,
         }

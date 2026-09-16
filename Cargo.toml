@@ -28,6 +28,7 @@ vt100 = "0.16.2"
 name = "editor"
 identifier = "io.github.ailegion.editor"
 short_description = "A minimal, no-bloat code editor"
+resources = ["themes"]
 
 [profile.dev]
 opt-level = 0    # Keeps your editor code fast to compile and completely debuggable

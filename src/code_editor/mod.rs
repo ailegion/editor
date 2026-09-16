@@ -27,6 +27,7 @@ use iced::widget::canvas::{self, Canvas};
 use iced::{Element, Event, Length, Rectangle, Renderer, Theme};
 
 use crate::git_diff::LineStatus;
+use crate::theme::EditorColors;
 
 /// Canvas-based `Program` that draws a [`Buffer`]'s contents and turns mouse clicks/drags
 /// into `cosmic_text::Action`s published as `Message`s (mirroring `text_editor`'s
@@ -45,13 +46,13 @@ impl<'a, Message> CodeEditor<'a, Message> {
     pub fn new(
         content: &'a Buffer,
         diff: &'a HashMap<usize, LineStatus>,
-        theme: &Theme,
+        colors: &EditorColors,
         zoom: f32,
     ) -> Self {
         Self {
             content,
             diff,
-            style: Style::from_theme(theme, zoom),
+            style: Style::new(colors, zoom),
             on_action: None,
             on_fold: None,
         }
@@ -233,7 +234,7 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
 pub fn code_editor<'a, Message>(
     content: &'a Buffer,
     diff: &'a HashMap<usize, LineStatus>,
-    theme: &Theme,
+    colors: &EditorColors,
     zoom: f32,
     on_action: impl Fn(cosmic_text::Action) -> Message + 'a,
     on_fold: impl Fn(usize) -> Message + 'a,
@@ -241,7 +242,7 @@ pub fn code_editor<'a, Message>(
 where
     Message: 'a,
 {
-    let mut editor = CodeEditor::new(content, diff, theme, zoom).on_action(on_action);
+    let mut editor = CodeEditor::new(content, diff, colors, zoom).on_action(on_action);
     editor.on_fold = Some(Box::new(on_fold));
     Canvas::new(editor)
         .width(Length::Fill)
