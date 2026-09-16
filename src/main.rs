@@ -308,6 +308,8 @@ struct State {
     /// persist as "windowed size" once it resolves.
     last_known_size: iced::Size,
     window_revealed: bool,
+    startup_maximized: bool,
+    startup_window: Option<u64>,
 
     ai_visible: bool,
     ai_mode: AiMode,
@@ -390,6 +392,8 @@ impl State {
             sidebar_visible,
             last_known_size: load_window_size(),
             window_revealed: !cfg!(windows),
+            startup_maximized: load_window_maximized(),
+            startup_window: None,
             ai_visible,
             ai_mode: AiMode::default(),
             chat: chat::ChatState::default(),
@@ -1413,8 +1417,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::PaintInitialWindow(id, raw) => {
-            if !paint_hidden_window(raw) {
+            state.startup_window = Some(raw);
+            if !paint_hidden_window(raw, state.startup_maximized) {
                 // Do not leave the app invisible if the native paint request fails.
+                cloak_startup_window(raw, false);
                 state.window_revealed = true;
                 task = iced::window::set_mode(id, iced::window::Mode::Windowed);
             }
@@ -1424,12 +1430,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.window_revealed = true;
                 // Redraw subscriptions are delivered after the renderer submits
                 // the frame, so Windows never shows an unpainted client area.
+                if let Some(raw) = state.startup_window.take() {
+                    cloak_startup_window(raw, false);
+                }
                 task = iced::window::set_mode(id, iced::window::Mode::Windowed);
             }
         }
         Message::WindowResized(id, size) => {
             state.last_known_size = size;
-            task = iced::window::is_maximized(id).map(Message::WindowMaximizedChecked);
+            if state.window_revealed {
+                task = iced::window::is_maximized(id).map(Message::WindowMaximizedChecked);
+            }
         }
         Message::WindowMoved(position) => save_window_position(position),
         Message::WindowMaximizedChecked(maximized) => {
@@ -2421,12 +2432,35 @@ fn reveal_in_file_manager(path: &Path) {
     }
 }
 
-fn paint_hidden_window(raw: u64) -> bool {
+fn cloak_startup_window(raw: u64, cloak: bool) {
+    #[cfg(windows)]
+    {
+        #[link(name = "dwmapi")]
+        unsafe extern "system" {
+            fn DwmSetWindowAttribute(window: *mut std::ffi::c_void, attribute: u32, value: *const i32, size: u32) -> i32;
+        }
+        let value = i32::from(cloak);
+        // SAFETY: live HWND from Iced and a valid BOOL for DWMWA_CLOAK.
+        unsafe { DwmSetWindowAttribute(raw as usize as *mut _, 13, &value, 4); }
+    }
+    #[cfg(not(windows))]
+    { let _ = (raw, cloak); }
+}
+
+fn paint_hidden_window(raw: u64, maximized: bool) -> bool {
     #[cfg(windows)]
     {
         #[link(name = "user32")]
         unsafe extern "system" {
             fn PostMessageW(window: *mut std::ffi::c_void, message: u32, wparam: usize, lparam: isize) -> i32;
+            fn ShowWindow(window: *mut std::ffi::c_void, command: i32) -> i32;
+        }
+        if maximized {
+            // SW_MAXIMIZE also shows the HWND. Cloak it until the first frame at
+            // its final maximized size, avoiding both a blank flash and animation.
+            cloak_startup_window(raw, true);
+            // SAFETY: raw is Iced's live HWND; 3 is SW_MAXIMIZE.
+            unsafe { ShowWindow(raw as usize as *mut _, 3); }
         }
         // Windows does not invalidate hidden windows. Explicitly queue WM_PAINT
         // so winit draws the first frame before we make the HWND visible.
@@ -2435,7 +2469,7 @@ fn paint_hidden_window(raw: u64) -> bool {
         unsafe { PostMessageW(raw as usize as *mut _, 0x000F, 0, 0) != 0 }
     }
     #[cfg(not(windows))]
-    { let _ = raw; false }
+    { let _ = (raw, maximized); false }
 }
 
 pub fn main() -> iced::Result {
@@ -2451,7 +2485,7 @@ pub fn main() -> iced::Result {
             min_size: Some(MIN_WINDOW_SIZE),
             visible: !cfg!(windows),
             position: load_window_position(),
-            maximized: load_window_maximized(),
+            maximized: !cfg!(windows) && load_window_maximized(),
             exit_on_close_request: false,
             ..Default::default()
         })
