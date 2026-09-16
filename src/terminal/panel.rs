@@ -62,7 +62,10 @@ mod tests {
             Message::Session(1, super::super::Message::Pasted(Some("first".into()))),
             cwd,
         );
-        assert_eq!(rx.try_recv().unwrap(), b"first");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            super::super::Command::Input(b"first".to_vec())
+        );
         let _ = panel.update(Message::Close(1), cwd);
         assert_eq!(panel.active, Some(2));
         // A clipboard response arriving after its tab closes must not hit the next tab.
@@ -91,12 +94,7 @@ mod tests {
             let mut panel = Panel::default();
             panel.open(Some(profile.clone()), &std::env::current_dir().unwrap());
             let terminal = &mut panel.tabs[0].terminal;
-            assert!(
-                terminal.child.is_some(),
-                "{}: {}",
-                profile.name,
-                terminal.status
-            );
+            assert!(terminal.running, "{}: {}", profile.name, terminal.status);
             let deadline = Instant::now() + Duration::from_secs(20);
             // User profiles can replace the prompt entirely; wait for output,
             // then let the shell consume buffered input once initialization ends.
@@ -121,7 +119,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
             terminal.write(b"exit\r".to_vec());
-            while terminal.child.is_some() {
+            while terminal.running {
                 terminal.poll();
                 assert!(Instant::now() < deadline, "{} did not exit", profile.name);
                 std::thread::sleep(Duration::from_millis(20));

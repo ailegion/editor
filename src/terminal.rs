@@ -1,14 +1,15 @@
 //! A persistent PTY shell with a bounded VT screen and scrollback.
 pub mod panel;
+
+mod appearance;
+mod backend;
+use backend::{Command, Event as PtyEvent};
 use iced::widget::{Space, canvas, column, container, row, text};
 use iced::{Color, Element, Event, Length, Point, Rectangle, Size, Task, keyboard, mouse};
-use portable_pty::{CommandBuilder, MasterPty, PtySize};
-use std::io::{Read, Write};
+use portable_pty::PtySize;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 
-const CELL_W: f32 = 8.0;
-const CELL_H: f32 = 18.0;
 const PAD: f32 = 6.0;
 
 #[derive(Default)]
@@ -45,10 +46,11 @@ fn new_parser() -> vt100::Parser<TerminalReplies> {
 pub struct Terminal {
     shell: Option<std::path::PathBuf>,
     parser: vt100::Parser<TerminalReplies>,
-    master: Option<Box<dyn MasterPty + Send>>,
-    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
-    input: Option<SyncSender<Vec<u8>>>,
-    output: Option<Receiver<Vec<u8>>>,
+    running: bool,
+    input: Option<SyncSender<Command>>,
+    output: Option<Receiver<PtyEvent>>,
+    pending_size: Option<(u16, u16)>,
+    directory: String,
     pub status: String,
     pub focused: bool,
 }
@@ -58,8 +60,9 @@ impl Default for Terminal {
         Self {
             shell: None,
             parser: new_parser(),
-            master: None,
-            child: None,
+            running: false,
+            pending_size: None,
+            directory: String::new(),
             input: None,
             output: None,
             status: "Not started".into(),
@@ -82,100 +85,76 @@ pub enum Message {
 
 impl Terminal {
     pub fn start(&mut self, cwd: &Path) {
+        let size = self.parser.screen().size();
         self.shutdown();
         self.parser = new_parser();
-        match self.spawn(cwd) {
-            Ok(()) => self.focused = true,
-            Err(error) => self.status = format!("Could not start shell: {error}"),
-        }
-    }
-
-    fn spawn(&mut self, cwd: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let pair = portable_pty::native_pty_system().openpty(pty_size(24, 80))?;
-        let mut command = match &self.shell {
-            Some(shell) => CommandBuilder::new(shell),
-            None => CommandBuilder::new_default_prog(),
-        };
-        command.cwd(cwd);
-        command.env("TERM", "xterm-256color");
-        command.env("COLORTERM", "truecolor");
-        let mut reader = pair.master.try_clone_reader()?;
-        let mut writer = pair.master.take_writer()?;
-        let child = pair.slave.spawn_command(command)?;
-        drop(pair.slave);
-        let (output_tx, output_rx) = mpsc::sync_channel(64);
-        std::thread::spawn(move || {
-            let mut buffer = [0u8; 8192];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if output_tx.send(buffer[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-        let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(64);
-        std::thread::spawn(move || {
-            while let Ok(bytes) = input_rx.recv() {
-                if writer
-                    .write_all(&bytes)
-                    .and_then(|_| writer.flush())
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-        self.master = Some(pair.master);
-        self.child = Some(child);
-        self.input = Some(input_tx);
-        self.output = Some(output_rx);
-        self.status = cwd.display().to_string();
-        Ok(())
+        self.parser.screen_mut().set_size(size.0, size.1);
+        let (input, commands) = mpsc::sync_channel(64);
+        let (events, output) = mpsc::sync_channel(64);
+        self.input = Some(input);
+        self.output = Some(output);
+        self.running = true;
+        self.focused = true;
+        self.directory = cwd.display().to_string();
+        self.status = "Starting shell…".into();
+        backend::spawn(
+            self.shell.clone(),
+            cwd.to_path_buf(),
+            size,
+            commands,
+            events,
+        );
     }
 
     pub fn shutdown(&mut self) {
+        // The worker owns process/PTY handles and performs all blocking cleanup.
         self.input = None;
         self.output = None;
-        self.master = None;
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }
+        self.pending_size = None;
+        self.running = false;
     }
 
     pub fn poll(&mut self) {
-        if let Some(rx) = &self.output {
-            // Keep noisy commands from monopolizing the UI thread.
-            for _ in 0..64 {
-                let Ok(bytes) = rx.try_recv() else {
-                    break;
-                };
-                self.parser.process(&bytes);
-                let replies = std::mem::take(&mut self.parser.callbacks_mut().0);
-                if !replies.is_empty() {
-                    if let Some(tx) = &self.input {
-                        if let Err(error) = tx.try_send(replies) {
-                            self.status = format!("Could not send terminal reply: {error}");
-                        }
-                    }
-                }
+        if let (Some(size), Some(tx)) = (self.pending_size, &self.input) {
+            if tx.try_send(Command::Resize(size.0, size.1)).is_ok() {
+                self.pending_size = None;
             }
         }
-        if let Some(child) = &mut self.child {
-            match child.try_wait() {
-                Ok(Some(exit)) => {
-                    self.status = format!("Shell exited ({exit}) · Restart to open a new shell");
-                    self.child = None;
-                    self.input = None;
+        if let Some(rx) = &self.output {
+            // Bound parsing work so noisy background tabs cannot monopolize the UI.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2);
+            for _ in 0..8 {
+                match rx.try_recv() {
+                    Ok(PtyEvent::Ready) => self.status = self.directory.clone(),
+                    Ok(PtyEvent::Output(bytes)) => {
+                        self.parser.process(&bytes);
+                        let replies = std::mem::take(&mut self.parser.callbacks_mut().0);
+                        if !replies.is_empty() {
+                            if let Some(tx) = &self.input {
+                                if let Err(error) = tx.try_send(Command::Input(replies)) {
+                                    self.status = format!("Could not send terminal reply: {error}");
+                                }
+                            }
+                        }
+                    }
+                    Ok(PtyEvent::Exited(status) | PtyEvent::Error(status)) => {
+                        self.status = status;
+                        self.running = false;
+                        self.input = None;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        if self.running {
+                            self.status = "Terminal worker stopped · Restart to try again".into();
+                        }
+                        self.running = false;
+                        self.input = None;
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
                 }
-                Err(error) => self.status = format!("Shell error: {error}"),
-                _ => {}
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
             }
         }
     }
@@ -183,7 +162,7 @@ impl Terminal {
     fn write(&mut self, bytes: Vec<u8>) {
         self.parser.screen_mut().set_scrollback(0);
         if let Some(tx) = &self.input {
-            if let Err(error) = tx.try_send(bytes) {
+            if let Err(error) = tx.try_send(Command::Input(bytes)) {
                 self.status = format!("Could not send terminal input: {error}");
             }
         }
@@ -194,13 +173,9 @@ impl Terminal {
             Message::Input(bytes) => self.write(bytes),
             Message::Resize(rows, cols) => {
                 self.parser.screen_mut().set_size(rows, cols);
-                if let Some(master) = &self.master {
-                    match master.resize(pty_size(rows, cols)) {
-                        Ok(()) => {}
-                        Err(error) => self.status = format!("Could not resize terminal: {error}"),
-                    }
-                }
+                self.pending_size = Some((rows, cols));
             }
+
             Message::Scroll(delta) => {
                 let offset = self.parser.screen().scrollback() as i32;
                 self.parser
@@ -313,8 +288,8 @@ impl canvas::Program<Message> for Screen<'_> {
         match event {
             Event::Window(iced::window::Event::RedrawRequested(_)) => {
                 let next = (
-                    ((bounds.height - PAD * 2.0) / CELL_H).max(1.0) as u16,
-                    ((bounds.width - PAD * 2.0) / CELL_W).max(2.0) as u16,
+                    ((bounds.height - PAD * 2.0) / appearance::get().cell_height).max(1.0) as u16,
+                    ((bounds.width - PAD * 2.0) / appearance::get().cell_width).max(2.0) as u16,
                 );
                 if next != *size || next != self.terminal.parser.screen().size() {
                     *size = next;
@@ -333,7 +308,7 @@ impl canvas::Program<Message> for Screen<'_> {
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(bounds) => {
                 let lines = match delta {
                     mouse::ScrollDelta::Lines { y, .. } => *y * 3.0,
-                    mouse::ScrollDelta::Pixels { y, .. } => *y / CELL_H,
+                    mouse::ScrollDelta::Pixels { y, .. } => *y / appearance::get().cell_height,
                 };
                 return publish(Message::Scroll(lines as i32));
             }
@@ -387,8 +362,13 @@ impl canvas::Program<Message> for Screen<'_> {
     ) -> Vec<canvas::Geometry> {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
         let palette = theme.extended_palette();
-        let fg = palette.background.base.text;
-        let bg = palette.background.base.color;
+        let appearance = appearance::get();
+        let fg = appearance
+            .foreground
+            .unwrap_or(palette.background.base.text);
+        let bg = appearance
+            .background
+            .unwrap_or(palette.background.base.color);
         frame.fill_rectangle(Point::ORIGIN, bounds.size(), bg);
         let screen = self.terminal.parser.screen();
         let (rows, cols) = screen.size();
@@ -405,27 +385,38 @@ impl canvas::Program<Message> for Screen<'_> {
                 if cell.inverse() {
                     std::mem::swap(&mut foreground, &mut background);
                 }
-                let point = Point::new(PAD + col as f32 * CELL_W, PAD + row as f32 * CELL_H);
-                let width = CELL_W * if cell.is_wide() { 2.0 } else { 1.0 };
-                frame.fill_rectangle(point, Size::new(width, CELL_H), background);
+                let point = Point::new(
+                    PAD + col as f32 * appearance::get().cell_width,
+                    PAD + row as f32 * appearance::get().cell_height,
+                );
+                let width = appearance::get().cell_width * if cell.is_wide() { 2.0 } else { 1.0 };
+                frame.fill_rectangle(
+                    point,
+                    Size::new(width, appearance::get().cell_height),
+                    background,
+                );
                 frame.fill_text(canvas::Text {
                     content: cell.contents().to_string(),
                     position: point,
                     color: foreground,
-                    size: 13.0.into(),
+                    size: appearance.font_size.into(),
+                    line_height: iced::widget::text::LineHeight::Absolute(
+                        appearance.cell_height.into(),
+                    ),
+                    shaping: iced::widget::text::Shaping::Advanced,
                     font: iced::Font {
                         weight: if cell.bold() {
                             iced::font::Weight::Bold
                         } else {
                             iced::font::Weight::Normal
                         },
-                        ..iced::Font::MONOSPACE
+                        ..appearance.font
                     },
                     ..Default::default()
                 });
                 if cell.underline() {
                     frame.fill_rectangle(
-                        Point::new(point.x, point.y + CELL_H - 2.0),
+                        Point::new(point.x, point.y + appearance::get().cell_height - 2.0),
                         Size::new(width, 1.0),
                         foreground,
                     );
@@ -440,11 +431,13 @@ impl canvas::Program<Message> for Screen<'_> {
             let (row, col) = screen.cursor_position();
             frame.fill_rectangle(
                 Point::new(
-                    PAD + col as f32 * CELL_W,
-                    PAD + row as f32 * CELL_H + CELL_H - 2.0,
+                    PAD + col as f32 * appearance::get().cell_width,
+                    PAD + row as f32 * appearance::get().cell_height
+                        + appearance::get().cell_height
+                        - 2.0,
                 ),
-                Size::new(CELL_W, 2.0),
-                fg,
+                Size::new(appearance::get().cell_width, 2.0),
+                appearance.cursor.unwrap_or(fg),
             );
         }
         vec![frame.into_geometry()]
@@ -517,6 +510,9 @@ fn color(value: vt100::Color, default: Color) -> Color {
                 0x666666, 0xf14c4c, 0x23d18b, 0xf5f543, 0x3b8eea, 0xd670d6, 0x29b8db, 0xffffff,
             ];
             if index < 16 {
+                if let Some(color) = appearance::get().ansi[index as usize] {
+                    return color;
+                }
                 let rgb = ANSI[index as usize];
                 Color::from_rgb8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
             } else if index >= 232 {
@@ -536,6 +532,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn startup_errors_arrive_asynchronously_and_restart_discards_old_events() {
+        let mut terminal = Terminal::default();
+        terminal.shell = Some(std::env::temp_dir().join("editor-nonexistent-test-shell.exe"));
+        terminal.start(&std::env::current_dir().unwrap());
+        // No worker event is applied until the UI polls, even for immediate failure.
+        assert_eq!(terminal.status, "Starting shell…");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while terminal.running {
+            terminal.poll();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Worker did not report failure"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            terminal.status.starts_with("Terminal error:"),
+            "{}",
+            terminal.status
+        );
+        let (events, output) = mpsc::sync_channel(2);
+        terminal.output = Some(output);
+        terminal.start(&std::env::current_dir().unwrap());
+        assert!(
+            events
+                .send(PtyEvent::Output(b"stale output".to_vec()))
+                .is_err()
+        );
+        terminal.shutdown();
+    }
+
+    #[test]
+    fn resize_does_not_wait_for_a_busy_worker_and_coalesces_requests() {
+        let mut terminal = Terminal::default();
+        let (input, commands) = mpsc::sync_channel(1);
+        terminal.input = Some(input);
+        terminal.write(b"busy".to_vec());
+        let _ = terminal.update(Message::Resize(20, 100));
+        let _ = terminal.update(Message::Resize(30, 120));
+        terminal.poll();
+        assert_eq!(terminal.pending_size, Some((30, 120)));
+        assert_eq!(
+            commands.try_recv().unwrap(),
+            Command::Input(b"busy".to_vec())
+        );
+        terminal.poll();
+        assert_eq!(commands.try_recv().unwrap(), Command::Resize(30, 120));
+        assert_eq!(terminal.pending_size, None);
+    }
+
+    #[test]
     fn terminal_replies_to_fragmented_cursor_queries() {
         let mut parser = new_parser();
         parser.process(b"\x1b[4;9H\x1b[");
@@ -549,7 +596,7 @@ mod tests {
         let mut terminal = Terminal::default();
         let cwd = std::env::current_dir().unwrap();
         terminal.start(&cwd);
-        assert!(terminal.child.is_some(), "{}", terminal.status);
+        assert!(terminal.running, "{}", terminal.status);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         // Wait for the initial prompt before sending input to the shell.
         while !terminal.parser.screen().contents().contains('>') {
@@ -577,7 +624,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         terminal.write(b"exit\r".to_vec());
-        while terminal.child.is_some() {
+        while terminal.running {
             terminal.poll();
             assert!(std::time::Instant::now() < deadline, "Shell did not exit");
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -647,7 +694,7 @@ mod tests {
         let mut terminal = Terminal::default();
         let cwd = std::env::current_dir().unwrap();
         terminal.start(&cwd);
-        assert!(terminal.child.is_some(), "{}", terminal.status);
+        assert!(terminal.running, "{}", terminal.status);
         let _ = terminal.update(Message::Resize(20, 100));
         // Split the marker so echoed input cannot satisfy the output assertion.
         terminal.write(b"printf 'pty-%s\\n' ready; pwd; stty size\r".to_vec());
@@ -668,7 +715,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         terminal.write(b"exit\r".to_vec());
-        while terminal.child.is_some() {
+        while terminal.running {
             terminal.poll();
             assert!(std::time::Instant::now() < deadline, "Shell did not exit");
             std::thread::sleep(std::time::Duration::from_millis(20));

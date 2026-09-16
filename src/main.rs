@@ -247,6 +247,9 @@ enum Message {
     Tick,
 
     WindowResized(iced::window::Id, iced::Size),
+    WindowFrameDrawn(iced::window::Id),
+    WindowOpened(iced::window::Id),
+    PaintInitialWindow(iced::window::Id, u64),
     WindowMoved(iced::Point),
     WindowMaximizedChecked(bool),
 }
@@ -304,6 +307,7 @@ struct State {
     /// `is_maximized` check triggered by that same event (see its handler) knows what to
     /// persist as "windowed size" once it resolves.
     last_known_size: iced::Size,
+    window_revealed: bool,
 
     ai_visible: bool,
     ai_mode: AiMode,
@@ -385,6 +389,7 @@ impl State {
             ai_split,
             sidebar_visible,
             last_known_size: load_window_size(),
+            window_revealed: !cfg!(windows),
             ai_visible,
             ai_mode: AiMode::default(),
             chat: chat::ChatState::default(),
@@ -1402,6 +1407,26 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
 
+        Message::WindowOpened(id) => {
+            if !state.window_revealed {
+                task = iced::window::raw_id::<Message>(id).map(move |raw| Message::PaintInitialWindow(id, raw));
+            }
+        }
+        Message::PaintInitialWindow(id, raw) => {
+            if !paint_hidden_window(raw) {
+                // Do not leave the app invisible if the native paint request fails.
+                state.window_revealed = true;
+                task = iced::window::set_mode(id, iced::window::Mode::Windowed);
+            }
+        }
+        Message::WindowFrameDrawn(id) => {
+            if !state.window_revealed {
+                state.window_revealed = true;
+                // Redraw subscriptions are delivered after the renderer submits
+                // the frame, so Windows never shows an unpainted client area.
+                task = iced::window::set_mode(id, iced::window::Mode::Windowed);
+            }
+        }
         Message::WindowResized(id, size) => {
             state.last_known_size = size;
             task = iced::window::is_maximized(id).map(Message::WindowMaximizedChecked);
@@ -2105,16 +2130,26 @@ fn handle_raw_key_event(
     }
 }
 
-fn subscription(_state: &State) -> Subscription<Message> {
+fn subscription(state: &State) -> Subscription<Message> {
     let keys = iced::event::listen_with(handle_raw_key_event);
     let tick = iced::time::every(Duration::from_millis(50)).map(|_| Message::Tick);
     let window_events = iced::window::events().map(|(id, event)| match event {
         iced::window::Event::CloseRequested => Message::Exit,
+        iced::window::Event::Opened { .. } => Message::WindowOpened(id),
         iced::window::Event::Resized(size) => Message::WindowResized(id, size),
         iced::window::Event::Moved(position) => Message::WindowMoved(position),
         _ => Message::Noop,
     });
-    Subscription::batch([keys, tick, window_events])
+    let first_frame = if state.window_revealed {
+        Subscription::none()
+    } else {
+        // `window::events` filters redraws; listen raw only until the first frame.
+        iced::event::listen_raw(|event, _, id| match event {
+            iced::Event::Window(iced::window::Event::RedrawRequested(_)) => Some(Message::WindowFrameDrawn(id)),
+            _ => None,
+        })
+    };
+    Subscription::batch([keys, tick, window_events, first_frame])
 }
 
 /// `HOME` is unset on native Windows launches outside Git Bash/pwsh7, so use
@@ -2386,6 +2421,23 @@ fn reveal_in_file_manager(path: &Path) {
     }
 }
 
+fn paint_hidden_window(raw: u64) -> bool {
+    #[cfg(windows)]
+    {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn PostMessageW(window: *mut std::ffi::c_void, message: u32, wparam: usize, lparam: isize) -> i32;
+        }
+        // Windows does not invalidate hidden windows. Explicitly queue WM_PAINT
+        // so winit draws the first frame before we make the HWND visible.
+        // SAFETY: raw is the HWND obtained from Iced's live window; no pointers
+        // are dereferenced or passed in the message payload.
+        unsafe { PostMessageW(raw as usize as *mut _, 0x000F, 0, 0) != 0 }
+    }
+    #[cfg(not(windows))]
+    { let _ = raw; false }
+}
+
 pub fn main() -> iced::Result {
     let icon = iced::window::icon::from_file_data(include_bytes!("../icon.png"), None).ok();
     iced::application(State::boot, update, view)
@@ -2397,6 +2449,7 @@ pub fn main() -> iced::Result {
             icon,
             size: load_window_size(),
             min_size: Some(MIN_WINDOW_SIZE),
+            visible: !cfg!(windows),
             position: load_window_position(),
             maximized: load_window_maximized(),
             exit_on_close_request: false,
