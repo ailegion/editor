@@ -1,4 +1,5 @@
 mod acp;
+mod terminal;
 mod chat;
 mod code_editor;
 mod command_palette;
@@ -164,6 +165,7 @@ enum AiMode {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PaneKind {
+    Terminal,
     Sidebar,
     Main,
     Ai,
@@ -184,6 +186,8 @@ fn tabs_to_close(count: usize, anchor: usize, scope: TabCloseScope) -> Vec<usize
 
 #[derive(Debug, Clone)]
 enum Message {
+    TerminalToggle,
+    Terminal(terminal::Message),
     EditorAction(cosmic_text::Action),
     ToggleFold(usize),
     Search(code_editor::search::Message),
@@ -305,6 +309,9 @@ struct State {
     ai_mode: AiMode,
     chat: chat::ChatState,
     acp: acp::AcpState,
+    terminal: terminal::Terminal,
+    terminal_visible: bool,
+    terminal_started: bool,
 }
 
 impl State {
@@ -383,6 +390,9 @@ impl State {
             ai_mode: AiMode::default(),
             chat: chat::ChatState::default(),
             acp: acp::AcpState::default(),
+            terminal: terminal::Terminal::default(),
+            terminal_visible: false,
+            terminal_started: false,
         }
     }
 
@@ -706,6 +716,33 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         return Task::none();
     }
     match message {
+        Message::TerminalToggle => {
+            state.terminal_visible = !state.terminal_visible;
+            if state.terminal_visible {
+                if !state.terminal_started {
+                    state.terminal.start(&state.root_or_cwd());
+                    state.terminal_started = true;
+                }
+                state.terminal.focused = true;
+                task = iced::widget::operation::focus("terminal-canvas");
+                let main = state.panes.iter().find(|(_, kind)| **kind == PaneKind::Main).map(|(pane, _)| *pane);
+                if let Some(main) = main {
+                    if let Some((_, split)) = state.panes.split(pane_grid::Axis::Horizontal, main, PaneKind::Terminal) {
+                        state.panes.resize(split, 0.7);
+                    }
+                }
+
+            } else {
+                state.terminal.focused = false;
+                let pane = state.panes.iter().find(|(_, kind)| **kind == PaneKind::Terminal).map(|(pane, _)| *pane);
+                if let Some(pane) = pane { state.panes.close(pane); }
+            }
+        }
+        Message::Terminal(terminal::Message::Hide) => return update(state, Message::TerminalToggle),
+        Message::Terminal(terminal::Message::Restart) => {
+            state.terminal.start(&state.root_or_cwd());
+        }
+        Message::Terminal(message) => task = state.terminal.update(message).map(Message::Terminal),
         Message::ToggleFold(line) => {
             if let Some(tab) = state.tabs.get_mut(state.active_tab) { tab.content.toggle_fold(line); }
         }
@@ -872,6 +909,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.notify("Could not save recovery. Save your files before closing.");
                 return Task::none();
             }
+            state.terminal.shutdown();
             return iced::exit();
         }
         Message::ReopenClosedTab => {
@@ -1128,6 +1166,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
 
         Message::KeyPressed(key, modifiers) => {
+            if modifiers.control() && key.as_ref() == keyboard::Key::Character("`") {
+                return update(state, Message::TerminalToggle);
+            }
+            if state.terminal_visible && state.terminal.focused
+                && !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible
+                && key == keyboard::Key::Named(keyboard::key::Named::Escape) {
+                return Task::none();
+            }
             if key == keyboard::Key::Named(keyboard::key::Named::Escape) && (state.creating.is_some() || state.renaming.is_some()) {
                 state.creating = None;
                 state.renaming = None;
@@ -1347,6 +1393,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             task = acp::update(&mut state.acp, msg, cwd).map(Message::Acp);
         }
         Message::Tick => {
+            state.terminal.poll();
             if state.notice.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(8)) { state.notice = None; }
             state.chat.poll();
             state.acp.poll();
@@ -1385,6 +1432,8 @@ fn view(state: &State) -> Element<'_, Message> {
 
     let panes = PaneGrid::new(&state.panes, |_id, kind, _is_maximized| {
         let content: Element<'_, Message> = match kind {
+            PaneKind::Terminal => terminal::view(&state.terminal,
+                !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible).map(Message::Terminal),
             PaneKind::Sidebar => container(view_sidebar(state))
                 .padding(0)
                 .width(Length::Fill)
@@ -1627,6 +1676,7 @@ fn command_list(state: &State) -> Vec<command_palette::Command> {
         Command { label: ViewAction::ZoomReset.to_string(), message: Message::ViewAction(ViewAction::ZoomReset) },
         Command { label: "Toggle Sidebar".to_string(), message: Message::SidebarToggle },
         Command { label: "Toggle Git Panel".to_string(), message: Message::GitPanelToggle },
+        Command { label: "Toggle Terminal (Ctrl+`)".into(), message: Message::TerminalToggle },
         Command { label: "Toggle AI Panel".to_string(), message: Message::AiToggle },
         Command { label: "Refresh File Tree".to_string(), message: Message::RefreshTree },
         Command { label: "Refresh Git Status".to_string(), message: Message::Git(git::Message::Refresh) },
@@ -1735,6 +1785,7 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
             ViewAction::ZoomReset.to_string(),
             Message::ViewAction(ViewAction::ZoomReset)
         )),
+        (menu_button("Toggle Terminal (Ctrl+`)".into(), Message::TerminalToggle)),
     );
 
     let theme_menu_button = menu_button("Theme".to_string(), Message::Noop).width(Length::Shrink);
@@ -1781,7 +1832,8 @@ fn view_status_bar(state: &State) -> Element<'_, Message> {
         bar = bar.push(text(language.to_string()).size(12).style(iced::widget::text::secondary));
     }
 
-    let bar = bar.push(icon_control(lucide_icons::Icon::Sparkles, "Toggle AI panel", Some(Message::AiToggle), state.ai_visible))
+    let bar = bar.push(icon_control(lucide_icons::Icon::Terminal, "Toggle terminal (Ctrl+`)", Some(Message::TerminalToggle), state.terminal_visible))
+        .push(icon_control(lucide_icons::Icon::Sparkles, "Toggle AI panel", Some(Message::AiToggle), state.ai_visible))
         .align_y(iced::Alignment::Center).padding([0, 6]);
     container(bar).width(Length::Fill).style(chrome_style).into()
 }
@@ -2053,7 +2105,8 @@ fn handle_raw_key_event(
         return None;
     };
     let is_escape = modified_key == keyboard::Key::Named(keyboard::key::Named::Escape);
-    if status == iced::event::Status::Ignored || is_escape {
+    let terminal_shortcut = modifiers.control() && modified_key.as_ref() == keyboard::Key::Character("`");
+    if status == iced::event::Status::Ignored || is_escape || terminal_shortcut {
         Some(Message::KeyPressed(modified_key, modifiers))
     } else {
         None

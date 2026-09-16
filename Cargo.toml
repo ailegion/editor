@@ -21,6 +21,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
 ureq = "3.3.0"
+portable-pty = "0.9.0"
+vt100 = "0.16.2"
 
 [package.metadata.bundle]
 name = "editor"
