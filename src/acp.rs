@@ -122,8 +122,6 @@ pub struct AcpState {
     cancel_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     streaming: bool,
     started: bool,
-    thinking_index: Option<usize>,
-    assistant_index: Option<usize>,
     usage: Option<Usage>,
     pending_permission: Option<PendingPermission>,
     permission_queue: std::collections::VecDeque<PendingPermission>,
@@ -150,8 +148,6 @@ impl Default for AcpState {
             cancel_tx: None,
             streaming: false,
             started: false,
-            thinking_index: None,
-            assistant_index: None,
             usage: None,
             pending_permission: None,
             permission_queue: Default::default(),
@@ -192,22 +188,12 @@ impl AcpState {
         let Some(rx) = &self.rx else { return };
         let mut finished = false;
         let mut new_session_id = None;
+        let mut transcript_changed = false;
         while let Ok(event) = rx.try_recv() {
+            transcript_changed |= matches!(&event, Event::Delta(_) | Event::ThoughtDelta(_) | Event::ToolCall { .. } | Event::ToolCallUpdate { .. } | Event::ToolDetails(_, _) | Event::Error(_));
             match event {
-                Event::Delta(text) => {
-                    if let Some(i) = self.assistant_index {
-                        if let Some(Entry::Assistant { content }) = self.entries.get_mut(i) {
-                            content.push_str(&text);
-                        }
-                    }
-                }
-                Event::ThoughtDelta(text) => {
-                    if let Some(i) = self.thinking_index {
-                        if let Some(Entry::Thinking { content }) = self.entries.get_mut(i) {
-                            content.push_str(&text);
-                        }
-                    }
-                }
+                Event::Delta(text) => Self::append_chunk(&mut self.entries, text, false),
+                Event::ThoughtDelta(text) => Self::append_chunk(&mut self.entries, text, true),
                 Event::Usage(used, size, cost) => {
                     self.usage = Some(Usage { used, size, cost });
                 }
@@ -230,11 +216,7 @@ impl AcpState {
                 }
                 Event::Done => finished = true,
                 Event::Error(err) => {
-                    if let Some(i) = self.assistant_index {
-                        if let Some(Entry::Assistant { content }) = self.entries.get_mut(i) {
-                            content.push_str(&format!("\n[error: {err}]"));
-                        }
-                    }
+                    Self::append_chunk(&mut self.entries, format!("\n[error: {err}]"), false);
                     finished = true;
                 }
             }
@@ -260,10 +242,25 @@ impl AcpState {
             self.pending_permission = None;
             self.permission_queue.clear();
             self.just_finished = true;
+        }
+        // A notification dispatched just after the prompt result must also be saved.
+        if finished || (!self.streaming && transcript_changed) {
             self.save_current_thread();
             if let Some(cwd) = self.cwd.clone() {
                 self.persist(&cwd);
             }
+        }
+    }
+
+    /// Coalesce only adjacent chunks. Tool activity closes the preceding reply,
+    /// so a later summary is appended below it instead of modifying an old bubble.
+    fn append_chunk(entries: &mut Vec<Entry>, chunk: String, thinking: bool) {
+        if chunk.is_empty() { return; }
+        match entries.last_mut() {
+            Some(Entry::Assistant { content }) if !thinking => content.push_str(&chunk),
+            Some(Entry::Thinking { content }) if thinking => content.push_str(&chunk),
+            _ if thinking => entries.push(Entry::Thinking { content: chunk }),
+            _ => entries.push(Entry::Assistant { content: chunk }),
         }
     }
 
@@ -600,14 +597,6 @@ impl AcpState {
             prompt.push(attachment.acp());
         }
         self.entries.push(Entry::User { content: display });
-        self.thinking_index = Some(self.entries.len());
-        self.entries.push(Entry::Thinking {
-            content: String::new(),
-        });
-        self.assistant_index = Some(self.entries.len());
-        self.entries.push(Entry::Assistant {
-            content: String::new(),
-        });
         self.streaming = true;
         if let Some(tx) = &self.prompt_tx {
             let _ = tx.send(prompt);
@@ -632,8 +621,6 @@ impl AcpState {
         self.entries.clear();
         self.input = text_editor::Content::new();
         self.attachments.clear();
-        self.thinking_index = None;
-        self.assistant_index = None;
         self.usage = None;
         self.reset_connection();
         self.persist(cwd);
@@ -649,8 +636,6 @@ impl AcpState {
         self.attachments.clear();
         self.input = text_editor::Content::new();
         self.entries = self.threads[index].entries.clone();
-        self.thinking_index = None;
-        self.assistant_index = None;
         self.usage = None;
         self.reset_connection();
         self.persist(cwd);
@@ -765,9 +750,8 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
                 .on_press(Message::UsePrompt("Review my current changes for bugs and regressions. Explain your findings before editing.".into())),
         ].spacing(12)).padding([24, 8]));
     }
-    let last = state.entries.len().saturating_sub(1);
     for (i, entry) in state.entries.iter().enumerate() {
-        if let Entry::Thinking { content } = entry {
+        if let Entry::Thinking { content } | Entry::Assistant { content } = entry {
             if content.is_empty() {
                 continue;
             }
@@ -775,9 +759,42 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
         let card: Element<'_, Message> = match entry {
             Entry::ToolCall { title, status, details, .. } => {
                 let expanded = state.expanded_thinking.contains(&i);
-                let mut card = column![row![text(status.icon()).size(12), button(text(title.clone()).size(13)).style(crate::flat_button_style).on_press(Message::ToggleThinking(i))].spacing(6)];
-                if expanded && !details.is_empty() { card = card.push(text(details.clone()).size(12)); }
-                card.into()
+                let status = *status;
+                let badge = container(text(status.icon()).size(10))
+                    .padding([3, 7])
+                    .style(move |theme: &iced::Theme| {
+                        let palette = theme.extended_palette();
+                        let pair = match status {
+                            ToolStatus::Completed => palette.success.weak,
+                            ToolStatus::Failed => palette.danger.weak,
+                            ToolStatus::InProgress => palette.primary.weak,
+                            ToolStatus::Pending => palette.secondary.weak,
+                        };
+                        iced::widget::container::Style {
+                            background: Some(pair.color.into()), text_color: Some(pair.text),
+                            border: iced::Border::default().rounded(4), ..Default::default()
+                        }
+                    });
+                let heading = row![
+                    text("Tool activity").size(11).style(iced::widget::text::secondary),
+                    Space::new().width(Length::Fill), badge,
+                    text(if details.is_empty() { "" } else if expanded { "Hide" } else { "Details" }).size(11),
+                ].spacing(8).align_y(iced::Alignment::Center);
+                let summary = column![heading, text(title.clone()).size(12).width(Length::Fill)].spacing(6);
+                let mut card = column![button(summary).padding(0).width(Length::Fill)
+                    .style(crate::flat_button_style)
+                    .on_press_maybe((!details.is_empty()).then_some(Message::ToggleThinking(i)))].spacing(10);
+                if expanded && !details.is_empty() {
+                    card = card.push(container(text(details.clone()).size(12).font(iced::Font::MONOSPACE)).padding(8).width(Length::Fill).style(container::dark));
+                }
+                container(card).padding(10).width(Length::Fill).style(|theme: &iced::Theme| {
+                    let palette = theme.extended_palette();
+                    iced::widget::container::Style {
+                        background: Some(palette.background.weak.color.into()),
+                        border: iced::Border { color: palette.background.strong.color, width: 1.0, radius: 6.0.into() },
+                        ..Default::default()
+                    }
+                }).into()
             }
             Entry::User { content } => labeled_copyable("You", content),
             Entry::Thinking { content } => {
@@ -788,21 +805,23 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
                 section.into()
             },
             Entry::Assistant { content } => {
-                if content.is_empty() && i == last && state.streaming {
-                    column![
-                        text(state.provider),
-                        text("Waiting for response...").style(|theme: &iced::Theme| {
-                            let palette = theme.extended_palette();
-                            iced::widget::text::Style { color: Some(palette.background.strong.color) }
-                        }),
-                    ]
-                    .into()
-                } else {
-                    labeled_copyable(state.provider, content)
-                }
+                container(labeled_copyable(state.provider, content)).padding(12).width(Length::Fill)
+                    .style(|theme: &iced::Theme| {
+                        let palette = theme.extended_palette();
+                        iced::widget::container::Style {
+                            background: Some(palette.background.base.color.into()),
+                            border: iced::Border { color: palette.primary.weak.color, width: 1.0, radius: 6.0.into() },
+                            ..Default::default()
+                        }
+                    }).into()
             }
+
         };
         messages = messages.push(container(card).padding(6));
+    }
+    if state.streaming {
+        messages = messages.push(container(text(if state.stopping { "Stopping..." } else { "Assistant is working..." })
+            .size(12).style(iced::widget::text::secondary)).padding(12));
     }
     let messages = scrollable(messages).anchor_bottom().height(Length::Fill);
 
@@ -851,7 +870,7 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
         column![
             text_editor(&state.input)
                 .size(13)
-                .placeholder("Ask Claude… (Cmd/Ctrl+Enter to send)")
+                .placeholder("Ask your assistant… (Cmd/Ctrl+Enter to send)")
                 .on_action(Message::InputChanged)
                 .height(Length::Fixed(60.0))
                 .key_binding(|key_press| {
@@ -916,6 +935,46 @@ fn format_tokens(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_reply_follows_tools_and_survives_late_completion_updates() {
+        let mut state = AcpState::default();
+        let (tx, rx) = mpsc::channel();
+        state.rx = Some(rx);
+        state.streaming = true;
+        state.threads.push(Thread::default());
+        state.entries.push(Entry::User { content: "Review project".into() });
+        tx.send(Event::Delta("I will inspect it.".into())).unwrap();
+        tx.send(Event::ToolCall { id: "read".into(), title: "Read main.rs".into(), status: ToolStatus::InProgress }).unwrap();
+        tx.send(Event::Delta("The project ".into())).unwrap();
+        tx.send(Event::ToolCallUpdate { id: "read".into(), title: None, status: Some(ToolStatus::Completed) }).unwrap();
+        tx.send(Event::Delta("looks good.".into())).unwrap();
+        tx.send(Event::Done).unwrap();
+        state.poll();
+        assert_eq!(state.entries.len(), 4);
+        assert!(matches!(&state.entries[1], Entry::Assistant { content } if content == "I will inspect it."));
+        assert!(matches!(&state.entries[2], Entry::ToolCall { status: ToolStatus::Completed, .. }));
+        assert!(matches!(&state.entries[3], Entry::Assistant { content } if content == "The project looks good."));
+        // Late notifications must not be lost from the saved transcript either.
+        tx.send(Event::Delta(" No bugs found.".into())).unwrap();
+        state.poll();
+        assert!(matches!(state.threads[0].entries.last(), Some(Entry::Assistant { content }) if content == "The project looks good. No bugs found."));
+        assert!(!state.streaming);
+    }
+
+    #[test]
+    fn thinking_and_errors_preserve_timeline_without_empty_bubbles() {
+        let mut entries = Vec::new();
+        AcpState::append_chunk(&mut entries, String::new(), false);
+        assert!(entries.is_empty());
+        AcpState::append_chunk(&mut entries, "Plan".into(), true);
+        AcpState::append_chunk(&mut entries, "ning".into(), true);
+        AcpState::upsert_tool_call(&mut entries, "edit".into(), Some("Edit file".into()), None);
+        AcpState::append_chunk(&mut entries, "[error: disconnected]".into(), false);
+        assert_eq!(entries.len(), 3);
+        assert!(matches!(&entries[0], Entry::Thinking { content } if content == "Planning"));
+        assert!(matches!(&entries[2], Entry::Assistant { content } if content.contains("disconnected")));
+    }
 
     fn permission(scope: &str) -> (PendingPermission, tokio::sync::oneshot::Receiver<String>) {
         let (respond, rx) = tokio::sync::oneshot::channel();
