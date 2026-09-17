@@ -40,7 +40,8 @@ The first launch may download the adapter. Connection errors appear in the conve
 - **Cmd/Ctrl+Enter** sends the prompt, including attachment-only prompts.
 - Tool requests show approval controls and details. ACP tool cards expand to show
   supplied output and before/after edits. Approval applies to the entire tool request.
-- **Allow identical operation for this session** remembers only the same tool input;
+- Approval cards show decoded request details and separate **Reject** / **Allow once**
+  actions. **Remember for this session** remembers only the same tool input after allowing;
   **Reset session approvals** revokes these grants. New conversations, project changes,
   or ACP connection resets clear them. ACP can also offer its own named permission
   choices, whose persistence is controlled by the agent.
