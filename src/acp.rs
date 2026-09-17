@@ -91,6 +91,7 @@ enum Event {
     Delta(String),
     ThoughtDelta(String),
     Usage(u64, u64, Option<(f64, String)>),
+    Model(Option<String>),
     SessionId(String),
     Permission(PendingPermission),
     ToolCall {
@@ -124,6 +125,8 @@ pub struct AcpState {
     streaming: bool,
     started: bool,
     usage: Option<Usage>,
+    model: Option<String>,
+    usage_open: bool,
     pending_permission: Option<PendingPermission>,
     permission_queue: std::collections::VecDeque<PendingPermission>,
     just_finished: bool,
@@ -150,6 +153,8 @@ impl Default for AcpState {
             streaming: false,
             started: false,
             usage: None,
+            model: None,
+            usage_open: false,
             pending_permission: None,
             permission_queue: Default::default(),
             just_finished: false,
@@ -163,6 +168,8 @@ impl Default for AcpState {
 #[derive(Debug, Clone)]
 pub enum Message {
     Composer(crate::ai_composer::Action),
+    ToggleUsage,
+    CloseUsage,
     NewThread,
     SwitchThread(usize),
     ThreadMenuToggle,
@@ -196,6 +203,7 @@ impl AcpState {
             match event {
                 Event::Delta(text) => Self::append_chunk(&mut self.entries, text, false),
                 Event::ThoughtDelta(text) => Self::append_chunk(&mut self.entries, text, true),
+                Event::Model(model) => self.model = model,
                 Event::Usage(used, size, cost) => {
                     self.usage = Some(Usage { used, size, cost });
                 }
@@ -364,6 +372,8 @@ impl AcpState {
 
     fn reset_connection(&mut self) {
         self.session_grants.clear();
+        self.model = None;
+        self.usage_open = false;
         self.stopping = false;
         self.expanded_thinking.clear();
         self.started = false;
@@ -435,6 +445,9 @@ impl AcpState {
                                     if let ContentBlock::Text(text) = chunk.content {
                                         let _ = notify_tx.send(Event::ThoughtDelta(text.text));
                                     }
+                                }
+                                SessionUpdate::ConfigOptionUpdate(update) => {
+                                    let _ = notify_tx.send(Event::Model(model_from_options(&update.config_options)));
                                 }
                                 SessionUpdate::UsageUpdate(usage) => {
                                     let cost = usage.cost.map(|c| (c.amount, c.currency));
@@ -524,7 +537,8 @@ impl AcpState {
                                     .send_request(LoadSessionRequest::new(id.clone(), cwd.clone()))
                                     .block_task()
                                     .await;
-                                if loaded.is_ok() {
+                                if let Ok(loaded) = loaded {
+                                    let _ = loop_tx.send(Event::Model(model_from_options(loaded.config_options.as_deref().unwrap_or_default())));
                                     loaded_session_id = Some(SessionId::new(id));
                                 }
                             }
@@ -537,6 +551,7 @@ impl AcpState {
                                     .send_request(NewSessionRequest::new(cwd))
                                     .block_task()
                                     .await?;
+                                let _ = loop_tx.send(Event::Model(model_from_options(session.config_options.as_deref().unwrap_or_default())));
                                 session.session_id
                             }
                         };
@@ -654,6 +669,8 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
     state.cwd = Some(cwd.clone());
     match message {
         Message::Composer(_) => {},
+        Message::ToggleUsage => state.usage_open = !state.usage_open,
+        Message::CloseUsage => state.usage_open = false,
         Message::NewThread => state.new_thread(&cwd),
         Message::SwitchThread(i) => {
             state.switch_thread(i, &cwd);
@@ -852,21 +869,11 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
     if !state.session_grants.is_empty() {
         bottom = bottom.push(button("Reset session approvals").style(crate::flat_button_style).on_press(Message::ResetPermissions));
     }
-    if let Some(usage) = &state.usage {
-        let percent = if usage.size > 0 {
-            usage.used as f64 / usage.size as f64 * 100.0
-        } else {
-            0.0
-        };
-        bottom = bottom.push(text(format!(
-            "Context: {percent:.0}% ({}/{})",
-            format_tokens(usage.used),
-            format_tokens(usage.size)
-        )));
-        if let Some((amount, currency)) = &usage.cost {
-            bottom = bottom.push(text(format!("{amount:.2} {currency}")));
-        }
-    }
+    let usage_ring = crate::ai_usage::view(crate::ai_usage::Info {
+        provider: format!("{} ACP", state.provider), model: state.model.clone(),
+        used: state.usage.as_ref().map(|u| u.used), capacity: state.usage.as_ref().map(|u| u.size),
+        cost: state.usage.as_ref().and_then(|u| u.cost.clone()),
+    }, state.usage_open, Message::ToggleUsage, Message::CloseUsage);
 
     let awaiting_permission = state.pending_permission.is_some();
     let send_button = if state.streaming {
@@ -891,7 +898,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
                         text_editor::Binding::from_key_press(key_press)
                     }
                 }),
-            row![text(if state.stopping { "Stopping…" } else if awaiting_permission { "Waiting for approval" } else if state.streaming { "Working…" } else { "Ready" }).size(12).style(iced::widget::text::secondary), Space::new().width(Length::Fill), send_button],
+            row![text(if state.stopping { "Stopping…" } else if awaiting_permission { "Waiting for approval" } else if state.streaming { "Working…" } else { "Ready" }).size(12).style(iced::widget::text::secondary), Space::new().width(Length::Fill), usage_ring, send_button].spacing(6).align_y(iced::Alignment::Center),
         ]
         .spacing(4).into(),
         &state.attachments, composer, Message::Composer,
@@ -932,19 +939,30 @@ fn threads_path(cwd: &Path, provider: &str) -> Option<PathBuf> {
     )
 }
 
-fn format_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{}k", n / 1_000)
-    } else {
-        n.to_string()
-    }
+fn model_from_options(options: &[agent_client_protocol::schema::v1::SessionConfigOption]) -> Option<String> {
+    use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigOptionCategory};
+    options.iter().find_map(|option| {
+        if option.category != Some(SessionConfigOptionCategory::Model) && option.id.0.as_ref() != "model" { return None; }
+        match &option.kind {
+            SessionConfigKind::Select(select) => Some(select.current_value.0.to_string()),
+            _ => None,
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_metadata_is_read_from_session_configuration() {
+        let options = serde_json::from_value::<Vec<agent_client_protocol::schema::v1::SessionConfigOption>>(serde_json::json!([
+            {"id":"mode", "name":"Mode", "type":"select", "currentValue":"code", "options":[]},
+            {"id":"agent-model", "category":"model", "name":"Model", "type":"select", "currentValue":"reported-model", "options":[]}
+        ])).unwrap();
+        assert_eq!(model_from_options(&options).as_deref(), Some("reported-model"));
+        assert_eq!(model_from_options(&[]), None);
+    }
 
     #[test]
     fn remember_checkbox_grants_only_when_allow_is_chosen() {

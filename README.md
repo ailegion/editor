@@ -38,6 +38,9 @@ The first launch may download the adapter. Connection errors appear in the conve
 - The composer's code icon attaches the current selection, or the active editor buffer
   including unsaved changes. Attachments are snapshots, not live links.
 - **Cmd/Ctrl+Enter** sends the prompt, including attachment-only prompts.
+- The ACP composer's context ring fills with used context. Hover for the percentage;
+  click for model, token usage, context limit, remaining space, and reported cost.
+  Unknown values are shown as not reported. Escape or clicking outside closes the overlay.
 - Tool requests show approval controls and details. ACP tool cards expand to show
   supplied output and before/after edits. Approval applies to the entire tool request.
 - Approval cards show decoded request details and separate **Reject** / **Allow once**
