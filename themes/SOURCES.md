@@ -17,4 +17,6 @@ installed VS Code extension (`package.json` with `contributes.themes`), keeps th
 labels); everything else is copied as published.
 
 The default Dark+ and Light+ themes are compiled into the binary from `src/theme/default/`
-(`microsoft/vscode` `extensions/theme-defaults/themes` @ the same commit, MIT).
+(`microsoft/vscode` `extensions/theme-defaults/themes` @ the same commit, MIT). `build.rs`
+copies their `LICENSE.txt` to `vscode.theme-defaults/LICENSE.txt` here so it ships with the
+other themes; that folder has no `package.json`, so it isn't loaded as a theme.

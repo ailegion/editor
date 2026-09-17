@@ -1,2 +1,4 @@
 /target
 .DS_Store
+# Copied from src/theme/default by build.rs
+/themes/vscode.theme-defaults/
