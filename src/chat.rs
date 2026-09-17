@@ -167,6 +167,7 @@ impl Default for ChatState {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Composer(crate::ai_composer::Action),
     ConnectionNameChanged(String),
     BaseUrlChanged(String),
     ApiKeyChanged(String),
@@ -381,6 +382,7 @@ impl ChatState {
 pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Message> {
     state.set_project(&cwd);
     match message {
+        Message::Composer(_) => {},
         Message::ConnectionNameChanged(text) => state.connection_name = text,
         Message::BaseUrlChanged(text) => {
             state.session_grants.clear();
@@ -438,7 +440,7 @@ pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Mes
     Task::none()
 }
 
-pub fn view(state: &ChatState) -> Element<'_, Message> {
+pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>) -> Element<'a, Message> {
     let mut header = column![row![
         text("Conversation").size(12),
         Space::new().width(Length::Fill),
@@ -620,7 +622,7 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
         );
     }
     if !state.session_grants.is_empty() { bottom = bottom.push(button("Reset session approvals").style(crate::flat_button_style).on_press(Message::ResetPermissions)); }
-    bottom = bottom.push(
+    bottom = bottom.push(crate::ai_composer::view(
         column![
             text_editor(&state.input)
                 .size(13)
@@ -653,8 +655,9 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
             ]
             .align_y(iced::Alignment::Center),
         ]
-        .spacing(4),
-    );
+        .spacing(4).into(),
+        &state.attachments, composer, Message::Composer,
+    ));
 
     container(column![header, messages, bottom].spacing(8))
         .padding(8)

@@ -30,10 +30,12 @@ ACP starts `npx --yes @agentclientprotocol/claude-agent-acp` or
 credentials before chatting. Codex adapter setup: https://github.com/zed-industries/codex-acp.
 The first launch may download the adapter. Connection errors appear in the conversation.
 
-- **Attach files** or drop files into the editor while the AI sidebar is open.
+- Drag project-tree files or external files/images onto the AI message composer.
+  The composer highlights while dragging; drops elsewhere do not attach files.
+  A paperclip in the composer opens the file picker as a fallback.
   Supports UTF-8 text/code and PNG, JPEG, GIF, WebP images; up to 16 attachments,
   8 MiB each. Review or remove attachments before sending.
-- **Reference code** attaches the current selection, or the active editor buffer
+- The composer's code icon attaches the current selection, or the active editor buffer
   including unsaved changes. Attachments are snapshots, not live links.
 - **Cmd/Ctrl+Enter** sends the prompt, including attachment-only prompts.
 - Tool requests show approval controls and details. ACP tool cards expand to show

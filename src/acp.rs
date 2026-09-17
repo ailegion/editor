@@ -161,6 +161,7 @@ impl Default for AcpState {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Composer(crate::ai_composer::Action),
     NewThread,
     SwitchThread(usize),
     ThreadMenuToggle,
@@ -646,6 +647,7 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
     state.ensure_loaded(&cwd);
     state.cwd = Some(cwd.clone());
     match message {
+        Message::Composer(_) => {},
         Message::NewThread => state.new_thread(&cwd),
         Message::SwitchThread(i) => {
             state.switch_thread(i, &cwd);
@@ -682,7 +684,7 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
     Task::none()
 }
 
-pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
+pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer::Context<'a>) -> Element<'a, Message> {
     let top_bar = row![
         text("Conversation").size(12),
         Space::new().width(Length::Fill),
@@ -866,7 +868,7 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
         crate::icon_control(lucide_icons::Icon::SendHorizonal, "Send message (Cmd/Ctrl+Enter)",
             (!awaiting_permission && (!state.input.text().trim().is_empty() || !state.attachments.is_empty())).then_some(Message::Send), false)
     };
-    bottom = bottom.push(
+    bottom = bottom.push(crate::ai_composer::view(
         column![
             text_editor(&state.input)
                 .size(13)
@@ -884,8 +886,9 @@ pub fn view(state: &AcpState, cwd: PathBuf) -> Element<'_, Message> {
                 }),
             row![text(if state.stopping { "Stopping…" } else if awaiting_permission { "Waiting for approval" } else if state.streaming { "Working…" } else { "Ready" }).size(12).style(iced::widget::text::secondary), Space::new().width(Length::Fill), send_button],
         ]
-        .spacing(4),
-    );
+        .spacing(4).into(),
+        &state.attachments, composer, Message::Composer,
+    ));
 
     container(column![header, messages, bottom.spacing(6)].spacing(8)).padding(8).height(Length::Fill).into()
 }

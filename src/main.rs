@@ -1,3 +1,4 @@
+mod ai_composer;
 mod ai_context;
 mod acp;
 mod terminal;
@@ -266,6 +267,8 @@ enum Message {
     SidebarSelected(SidebarMode),
     AiToggle,
     AiModeSelected(AiMode),
+    TreeDragReleased,
+    TreeDragCancel,
     AiAttach,
     AiFiles(Vec<PathBuf>),
     AiAttachmentsLoaded(AiMode, PathBuf, Vec<Result<ai_context::Attachment, String>>),
@@ -1531,6 +1534,32 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::AiModeSelected(mode) => state.ai_mode = mode,
+        Message::Chat(chat::Message::Composer(action))
+        | Message::Acp(acp::Message::Composer(action))
+        | Message::Codex(acp::Message::Composer(action)) => {
+            let next = match action {
+                ai_composer::Action::Attach => Message::AiAttach,
+                ai_composer::Action::Reference => Message::AiReference,
+                ai_composer::Action::Remove(index) => Message::AiRemoveAttachment(index),
+                ai_composer::Action::Drop(paths) => {
+                    if let Some(tree) = &mut state.tree {
+                        let _ = tree.update(DirectoryTreeEvent::Drag(iced_swdir_tree::DragMsg::Cancelled));
+                    }
+                    Message::AiFiles(paths)
+                }
+            };
+            return update(state, next);
+        }
+        Message::TreeDragReleased => {
+            // Let the tree process its own release/click before clearing an
+            // abandoned drag; raw subscriptions also see captured events.
+            task = Task::done(Message::TreeDragCancel);
+        }
+        Message::TreeDragCancel => {
+            if let Some(tree) = &mut state.tree {
+                task = tree.update(DirectoryTreeEvent::Drag(iced_swdir_tree::DragMsg::Cancelled)).map(Message::Tree);
+            }
+        }
         Message::AiAttach => {
             task = Task::perform(async { rfd::AsyncFileDialog::new().pick_files().await.unwrap_or_default().into_iter().map(|f| f.path().to_path_buf()).collect() }, Message::AiFiles);
         }
@@ -1749,21 +1778,17 @@ fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
         Space::new().width(Length::Fill),
         icon_control(lucide_icons::Icon::X, "Close AI panel", Some(Message::AiToggle), false)
     ].spacing(6).padding(8);
-    let attachments = match state.ai_mode { AiMode::Http => &state.chat.attachments, AiMode::Acp => &state.acp.attachments, AiMode::Codex => &state.codex.attachments };
-    let mut context = column![row![
-        button("Attach files").style(flat_button_style).on_press(Message::AiAttach),
-        button("Reference code").style(flat_button_style).on_press_maybe(state.tabs.get(state.active_tab).map(|_| Message::AiReference)),
-    ].spacing(4), text("Drop images or files · Reference selection or active file").size(11)].spacing(4);
-    for (i, attachment) in attachments.iter().enumerate() {
-        context = context.push(row![text(attachment.name.clone()).size(11).width(Length::Fill), button("Remove").style(flat_button_style).on_press(Message::AiRemoveAttachment(i))].spacing(4));
-    }
+    let composer = ai_composer::Context {
+        sources: state.tree.as_ref().map(|tree| tree.drag_sources()).unwrap_or_default(),
+        can_reference: state.tabs.get(state.active_tab).is_some(),
+    };
     let panel: Element<'_, Message> = match state.ai_mode {
-        AiMode::Http => chat::view(&state.chat).map(Message::Chat),
-        AiMode::Codex => acp::view(&state.codex, state.root_or_cwd()).map(Message::Codex),
-        AiMode::Acp => acp::view(&state.acp, state.root_or_cwd()).map(Message::Acp),
+        AiMode::Http => chat::view(&state.chat, composer).map(Message::Chat),
+        AiMode::Codex => acp::view(&state.codex, state.root_or_cwd(), composer).map(Message::Codex),
+        AiMode::Acp => acp::view(&state.acp, state.root_or_cwd(), composer).map(Message::Acp),
     };
 
-    column![mode_row, container(scrollable(context).height(Length::Shrink)).max_height(160).padding(8), panel].height(Length::Fill).into()
+    column![mode_row, panel].height(Length::Fill).into()
 }
 
 /// Shared 26px toolbar target with a 14px glyph and a discoverable label.
@@ -2381,7 +2406,6 @@ fn subscription(state: &State) -> Subscription<Message> {
     let keys = iced::event::listen_with(handle_raw_key_event);
     let tick = iced::time::every(Duration::from_millis(50)).map(|_| Message::Tick);
     let window_events = iced::window::events().map(|(id, event)| match event {
-        iced::window::Event::FileDropped(path) => Message::AiFiles(vec![path]),
         iced::window::Event::CloseRequested => Message::Exit,
         iced::window::Event::Opened { .. } => Message::WindowOpened(id),
         iced::window::Event::Resized(size) => Message::WindowResized(id, size),
@@ -2397,7 +2421,13 @@ fn subscription(state: &State) -> Subscription<Message> {
             _ => None,
         })
     };
-    Subscription::batch([keys, tick, window_events, first_frame])
+    let drag_cleanup = iced::event::listen_raw(|event, _, _| match event {
+        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => Some(Message::TreeDragReleased),
+        iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::TreeDragCancel),
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape), .. }) => Some(Message::TreeDragCancel),
+        _ => None,
+    });
+    Subscription::batch([keys, tick, window_events, first_frame, drag_cleanup])
 }
 
 /// `HOME` is unset on native Windows launches outside Git Bash/pwsh7, so use
