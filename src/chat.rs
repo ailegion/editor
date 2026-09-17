@@ -68,6 +68,7 @@ enum Event {
 /// blocking `recv()` in `request_permission`. Dropping it without sending (e.g. because the
 /// user hit Stop) reads as a denial on the other end.
 struct PendingPermission {
+    remember: bool,
     label: String,
     respond: mpsc::Sender<bool>,
 }
@@ -185,7 +186,7 @@ pub enum Message {
     Stop,
     Copy(String),
     PermissionChosen(bool),
-    AllowSession,
+    RememberPermission(bool),
     ResetPermissions,
     OllamaPreset,
 }
@@ -425,14 +426,12 @@ pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Mes
             state.test_connection();
         }
         Message::ResetPermissions => state.session_grants.clear(),
-        Message::AllowSession => {
-            if let Some(pending) = state.pending_permission.take() {
-                state.session_grants.insert(pending.label);
-                let _ = pending.respond.send(true);
-            }
+        Message::RememberPermission(remember) => {
+            if let Some(pending) = &mut state.pending_permission { pending.remember = remember; }
         }
         Message::PermissionChosen(allowed) => {
             if let Some(pending) = state.pending_permission.take() {
+                if allowed && pending.remember { state.session_grants.insert(pending.label); }
                 let _ = pending.respond.send(allowed);
             }
         }
@@ -594,32 +593,21 @@ pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>)
 
     let mut bottom = column![].spacing(4);
     if let Some(pending) = &state.pending_permission {
-        bottom = bottom.push(
-            container(
-                column![
-                    text("Review tool request").size(14),
-                    scrollable(text(pending.label.clone()).size(12)).height(Length::Fixed(140.0)),
-                    row![
-                        button(text("Accept")).on_press(Message::PermissionChosen(true)),
-                        button(text("Reject")).on_press(Message::PermissionChosen(false)),
-
-                    ]
-                    .spacing(6),
-                    button("Allow identical operation for session").on_press(Message::AllowSession),
-                ]
-                .spacing(6),
-            )
-            .padding(8)
-            .width(Length::Fill)
-            .style(|theme: &iced::Theme| {
-                let palette = theme.extended_palette();
-                iced::widget::container::Style {
-                    background: Some(palette.background.weak.color.into()),
-                    border: iced::Border::default().rounded(6.0),
-                    ..iced::widget::container::Style::default()
-                }
-            }),
-        );
+        use crate::ai_approval::{Card, Choice, ChoiceKind};
+        let (title, details) = pending.label.split_once('(').map(|(name, args)| {
+            let details = serde_json::from_str::<serde_json::Value>(args.strip_suffix(')').unwrap_or(args))
+                .map(|value| crate::ai_approval::format_input(&value)).unwrap_or_else(|_| args.to_string());
+            (name.to_string(), details)
+        }).unwrap_or_else(|| ("Review tool request".into(), pending.label.clone()));
+        bottom = bottom.push(crate::ai_approval::view(Card {
+            title, details: details.clone(),
+            choices: vec![
+                Choice { label: "Reject".into(), message: Message::PermissionChosen(false), kind: ChoiceKind::Reject },
+                Choice { label: if pending.remember { "Allow for session" } else { "Allow once" }.into(), message: Message::PermissionChosen(true), kind: ChoiceKind::Allow },
+            ],
+            remember: Some((pending.remember, Message::RememberPermission)),
+            copy: Message::Copy(details),
+        }));
     }
     if !state.session_grants.is_empty() { bottom = bottom.push(button("Reset session approvals").style(crate::flat_button_style).on_press(Message::ResetPermissions)); }
     bottom = bottom.push(crate::ai_composer::view(
@@ -751,7 +739,7 @@ fn run_conversation(
 /// the channel disconnects without a reply (e.g. the user hit Stop), that reads as a denial.
 fn request_permission(tx: &mpsc::Sender<Event>, label: &str) -> bool {
     let (respond, response) = mpsc::channel();
-    let request = PendingPermission { label: label.to_string(), respond };
+    let request = PendingPermission { label: label.to_string(), remember: false, respond };
     if tx.send(Event::PermissionRequest(request)).is_err() {
         return false;
     }
@@ -1080,6 +1068,17 @@ fn truncate(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remembering_a_rejected_request_does_not_grant_permission() {
+        let mut state = ChatState::default();
+        let (respond, reply) = mpsc::channel();
+        state.pending_permission = Some(PendingPermission { remember: false, label: "write_file({})".into(), respond });
+        let _ = update(&mut state, Message::RememberPermission(true), PathBuf::from("."));
+        let _ = update(&mut state, Message::PermissionChosen(false), PathBuf::from("."));
+        assert!(!reply.try_recv().unwrap());
+        assert!(state.session_grants.is_empty());
+    }
 
     #[test]
     fn project_changes_clear_grants_and_context() {

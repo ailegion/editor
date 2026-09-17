@@ -8,7 +8,7 @@ use std::sync::Arc;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest,
-    PermissionOptionId, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+    PermissionOptionId, PermissionOptionKind, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
     SessionUpdate, TextContent, ToolCallStatus,
 };
@@ -82,7 +82,8 @@ struct PendingPermission {
     details: String,
     allow_once: Option<String>,
     scope: Option<String>,
-    options: Vec<(String, String)>,
+    options: Vec<(String, String, PermissionOptionKind)>,
+    remember: bool,
     respond: tokio::sync::oneshot::Sender<String>,
 }
 
@@ -171,7 +172,7 @@ pub enum Message {
     Send,
     Stop,
     PermissionChosen(String),
-    AllowSession,
+    RememberPermission(bool),
     ResetPermissions,
     Copy(String),
 }
@@ -474,21 +475,26 @@ impl AcpState {
                                 .title
                                 .clone()
                                 .unwrap_or_else(|| "Permission requested".to_string());
-                            let options: Vec<(String, String)> = request
+                            let options: Vec<(String, String, PermissionOptionKind)> = request
                                 .options
                                 .iter()
-                                .map(|opt| (opt.option_id.0.to_string(), opt.name.clone()))
+                                .map(|opt| (opt.option_id.0.to_string(), opt.name.clone(), opt.kind))
                                 .collect();
 
                             let allow_once = request.options.iter().find(|o| o.kind == agent_client_protocol::schema::v1::PermissionOptionKind::AllowOnce).map(|o| o.option_id.0.to_string());
                             // Reuse approval only for an identical operation in this live session.
                             let scope = request.tool_call.fields.raw_input.as_ref().map(|input| format!("{title}:{input}"));
-                            let details = tool_details(request.tool_call.fields.content.as_deref().unwrap_or_default(), request.tool_call.fields.raw_input.as_ref());
+                            let mut details = tool_details(request.tool_call.fields.content.as_deref().unwrap_or_default(), None);
+                            if let Some(input) = &request.tool_call.fields.raw_input {
+                                if !details.is_empty() { details.push_str("\n\n"); }
+                                details.push_str(&crate::ai_approval::format_input(input));
+                            }
                             let (respond_tx, respond_rx) = tokio::sync::oneshot::channel::<String>();
                             let _ = permission_tx.send(Event::Permission(PendingPermission {
                                 title,
                                 details, allow_once, scope,
                                 options,
+                                remember: false,
                                 respond: respond_tx,
                             }));
 
@@ -666,16 +672,14 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
         Message::Send => state.send(cwd),
         Message::Stop => state.stop(),
         Message::ResetPermissions => state.session_grants.clear(),
-        Message::AllowSession => {
-            if let Some(pending) = state.pending_permission.take() {
-                if let (Some(scope), Some(option)) = (pending.scope, pending.allow_once) {
-                    state.session_grants.insert(scope);
-                    let _ = pending.respond.send(option);
-                }
-            }
+        Message::RememberPermission(remember) => {
+            if let Some(pending) = &mut state.pending_permission { pending.remember = remember; }
         }
         Message::PermissionChosen(option_id) => {
             if let Some(pending) = state.pending_permission.take() {
+                if pending.remember && pending.allow_once.as_deref() == Some(option_id.as_str()) {
+                    if let Some(scope) = pending.scope { state.session_grants.insert(scope); }
+                }
                 let _ = pending.respond.send(option_id);
             }
         }
@@ -829,18 +833,21 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
 
     let mut bottom = column![];
     if let Some(pending) = &state.pending_permission {
-        bottom = bottom.push(text("Approval needed").size(14));
-        bottom = bottom.push(text(pending.title.clone()).size(13));
-        bottom = bottom.push(scrollable(text(pending.details.clone()).size(12)).height(Length::Fixed(140.0)));
-        if pending.allow_once.is_some() && pending.scope.is_some() {
-            bottom = bottom.push(button("Allow identical operation for this session").on_press(Message::AllowSession));
-        }
-        let mut options = column![].spacing(4);
-        for (option_id, name) in &pending.options {
-            options = options
-                .push(button(text(name.clone())).on_press(Message::PermissionChosen(option_id.clone())));
-        }
-        bottom = bottom.push(options);
+        use crate::ai_approval::{Card, Choice, ChoiceKind};
+        let mut choices: Vec<_> = pending.options.iter().map(|(id, name, kind)| {
+            let (label, style) = match kind {
+                PermissionOptionKind::AllowOnce => (if pending.remember { "Allow for session" } else { "Allow once" }.to_string(), ChoiceKind::Allow),
+                PermissionOptionKind::RejectOnce => ("Reject".to_string(), ChoiceKind::Reject),
+                _ => (name.clone(), ChoiceKind::Other),
+            };
+            Choice { label, kind: style, message: Message::PermissionChosen(id.clone()) }
+        }).collect();
+        choices.sort_by_key(|choice| match choice.kind { ChoiceKind::Reject => 0, ChoiceKind::Allow => 1, ChoiceKind::Other => 2 });
+        bottom = bottom.push(crate::ai_approval::view(Card {
+            title: pending.title.clone(), details: pending.details.clone(), choices,
+            remember: (pending.allow_once.is_some() && pending.scope.is_some()).then_some((pending.remember, Message::RememberPermission)),
+            copy: Message::Copy(pending.details.clone()),
+        }));
     }
     if !state.session_grants.is_empty() {
         bottom = bottom.push(button("Reset session approvals").style(crate::flat_button_style).on_press(Message::ResetPermissions));
@@ -940,6 +947,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remember_checkbox_grants_only_when_allow_is_chosen() {
+        let cwd = PathBuf::from("approval-test");
+        let mut state = AcpState { loaded: true, cwd: Some(cwd.clone()), ..Default::default() };
+        let (pending, mut reply) = permission("operation");
+        state.pending_permission = Some(pending);
+        let _ = update(&mut state, Message::RememberPermission(true), cwd.clone());
+        assert!(state.session_grants.is_empty());
+        let _ = update(&mut state, Message::PermissionChosen("reject".into()), cwd.clone());
+        assert_eq!(reply.try_recv().unwrap(), "reject");
+        assert!(state.session_grants.is_empty());
+        let (pending, mut reply) = permission("operation");
+        state.pending_permission = Some(pending);
+        let _ = update(&mut state, Message::RememberPermission(true), cwd.clone());
+        let _ = update(&mut state, Message::PermissionChosen("accept".into()), cwd);
+        assert_eq!(reply.try_recv().unwrap(), "accept");
+        assert!(state.session_grants.contains("operation"));
+    }
+
+    #[test]
     fn final_reply_follows_tools_and_survives_late_completion_updates() {
         let mut state = AcpState::default();
         let (tx, rx) = mpsc::channel();
@@ -981,7 +1007,7 @@ mod tests {
 
     fn permission(scope: &str) -> (PendingPermission, tokio::sync::oneshot::Receiver<String>) {
         let (respond, rx) = tokio::sync::oneshot::channel();
-        (PendingPermission { title: "Edit file".into(), details: "replacement".into(), scope: Some(scope.into()), allow_once: Some("accept".into()), options: vec![], respond }, rx)
+        (PendingPermission { title: "Edit file".into(), details: "replacement".into(), scope: Some(scope.into()), allow_once: Some("accept".into()), options: vec![], remember: false, respond }, rx)
     }
 
     #[test]
@@ -1032,7 +1058,7 @@ mod tests {
         state.rx = Some(rx);
         state.streaming = true;
         state.pending_permission = Some(PendingPermission {
-            title: "Run command".into(), details: String::new(), allow_once: None, scope: None, options: vec![], respond,
+            title: "Run command".into(), details: String::new(), allow_once: None, scope: None, options: vec![], remember: false, respond,
         });
         state.stop();
         assert!(state.streaming);
