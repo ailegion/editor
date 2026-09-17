@@ -238,9 +238,9 @@ impl Buffer {
     /// Re-derives syntax-highlight colors for the current text and re-applies them via
     /// `set_rich_text`. Cursor/selection (line, byte index) are unaffected since this only
     /// re-styles the existing text rather than editing it.
-    pub fn highlight(&mut self, highlighter: &Highlighter, extension: &str, app_theme: &iced::Theme) {
+    pub fn highlight(&mut self, highlighter: &Highlighter, extension: &str, theme: &syntect::highlighting::Theme) {
         let text = self.text();
-        let spans = highlighter.highlight(&text, extension, app_theme);
+        let spans = highlighter.highlight(&text, extension, theme);
         self.inner.set_rich_text(
             &mut self.font_system,
             spans.iter().map(|(chunk, attrs)| (chunk.as_str(), attrs.clone())),

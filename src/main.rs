@@ -11,6 +11,8 @@ mod goto_line;
 mod project_search;
 mod quick_open;
 mod recent_files;
+mod theme;
+mod theme_install;
 
 use iced::keyboard;
 use iced::widget::{
@@ -201,6 +203,7 @@ enum Message {
     ToggleProjectSearch,
     QuickOpen(quick_open::Message),
     ToggleQuickOpen,
+    ThemeInstall(theme_install::Message),
     CommandPalette(command_palette::Message),
     ToggleCommandPalette,
     GotoLine(goto_line::Message),
@@ -244,7 +247,8 @@ enum Message {
     /// Clipboard contents read for `EditAction::Paste`.
     EditorPasted(Option<String>),
     ViewAction(ViewAction),
-    AppThemeSelected(iced::Theme),
+    /// A theme name from `State::themes`.
+    AppThemeSelected(String),
     PaneResized(pane_grid::ResizeEvent),
 
     KeyPressed(keyboard::Key, keyboard::Modifiers),
@@ -300,13 +304,15 @@ struct State {
     sidebar_mode: SidebarMode,
     project_search: project_search::SearchState,
     quick_open: quick_open::QuickOpenState,
+    theme_install: theme_install::ThemeInstallState,
     command_palette: command_palette::PaletteState,
     goto_line: goto_line::GotoLineState,
     recent_files: Vec<PathBuf>,
     git: git::GitState,
     git_preview: Option<git_preview::Preview>,
 
-    app_theme: iced::Theme,
+    app_theme: theme::EditorTheme,
+    themes: theme::ThemeRegistry,
     highlighter: code_editor::Highlighter,
     zoom: f32,
 
@@ -343,7 +349,8 @@ impl State {
             .map(|p| DirectoryTree::new(p).with_filter(DirectoryFilter::FilesAndFolders).with_icon_theme(std::sync::Arc::new(file_icons::FileIcons)));
         let sidebar_visible = load_sidebar_visible();
         let ai_visible = load_ai_visible();
-        let app_theme = load_app_theme();
+        let themes = theme::ThemeRegistry::load();
+        let app_theme = load_app_theme(&themes);
         let zoom = load_zoom();
         let sidebar_ratio = load_sidebar_ratio();
         let ai_ratio = load_ai_ratio();
@@ -394,12 +401,14 @@ impl State {
             sidebar_mode: SidebarMode::default(),
             project_search: project_search::SearchState::default(),
             quick_open: quick_open::QuickOpenState::default(),
+            theme_install: theme_install::ThemeInstallState::default(),
             command_palette: command_palette::PaletteState::default(),
             goto_line: goto_line::GotoLineState::default(),
             recent_files: recent_files::load(),
             git: git::GitState::default(),
             git_preview: None,
             app_theme,
+            themes,
             highlighter: code_editor::Highlighter::new(),
             zoom,
             panes,
@@ -438,7 +447,7 @@ impl State {
             for recovery in session.recovery {
                 let mut content = code_editor::Buffer::new(&recovery.text, code_editor::metrics_for_zoom(state.zoom));
                 let extension = recovery.path.as_ref().and_then(|path| path.extension()).and_then(|ext| ext.to_str()).unwrap_or("txt");
-                content.highlight(&state.highlighter, extension, &state.app_theme);
+                content.highlight(&state.highlighter, extension, &state.app_theme.syntax);
                 let tab = Tab {
                     path: recovery.path.clone(), content, dirty: true,
                     search: Default::default(), line_ending: LineEnding::detect(&recovery.text), diff: Default::default(),
@@ -569,7 +578,7 @@ impl State {
                     let extension = tab.extension();
                     tab.content =
                         code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
-                    tab.content.highlight(&self.highlighter, &extension, &self.app_theme);
+                    tab.content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
                     tasks.push(load_diff_task(self.root.clone(), path));
                 }
             }
@@ -599,7 +608,7 @@ impl State {
             .to_string();
         let line_ending = LineEnding::detect(&text);
         let mut content = code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
-        content.highlight(&self.highlighter, &extension, &self.app_theme);
+        content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
         recent_files::record(&mut self.recent_files, path.clone());
         let task = load_diff_task(self.root.clone(), path.clone());
         self.tabs.push(Tab {
@@ -696,7 +705,7 @@ impl State {
         }
         tab.dirty = true;
         let extension = tab.extension();
-        tab.content.highlight(&self.highlighter, &extension, &self.app_theme);
+        tab.content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
     }
 
     /// Applies `action` to `self.zoom`, then re-shapes every open tab's buffer at the new
@@ -829,6 +838,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             } else {
                 let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
                 let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
+                state.theme_install.visible = false;
                 quick_open::Message::Open
             };
             let (t, _) = quick_open::update(&mut state.quick_open, msg, root.as_deref(), &state.recent_files);
@@ -846,6 +856,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
             } else {
                 state.quick_open.visible = false;
+                state.theme_install.visible = false;
                 let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
                 let commands = command_list(state);
                 task = command_palette::open(&mut state.command_palette, commands).map(Message::CommandPalette);
@@ -864,8 +875,43 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
             } else if state.tabs.get(state.active_tab).is_some() {
                 state.quick_open.visible = false;
+                state.theme_install.visible = false;
                 let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
                 task = goto_line::open(&mut state.goto_line).map(Message::GotoLine);
+            }
+        }
+        Message::ThemeInstall(msg) => {
+            if matches!(msg, theme_install::Message::Open(_)) {
+                state.quick_open.visible = false;
+                let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
+                let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
+            }
+            let (t, event) = theme_install::update(&mut state.theme_install, msg);
+            task = t.map(Message::ThemeInstall);
+            let next_theme = match event {
+                Some(theme_install::Event::Installed(names)) => {
+                    state.themes = theme::ThemeRegistry::load();
+                    state.notify(format!("Installed {}", names.join(", ")));
+                    names.into_iter().next()
+                }
+                Some(theme_install::Event::Uninstalled(name)) => {
+                    state.themes = theme::ThemeRegistry::load();
+                    state.notify(format!("Uninstalled {name}"));
+                    // Reload the current theme (a bundled copy may remain) or fall back.
+                    let current = &state.app_theme.name;
+                    Some(if state.themes.names().any(|name| name == current) {
+                        current.clone()
+                    } else {
+                        match state.app_theme.kind {
+                            theme::Kind::Dark => theme::DEFAULT_DARK.to_string(),
+                            theme::Kind::Light => theme::DEFAULT_LIGHT.to_string(),
+                        }
+                    })
+                }
+                None => None,
+            };
+            if let Some(name) = next_theme {
+                task = Task::batch([task, update(state, Message::AppThemeSelected(name))]);
             }
         }
         Message::Git(git::Message::OpenDiff(path)) => {
@@ -1205,14 +1251,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::CreateCancel => state.creating = None,
 
-        Message::AppThemeSelected(theme) => {
-            save_app_theme(&theme);
-            state.app_theme = theme;
-            for tab in &mut state.tabs {
-                let extension = tab.extension();
-                tab.content.highlight(&state.highlighter, &extension, &state.app_theme);
+        Message::AppThemeSelected(name) => match state.themes.load_theme(&name) {
+            Ok(theme) => {
+                save_app_theme(&theme.name);
+                state.app_theme = theme;
+                for tab in &mut state.tabs {
+                    let extension = tab.extension();
+                    tab.content.highlight(&state.highlighter, &extension, &state.app_theme.syntax);
+                }
             }
-        }
+            Err(err) => state.notify(format!("Theme failed to load: {err}")),
+        },
         Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
             state.panes.resize(split, ratio);
             if Some(split) == state.sidebar_split {
@@ -1228,6 +1277,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             if state.terminal_visible && state.terminal.focused()
                 && !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible
+                && !state.theme_install.visible
                 && key == keyboard::Key::Named(keyboard::key::Named::Escape) {
                 return Task::none();
             }
@@ -1282,6 +1332,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
                         } else {
                             state.quick_open.visible = false;
+                            state.theme_install.visible = false;
                             let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
                             let commands = command_list(state);
                             task = command_palette::open(&mut state.command_palette, commands)
@@ -1293,6 +1344,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
                         } else if state.tabs.get(state.active_tab).is_some() {
                             state.quick_open.visible = false;
+                            state.theme_install.visible = false;
                             let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
                             task = goto_line::open(&mut state.goto_line).map(Message::GotoLine);
                         }
@@ -1304,6 +1356,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         } else {
                             let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
                             let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
+                            state.theme_install.visible = false;
                             quick_open::Message::Open
                         };
                         let (t, _) = quick_open::update(&mut state.quick_open, msg, root.as_deref(), &state.recent_files);
@@ -1333,6 +1386,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     _ => {
                         state.handle_editor_key(&key, modifiers);
                     }
+                }
+            } else if state.theme_install.visible {
+                // Same as quick open below: the text input handles Enter and typing.
+                let msg = match key.as_ref() {
+                    keyboard::Key::Named(keyboard::key::Named::Escape) => Some(theme_install::Message::Close),
+                    keyboard::Key::Named(keyboard::key::Named::ArrowDown) => Some(theme_install::Message::MoveDown),
+                    keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Some(theme_install::Message::MoveUp),
+                    _ => None,
+                };
+                if let Some(msg) = msg {
+                    task = update(state, Message::ThemeInstall(msg));
                 }
             } else if state.quick_open.visible {
                 // Single-line `text_input` captures Enter (via `on_submit`) and character keys
@@ -1542,7 +1606,8 @@ fn view(state: &State) -> Element<'_, Message> {
     let panes = PaneGrid::new(&state.panes, |_id, kind, _is_maximized| {
         let content: Element<'_, Message> = match kind {
             PaneKind::Terminal => state.terminal.view(
-                !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible).map(Message::Terminal),
+                !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible
+                    && !state.theme_install.visible).map(Message::Terminal),
             PaneKind::Sidebar => container(view_sidebar(state))
                 .padding(0)
                 .width(Length::Fill)
@@ -1589,7 +1654,9 @@ fn view(state: &State) -> Element<'_, Message> {
             .align_right(Length::Fill).align_bottom(Length::Fill)].into();
     }
 
-    if state.quick_open.visible {
+    if state.theme_install.visible {
+        iced::widget::stack![base, theme_install::view(&state.theme_install).map(Message::ThemeInstall)].into()
+    } else if state.quick_open.visible {
         iced::widget::stack![
             base,
             quick_open::view(&state.quick_open, state.root.as_deref()).map(Message::QuickOpen),
@@ -1812,8 +1879,11 @@ fn command_list(state: &State) -> Vec<command_palette::Command> {
         commands.push(Command { label: "Go to Line (Cmd+G)".to_string(), message: Message::ToggleGotoLine });
     }
 
-    for theme in iced::Theme::ALL.iter() {
-        commands.push(Command { label: format!("Theme: {theme}"), message: Message::AppThemeSelected(theme.clone()) });
+    for (label, mode) in [("Install Theme...", theme_install::Mode::Install), ("Uninstall Theme...", theme_install::Mode::Uninstall)] {
+        commands.push(Command { label: label.to_string(), message: Message::ThemeInstall(theme_install::Message::Open(mode)) });
+    }
+    for name in state.themes.names() {
+        commands.push(Command { label: format!("Theme: {name}"), message: Message::AppThemeSelected(name.to_string()) });
     }
 
     commands
@@ -1913,10 +1983,16 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
     );
 
     let theme_menu_button = menu_button("Theme".to_string(), Message::Noop).width(Length::Shrink);
-    let theme_items: Vec<_> = iced::Theme::ALL
-        .iter()
-        .map(|t| Item::new(menu_button(t.to_string(), Message::AppThemeSelected(t.clone()))))
-        .collect();
+    let mut theme_items = vec![
+        Item::new(menu_button("Install Theme...".into(), Message::ThemeInstall(theme_install::Message::Open(theme_install::Mode::Install)))),
+        Item::new(menu_button("Uninstall Theme...".into(), Message::ThemeInstall(theme_install::Message::Open(theme_install::Mode::Uninstall)))),
+    ];
+    theme_items.extend(
+        state
+            .themes
+            .names()
+            .map(|name| Item::new(menu_button(name.to_string(), Message::AppThemeSelected(name.to_string())))),
+    );
 
     let mb = menu_bar!(
         (file_menu_button, menu_tpl(file_items)),
@@ -2137,7 +2213,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             scrollable(tab_row).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())),
             header,
 
-            git_preview::view(preview, &state.app_theme),
+            git_preview::view(preview, &state.app_theme.iced),
         ].width(Length::Fill).height(Length::Fill).into();
     }
     let mut editor_column = column![];
@@ -2166,7 +2242,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         let editor = code_editor::code_editor(
             &tab.content,
             &tab.diff,
-            &state.app_theme,
+            &state.app_theme.editor,
             state.zoom,
             Message::EditorAction,
             Message::ToggleFold,
@@ -2323,22 +2399,29 @@ fn load_last_project() -> Option<PathBuf> {
     path.is_dir().then_some(path)
 }
 
-fn save_app_theme(theme: &iced::Theme) {
+fn save_app_theme(name: &str) {
     let Some(path) = config_path("app_theme") else { return };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(path, theme.to_string());
+    let _ = std::fs::write(path, name);
 }
 
-fn load_app_theme() -> iced::Theme {
-    config_path("app_theme")
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| {
-            let name = text.trim();
-            iced::Theme::ALL.iter().find(|t| t.to_string() == name).cloned()
-        })
-        .unwrap_or(iced::Theme::Dark)
+fn load_app_theme(themes: &theme::ThemeRegistry) -> theme::EditorTheme {
+    let Some(saved) = config_path("app_theme").and_then(|path| std::fs::read_to_string(path).ok()) else {
+        return theme::EditorTheme::default_dark();
+    };
+    let saved = saved.trim();
+    if let Ok(theme) = themes.load_theme(theme::migrate_name(saved)) {
+        return theme;
+    }
+    // A theme that's gone, or an old iced built-in without a bundled equivalent: keep at
+    // least its brightness.
+    let light = iced::Theme::ALL
+        .iter()
+        .find(|theme| theme.to_string() == saved)
+        .is_some_and(|theme| !theme.extended_palette().is_dark);
+    if light { theme::EditorTheme::default_light() } else { theme::EditorTheme::default_dark() }
 }
 
 fn save_zoom(zoom: f32) {
@@ -2633,7 +2716,7 @@ pub fn main() -> iced::Result {
     let icon = iced::window::icon::from_file_data(include_bytes!("../icon.png"), None).ok();
     iced::application(State::boot, update, view)
         .title("editor")
-        .theme(|state: &State| state.app_theme.clone())
+        .theme(|state: &State| state.app_theme.iced.clone())
         .subscription(subscription)
         .font(iced_swdir_tree::LUCIDE_FONT_BYTES)
         .window(iced::window::Settings {
