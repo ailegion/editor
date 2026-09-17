@@ -1021,6 +1021,7 @@ name = "editor"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
+ "base64",
  "cosmic-text",
  "fuzzy-matcher",
  "iced",

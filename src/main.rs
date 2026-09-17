@@ -1,3 +1,4 @@
+mod ai_context;
 mod acp;
 mod terminal;
 mod chat;
@@ -169,6 +170,13 @@ enum AiMode {
     #[default]
     Http,
     Acp,
+    Codex,
+}
+
+impl std::fmt::Display for AiMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self { Self::Http => "Local / Ollama / API", Self::Acp => "Claude ACP", Self::Codex => "Codex ACP" })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -258,6 +266,12 @@ enum Message {
     SidebarSelected(SidebarMode),
     AiToggle,
     AiModeSelected(AiMode),
+    AiAttach,
+    AiFiles(Vec<PathBuf>),
+    AiAttachmentsLoaded(AiMode, PathBuf, Vec<Result<ai_context::Attachment, String>>),
+    AiReference,
+    AiRemoveAttachment(usize),
+    Codex(acp::Message),
     Chat(chat::Message),
     Acp(acp::Message),
     Tick,
@@ -337,6 +351,7 @@ struct State {
     ai_mode: AiMode,
     chat: chat::ChatState,
     acp: acp::AcpState,
+    codex: acp::AcpState,
     terminal: terminal::panel::Panel,
     terminal_visible: bool,
 }
@@ -425,6 +440,7 @@ impl State {
             ai_mode: AiMode::default(),
             chat: chat::ChatState::default(),
             acp: acp::AcpState::default(),
+            codex: acp::AcpState::codex(),
             terminal: terminal::panel::Panel::default(),
             terminal_visible: false,
         }
@@ -1515,6 +1531,49 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::AiModeSelected(mode) => state.ai_mode = mode,
+        Message::AiAttach => {
+            task = Task::perform(async { rfd::AsyncFileDialog::new().pick_files().await.unwrap_or_default().into_iter().map(|f| f.path().to_path_buf()).collect() }, Message::AiFiles);
+        }
+        Message::AiFiles(paths) => {
+            if state.ai_visible {
+                let mode = state.ai_mode;
+                let project = state.root_or_cwd();
+                task = Task::perform(async move {
+                    tokio::task::spawn_blocking(move || paths.iter().take(16).map(|p| ai_context::Attachment::read(p)).collect()).await.unwrap_or_else(|e| vec![Err(e.to_string())])
+                }, move |files| Message::AiAttachmentsLoaded(mode, project.clone(), files));
+            }
+        }
+        Message::AiAttachmentsLoaded(mode, project, files) => {
+            if project != state.root_or_cwd() { return Task::none(); }
+            for file in files {
+                match file {
+                    Ok(file) => {
+                        let attachments = match mode { AiMode::Http => &mut state.chat.attachments, AiMode::Acp => &mut state.acp.attachments, AiMode::Codex => &mut state.codex.attachments };
+                        if attachments.len() < 16 { attachments.push(file); }
+                        else { state.notice = Some(("Maximum 16 attachments per message.".into(), std::time::Instant::now())); }
+                    }
+                    Err(error) => state.notice = Some((error, std::time::Instant::now())),
+                }
+            }
+        }
+        Message::AiRemoveAttachment(index) => {
+            let attachments = match state.ai_mode { AiMode::Http => &mut state.chat.attachments, AiMode::Acp => &mut state.acp.attachments, AiMode::Codex => &mut state.codex.attachments };
+            if index < attachments.len() { attachments.remove(index); }
+        }
+        Message::AiReference => {
+            if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+                let selection = tab.content.copy_selection();
+                let name = format!("{}{}", tab.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "Untitled".into()), if selection.is_some() { " (selection)" } else { " (editor buffer)" });
+                let content = selection.unwrap_or_else(|| tab.content.text());
+                let attachments = match state.ai_mode { AiMode::Http => &mut state.chat.attachments, AiMode::Acp => &mut state.acp.attachments, AiMode::Codex => &mut state.codex.attachments };
+                if content.len() <= ai_context::MAX_BYTES && attachments.len() < 16 { attachments.push(ai_context::Attachment { name, content, mime: None }); }
+                else { state.notice = Some(("Attachment limit reached (16 files, 8 MiB each).".into(), std::time::Instant::now())); }
+            }
+        }
+        Message::Codex(msg) => {
+            let cwd = state.root_or_cwd();
+            task = acp::update(&mut state.codex, msg, cwd).map(Message::Codex);
+        }
         Message::Chat(msg) => {
             let cwd = state.root_or_cwd();
             task = chat::update(&mut state.chat, msg, cwd).map(Message::Chat);
@@ -1526,18 +1585,21 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Tick => {
             state.terminal.poll();
             if state.notice.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(8)) { state.notice = None; }
+            let cwd = state.root_or_cwd();
+            state.chat.set_project(&cwd);
+            state.acp.ensure_loaded(&cwd);
+            state.codex.ensure_loaded(&cwd);
             state.chat.poll();
             state.acp.poll();
-            if state.acp.take_finished() {
-                task = state.reload_open_tabs();
-            }
-            if state.chat.take_files_changed() {
+            state.codex.poll();
+            let codex_finished = state.codex.take_finished();
+            let claude_finished = state.acp.take_finished();
+            let local_changed = state.chat.take_files_changed();
+            if codex_finished || claude_finished || local_changed {
                 let reload_task = state.reload_open_tabs();
                 if let Some(root) = state.root.clone() {
                     task = Task::batch([reload_task, refresh_dir_task(root)]);
-                } else {
-                    task = reload_task;
-                }
+                } else { task = reload_task; }
             }
             if !state.window_revealed && state.started_at.elapsed() > Duration::from_secs(2) {
                 // Safety net in case the frame after `PaintInitialWindow` never arrives: a
@@ -1681,43 +1743,27 @@ fn view(state: &State) -> Element<'_, Message> {
 }
 
 fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
-    let mode_tab = |label: &'static str, mode: AiMode| {
-        let is_active = state.ai_mode == mode;
-        let underline = container(Space::new().width(Length::Fill).height(2)).style(
-            move |theme: &iced::Theme| iced::widget::container::Style {
-                background: Some(
-                    if is_active {
-                        theme.extended_palette().primary.base.color
-                    } else {
-                        iced::Color::TRANSPARENT
-                    }
-                    .into(),
-                ),
-                ..iced::widget::container::Style::default()
-            },
-        );
-        column![
-            button(text(label).size(12).wrapping(iced::widget::text::Wrapping::None))
-                .padding([4, 4])
-                .width(Length::Shrink)
-                .style(move |theme, status| tab_button_style(theme, status, is_active))
-                .on_press(Message::AiModeSelected(mode)),
-            underline,
-        ]
-        .spacing(2)
-        .width(Length::Shrink)
-    };
-
-    let mode_row = row![mode_tab("Custom model", AiMode::Http), mode_tab("Claude Code", AiMode::Acp), Space::new().width(Length::Fill), icon_control(lucide_icons::Icon::X, "Close AI panel", Some(Message::AiToggle), false)]
-        .spacing(2)
-        .padding([4, 4]);
-
+    let mode_row = row![
+        text("Assistant").size(14),
+        iced::widget::pick_list([AiMode::Http, AiMode::Acp, AiMode::Codex], Some(state.ai_mode), Message::AiModeSelected).text_size(12),
+        Space::new().width(Length::Fill),
+        icon_control(lucide_icons::Icon::X, "Close AI panel", Some(Message::AiToggle), false)
+    ].spacing(6).padding(8);
+    let attachments = match state.ai_mode { AiMode::Http => &state.chat.attachments, AiMode::Acp => &state.acp.attachments, AiMode::Codex => &state.codex.attachments };
+    let mut context = column![row![
+        button("Attach files").style(flat_button_style).on_press(Message::AiAttach),
+        button("Reference code").style(flat_button_style).on_press_maybe(state.tabs.get(state.active_tab).map(|_| Message::AiReference)),
+    ].spacing(4), text("Drop images or files · Reference selection or active file").size(11)].spacing(4);
+    for (i, attachment) in attachments.iter().enumerate() {
+        context = context.push(row![text(attachment.name.clone()).size(11).width(Length::Fill), button("Remove").style(flat_button_style).on_press(Message::AiRemoveAttachment(i))].spacing(4));
+    }
     let panel: Element<'_, Message> = match state.ai_mode {
         AiMode::Http => chat::view(&state.chat).map(Message::Chat),
+        AiMode::Codex => acp::view(&state.codex, state.root_or_cwd()).map(Message::Codex),
         AiMode::Acp => acp::view(&state.acp, state.root_or_cwd()).map(Message::Acp),
     };
 
-    column![mode_row, panel].height(Length::Fill).into()
+    column![mode_row, container(scrollable(context).height(Length::Shrink)).max_height(160).padding(8), panel].height(Length::Fill).into()
 }
 
 /// Shared 26px toolbar target with a 14px glyph and a discoverable label.
@@ -2335,6 +2381,7 @@ fn subscription(state: &State) -> Subscription<Message> {
     let keys = iced::event::listen_with(handle_raw_key_event);
     let tick = iced::time::every(Duration::from_millis(50)).map(|_| Message::Tick);
     let window_events = iced::window::events().map(|(id, event)| match event {
+        iced::window::Event::FileDropped(path) => Message::AiFiles(vec![path]),
         iced::window::Event::CloseRequested => Message::Exit,
         iced::window::Event::Opened { .. } => Message::WindowOpened(id),
         iced::window::Event::Resized(size) => Message::WindowResized(id, size),

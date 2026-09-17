@@ -43,6 +43,7 @@ impl Role {
 }
 
 struct ChatMsg {
+    wire_content: Option<serde_json::Value>,
     role: Role,
     content: String,
 }
@@ -117,6 +118,9 @@ enum ConnectionStatus {
 }
 
 pub struct ChatState {
+    pub attachments: Vec<crate::ai_context::Attachment>,
+    session_grants: std::collections::HashSet<String>,
+    cwd: Option<PathBuf>,
     connection_name: String,
     base_url: String,
     api_key: String,
@@ -138,8 +142,11 @@ pub struct ChatState {
 impl Default for ChatState {
     fn default() -> Self {
         Self {
+            attachments: Vec::new(),
+            session_grants: Default::default(),
+            cwd: None,
             connection_name: String::new(),
-            base_url: "https://api.openai.com/v1".to_string(),
+            base_url: "http://localhost:11434/v1".to_string(),
             api_key: String::new(),
             model: String::new(),
             models: Vec::new(),
@@ -177,9 +184,23 @@ pub enum Message {
     Stop,
     Copy(String),
     PermissionChosen(bool),
+    AllowSession,
+    ResetPermissions,
+    OllamaPreset,
 }
 
 impl ChatState {
+    pub fn set_project(&mut self, cwd: &Path) {
+        if self.cwd.as_deref().is_some_and(|previous| previous != cwd) {
+            self.stop();
+            self.session_grants.clear();
+            self.messages.clear();
+            self.attachments.clear();
+            self.input = text_editor::Content::new();
+        }
+        self.cwd = Some(cwd.to_path_buf());
+    }
+
     pub fn poll(&mut self) {
         if let Some(rx) = &self.test_rx {
             let mut finished = false;
@@ -216,11 +237,14 @@ impl ChatState {
                     }
                 }
                 Event::ToolStart(label) => {
-                    self.messages.push(ChatMsg { role: Role::Tool, content: label });
-                    self.messages.push(ChatMsg { role: Role::Assistant, content: String::new() });
+                    self.messages.push(ChatMsg { wire_content: None, role: Role::Tool, content: label });
+                    self.messages.push(ChatMsg { wire_content: None, role: Role::Assistant, content: String::new() });
                 }
                 Event::FileChanged => self.files_changed = true,
-                Event::PermissionRequest(pending) => self.pending_permission = Some(pending),
+                Event::PermissionRequest(pending) => {
+                    if self.session_grants.contains(&pending.label) { let _ = pending.respond.send(true); }
+                    else { self.pending_permission = Some(pending); }
+                },
                 Event::Done => finished = true,
                 Event::Error(err) => {
                     if let Some(last) = self.messages.last_mut() {
@@ -245,23 +269,28 @@ impl ChatState {
 
     fn send(&mut self, cwd: PathBuf) {
         let text = self.input.text();
-        if text.trim().is_empty() || self.streaming || self.model.trim().is_empty() || self.base_url.trim().is_empty() {
+        if (text.trim().is_empty() && self.attachments.is_empty()) || self.streaming || self.model.trim().is_empty() || self.base_url.trim().is_empty() {
             return;
         }
         let text = text.trim_end().to_string();
         self.input = text_editor::Content::new();
+        let mut parts = vec![serde_json::json!({"type":"text", "text":text})];
+        let mut display = text.clone();
+        for attachment in self.attachments.drain(..) {
+            display.push_str(&format!("\n[Attached: {}]", attachment.name));
+            parts.push(attachment.http());
+        }
+        let wire_content = Some(if parts.len() == 1 { serde_json::Value::String(text) } else { serde_json::Value::Array(parts) });
+        self.messages.push(ChatMsg { wire_content, role: Role::User, content: display });
         self.messages.push(ChatMsg {
-            role: Role::User,
-            content: text,
-        });
-        self.messages.push(ChatMsg {
+            wire_content: None,
             role: Role::Assistant,
             content: String::new(),
         });
 
-        let history: Vec<(&'static str, String)> = self.messages[..self.messages.len() - 1]
+        let history: Vec<(&'static str, serde_json::Value)> = self.messages[..self.messages.len() - 1]
             .iter()
-            .map(|m| (m.role.wire_role(), m.content.clone()))
+            .map(|m| (m.role.wire_role(), m.wire_content.clone().unwrap_or_else(|| serde_json::Value::String(m.content.clone()))))
             .collect();
 
         let base_url = self.base_url.trim_end_matches('/').to_string();
@@ -330,6 +359,7 @@ impl ChatState {
     /// Loads a saved card into the current form and immediately re-tests it, so picking a
     /// card is enough to get back to a working, connected state.
     fn load_connection(&mut self, index: usize) {
+        self.session_grants.clear();
         let Some(conn) = self.connections.get(index) else { return };
         self.connection_name = conn.name.clone();
         self.base_url = conn.base_url.clone();
@@ -349,15 +379,18 @@ impl ChatState {
 }
 
 pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Message> {
+    state.set_project(&cwd);
     match message {
         Message::ConnectionNameChanged(text) => state.connection_name = text,
         Message::BaseUrlChanged(text) => {
+            state.session_grants.clear();
             state.base_url = text;
             state.test_rx = None;
             state.connection_status = ConnectionStatus::Idle;
             state.models.clear();
         }
         Message::ApiKeyChanged(text) => {
+            state.session_grants.clear();
             state.api_key = text;
             state.test_rx = None;
             state.connection_status = ConnectionStatus::Idle;
@@ -373,6 +406,8 @@ pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Mes
         Message::NewConversation => {
             if !state.streaming {
                 state.messages.clear();
+                state.attachments.clear();
+                state.session_grants.clear();
             }
         }
         Message::UsePrompt(prompt) => state.input = text_editor::Content::with_text(&prompt),
@@ -380,6 +415,20 @@ pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Mes
         Message::Send => state.send(cwd),
         Message::Stop => state.stop(),
         Message::Copy(text) => return iced::clipboard::write(text),
+        Message::OllamaPreset => {
+            state.session_grants.clear();
+            state.base_url = "http://localhost:11434/v1".into();
+            state.api_key.clear();
+            state.connection_name = "Ollama".into();
+            state.test_connection();
+        }
+        Message::ResetPermissions => state.session_grants.clear(),
+        Message::AllowSession => {
+            if let Some(pending) = state.pending_permission.take() {
+                state.session_grants.insert(pending.label);
+                let _ = pending.respond.send(true);
+            }
+        }
         Message::PermissionChosen(allowed) => {
             if let Some(pending) = state.pending_permission.take() {
                 let _ = pending.respond.send(allowed);
@@ -449,6 +498,7 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
         .align_y(iced::Alignment::Center);
 
         let form = column![
+            button("Use local Ollama").style(crate::flat_button_style).on_press(Message::OllamaPreset),
             cards,
             row![field("Name"), text_input("", &state.connection_name).on_input(Message::ConnectionNameChanged)]
                 .spacing(6)
@@ -545,12 +595,15 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
         bottom = bottom.push(
             container(
                 column![
-                    text(format!("Allow tool call: {}?", pending.label)),
+                    text("Review tool request").size(14),
+                    scrollable(text(pending.label.clone()).size(12)).height(Length::Fixed(140.0)),
                     row![
-                        button(text("Allow")).on_press(Message::PermissionChosen(true)),
-                        button(text("Deny")).on_press(Message::PermissionChosen(false)),
+                        button(text("Accept")).on_press(Message::PermissionChosen(true)),
+                        button(text("Reject")).on_press(Message::PermissionChosen(false)),
+
                     ]
                     .spacing(6),
+                    button("Allow identical operation for session").on_press(Message::AllowSession),
                 ]
                 .spacing(6),
             )
@@ -566,6 +619,7 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
             }),
         );
     }
+    if !state.session_grants.is_empty() { bottom = bottom.push(button("Reset session approvals").style(crate::flat_button_style).on_press(Message::ResetPermissions)); }
     bottom = bottom.push(
         column![
             text_editor(&state.input)
@@ -594,7 +648,7 @@ pub fn view(state: &ChatState) -> Element<'_, Message> {
                     crate::icon_control(lucide_icons::Icon::CircleStop, "Stop response", Some(Message::Stop), false)
                 } else {
                     crate::icon_control(lucide_icons::Icon::SendHorizonal, "Send message (Cmd/Ctrl+Enter)",
-                        (!state.model.trim().is_empty() && !state.base_url.trim().is_empty() && !state.input.text().trim().is_empty()).then_some(Message::Send), false)
+                        (!state.model.trim().is_empty() && !state.base_url.trim().is_empty() && (!state.input.text().trim().is_empty() || !state.attachments.is_empty())).then_some(Message::Send), false)
                 },
             ]
             .align_y(iced::Alignment::Center),
@@ -625,7 +679,7 @@ fn run_conversation(
     base_url: String,
     api_key: String,
     model: String,
-    history: Vec<(&'static str, String)>,
+    history: Vec<(&'static str, serde_json::Value)>,
     cwd: PathBuf,
     tx: mpsc::Sender<Event>,
     cancel: Arc<AtomicBool>,
@@ -661,7 +715,7 @@ fn run_conversation(
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
-            let preview = truncate(&call.arguments, 80);
+            let preview = call.arguments.clone();
             let label = format!("{}({})", call.name, preview);
 
             if !request_permission(&tx, &label) {
@@ -1023,6 +1077,17 @@ fn truncate(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_changes_clear_grants_and_context() {
+        let mut state = ChatState::default();
+        state.set_project(Path::new("first"));
+        state.session_grants.insert("write_file(...)".into());
+        state.input = text_editor::Content::with_text("private project context");
+        state.set_project(Path::new("second"));
+        assert!(state.session_grants.is_empty());
+        assert!(state.input.text().is_empty());
+    }
 
     #[test]
     fn send_without_model_preserves_draft() {

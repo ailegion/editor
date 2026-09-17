@@ -15,6 +15,34 @@ A minimal, no-bloat code editor in Rust, built on `iced`.
 - Clickable breadcrumbs and reveal-in-tree navigation
 - Notifications for saves, Git operations, and file-operation failures
 
+## AI assistant
+
+The AI sidebar has one provider picker: **Local / Ollama / API**, **Claude ACP**, and
+**Codex ACP**. Each provider keeps its own conversation and draft. Claude and Codex
+history is stored separately for each project.
+
+For Ollama, open model settings, choose **Use local Ollama**, and select a discovered
+model. Other OpenAI-compatible servers use the same base URL, key, and model settings.
+Image prompts require a vision-capable model.
+
+ACP starts `npx --yes @agentclientprotocol/claude-agent-acp` or
+`npx --yes @zed-industries/codex-acp`. Node/npm must be on PATH; configure the agent's
+credentials before chatting. Codex adapter setup: https://github.com/zed-industries/codex-acp.
+The first launch may download the adapter. Connection errors appear in the conversation.
+
+- **Attach files** or drop files into the editor while the AI sidebar is open.
+  Supports UTF-8 text/code and PNG, JPEG, GIF, WebP images; up to 16 attachments,
+  8 MiB each. Review or remove attachments before sending.
+- **Reference code** attaches the current selection, or the active editor buffer
+  including unsaved changes. Attachments are snapshots, not live links.
+- **Cmd/Ctrl+Enter** sends the prompt, including attachment-only prompts.
+- Tool requests show approval controls and details. ACP tool cards expand to show
+  supplied output and before/after edits. Approval applies to the entire tool request.
+- **Allow identical operation for this session** remembers only the same tool input;
+  **Reset session approvals** revokes these grants. New conversations, project changes,
+  or ACP connection resets clear them. ACP can also offer its own named permission
+  choices, whose persistence is controlled by the agent.
+
 ## Tab shortcuts
 
 - `Cmd+1`–`Cmd+9`: select a tab

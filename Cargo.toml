@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+base64 = "0.22"
 agent-client-protocol = "2.0.0"
 cosmic-text = "0.15.0"
 fuzzy-matcher = "0.3.7"
