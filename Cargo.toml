@@ -44,3 +44,7 @@ opt-level = 2    # Forces dependencies to prune their massive 146,000+ unused sy
 
 [dev-dependencies]
 iced_runtime = "0.14.0"
+
+[target.'cfg(windows)'.build-dependencies]
+image = { version = "0.25.9", default-features = false, features = ["png", "ico"] }
+winresource = "0.1.31"
