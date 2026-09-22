@@ -37,7 +37,7 @@ jobs:
         run: |
           tool="$RUNNER_TEMP/editor-tools/bin/cargo-about"
           if [[ ! -x "$tool" ]] || [[ "$("$tool" --version)" != 'cargo-about 0.9.2' ]]; then
-            cargo install cargo-about --version 0.9.2 --locked --force --root "$RUNNER_TEMP/editor-tools"
+            cargo install cargo-about --version 0.9.2 --features cli --locked --force --root "$RUNNER_TEMP/editor-tools"
           fi
           "$tool" --version
       - name: Generate license report and preserve component notices
