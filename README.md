@@ -74,11 +74,42 @@ One shell session is supported; mouse selection and terminal mouse reporting are
 
 ## Run
 
+For ready-to-run downloads, see [GitHub Releases](https://github.com/ailegion/editor/releases)
+and the [installation instructions](docs/INSTALL.md). No Rust installation is needed.
+
+To run from source:
+
 ```sh
 cargo run
 ```
 
-## Build a signed macOS app (.app + .dmg)
+## Publishing releases
+
+The **Build and release** GitHub Actions workflow tests and builds Windows x86-64,
+Linux x86-64, and macOS Apple Silicon and Intel packages.
+
+- Pushing to `main` or opening a pull request runs the builds and uploads downloadable
+  workflow artifacts. It does not create a public release.
+- You can also run the workflow manually from the Actions tab to check a build.
+- To release, set the version in `Cargo.toml`, update `Cargo.lock` with Cargo, and
+  commit/push your changes. Create and push a matching tag, for example `v0.1.0`
+  for the current version `0.1.0`.
+- A tag build creates a **draft release** only after all four packages succeed.
+  Open GitHub **Releases**, review the draft and downloads, then click **Publish release**.
+- Tags containing a prerelease suffix, such as `v0.2.0-beta.1`, create prereleases.
+  Reruns can update draft assets but will not overwrite an already published release.
+
+Enable GitHub Actions for the repository. The workflow uses GitHub's built-in token;
+no signing accounts or custom secrets are required. Standard hosted runners are free
+for public repositories; private repositories use your account's Actions allowance.
+The first cross-platform run must pass before a release is ready. Download and try
+each platform's package before publishing the draft.
+
+Packages contain themes, their original notices, the editor license, generated Rust
+dependency licenses, and embedded syntax/theme notices. Windows is unsigned; macOS
+uses free ad-hoc signing without Apple notarization. Linux ships as a `.tar.gz` archive.
+
+## Local macOS bundling (optional)
 
 ```sh
 cargo bundle --release
@@ -89,4 +120,16 @@ Output: signed `.app` and `.dmg` in `target/release/bundle/osx/`. Requires `carg
 
 ## License
 
-PolyForm Strict License 1.0.0 — free to download and use, but no forking or redistributing modified versions.
+The editor's original code is source-available under the [PolyForm Shield License 1.0.0](LICENSE.md).
+
+You can use the editor for personal projects and at work, including to develop commercial
+software. Modifications and redistribution are allowed for purposes permitted by the license;
+using this software to provide a competing product is not, even if that product is free.
+The full license governs these permissions and restrictions.
+
+Required Notice: Copyright 2026 Ajdin (https://github.com/ailegion/editor)
+
+Preserve this required notice when distributing the editor or its code. Bundled themes,
+vendored code, dependencies, and other third-party components retain their own licenses
+and copyright notices; PolyForm Shield does not replace those terms. See [NOTICE](NOTICE)
+for the license scope and locations of bundled component notices.

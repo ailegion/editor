@@ -2,6 +2,8 @@
 name = "editor"
 version = "0.1.0"
 edition = "2024"
+license-file = "LICENSE.md"
+publish = false
 
 [dependencies]
 base64 = "0.22"
@@ -32,7 +34,7 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2
 name = "editor"
 identifier = "io.github.ailegion.editor"
 short_description = "A minimal, no-bloat code editor"
-resources = ["themes"]
+resources = ["themes", "LICENSE.md", "NOTICE"]
 
 [profile.dev]
 opt-level = 0    # Keeps your editor code fast to compile and completely debuggable

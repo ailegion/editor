@@ -1,0 +1,28 @@
+editor
+
+Required Notice: Copyright 2026 Ajdin (https://github.com/ailegion/editor)
+
+The editor's original code is licensed under the PolyForm Shield License 1.0.0.
+See LICENSE.md for the full, unmodified license terms.
+
+Third-party components retain their own licenses and copyright notices.
+The editor's license does not replace or restrict the rights granted by those
+separate licenses.
+
+Bundled theme license texts and copyright notices:
+- themes/arcticicestudio.nord-visual-studio-code/LICENSE.txt
+- themes/Catppuccin.catppuccin-vsc/LICENSE.txt
+- themes/dracula-theme.theme-dracula/LICENSE.txt
+- themes/enkia.tokyo-night/LICENSE.txt
+- themes/jdinhlife.gruvbox/LICENSE.txt
+- themes/vscode.theme-solarized/LICENSE.txt
+- src/theme/default/LICENSE.txt (copied by build.rs to
+  themes/vscode.theme-defaults/LICENSE.txt for distribution)
+
+Vendored iced-swdir-tree license and attribution:
+- vendor/iced-swdir-tree/LICENSE
+- vendor/iced-swdir-tree/NOTICE
+
+Rust dependencies and their bundled assets are governed by their respective
+licenses. This file is a guide to repository notices, not a complete inventory
+of all transitive dependencies or a substitute for their license texts.

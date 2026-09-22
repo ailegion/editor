@@ -1,0 +1,227 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: '1.93.1'
+
+jobs:
+  licenses:
+    name: Dependency licenses
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal && rustup default "$RUST_VERSION"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-about
+          key: cargo-about-0.9.2-linux-x64
+      - name: Install license generator
+        run: command -v cargo-about || cargo install cargo-about --version 0.9.2 --locked
+      - name: Generate license report and preserve component notices
+        run: |
+          mkdir -p target/release-licenses
+          cargo about generate --locked --fail scripts/licenses.hbs -o target/release-licenses/THIRD_PARTY_LICENSES.html
+          cargo metadata --locked --format-version 1 | jq -r '.packages[] | select(.name != "editor") | .manifest_path' | while IFS= read -r manifest; do
+            source_dir=$(dirname "$manifest")
+            crate=$(basename "$source_dir")
+            while IFS= read -r -d '' notice; do
+              relative=${notice#"$source_dir/"}
+              destination="target/release-licenses/licenses/$crate/$relative"
+              mkdir -p "$(dirname "$destination")"
+              cp "$notice" "$destination"
+            done < <(find "$source_dir" -type f \( -iname 'LICENSE*' -o -iname 'NOTICE*' -o -iname 'COPYING*' -o -iname 'OFL*' \) -not -path '*/target/*' -not -path '*/.git/*' -print0)
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dependency-licenses
+          path: target/release-licenses/
+          if-no-files-found: error
+
+  build:
+    name: ${{ matrix.platform }}
+    needs: licenses
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - platform: macos-aarch64
+            runner: macos-15
+            target: aarch64-apple-darwin
+          - platform: macos-x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+    defaults:
+      run:
+        shell: bash
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+      # Portable Windows build: link the MSVC runtime into the executable.
+      RUSTFLAGS: ${{ matrix.platform == 'windows-x86_64' && '-C target-feature=+crt-static' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libfontconfig1-dev libudev-dev libdbus-1-dev libssl-dev libxcb-shape0-dev libxcb-xfixes0-dev libvulkan1 mesa-vulkan-drivers
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target "${{ matrix.target }}"
+          rustup default "$RUST_VERSION"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target/debug
+            target/release
+            target/${{ matrix.target }}
+          key: release-${{ matrix.platform }}-${{ env.RUST_VERSION }}-static-v1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: release-${{ matrix.platform }}-${{ env.RUST_VERSION }}-static-v1-
+      - name: Test
+        run: cargo test --locked --target "${{ matrix.target }}"
+      - name: Validate release version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "editor") | .version')
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "Tag must match Cargo.toml: v$version" >&2
+            exit 1
+          fi
+          echo "EDITOR_VERSION=$version" >> "$GITHUB_ENV"
+      - name: Build optimized editor
+        run: cargo build --release --locked --target "${{ matrix.target }}" --bin editor
+      - uses: actions/download-artifact@v4
+        with:
+          name: dependency-licenses
+          path: target/release-licenses
+      - name: Export embedded syntax and theme notices
+        run: cargo run --locked --target "${{ matrix.target }}" --example asset_notices > target/release-licenses/SYNTAX_AND_THEME_LICENSES.md
+      - name: Stage resources and verify required notices
+        run: |
+          stage="target/release-stage/editor-$EDITOR_VERSION-${{ matrix.platform }}"
+          mkdir -p "$stage" target/release-dist
+          cp -R themes "$stage/"
+          mkdir -p "$stage/themes/vscode.theme-defaults"
+          cp src/theme/default/LICENSE.txt "$stage/themes/vscode.theme-defaults/"
+          cp LICENSE.md NOTICE README.md docs/INSTALL.md "$stage/"
+          cp -R target/release-licenses/. "$stage/"
+          mkdir -p "$stage/licenses/iced-swdir-tree"
+          cp vendor/iced-swdir-tree/LICENSE vendor/iced-swdir-tree/NOTICE "$stage/licenses/iced-swdir-tree/"
+          test -s "$stage/THIRD_PARTY_LICENSES.html"
+          test -s "$stage/SYNTAX_AND_THEME_LICENSES.md"
+          test -s "$stage/themes/vscode.theme-solarized/ThirdPartyNotices.txt"
+          for theme in "$stage"/themes/*/; do test -s "$theme/LICENSE.txt"; done
+          echo "STAGE=$stage" >> "$GITHUB_ENV"
+      - name: Package Windows ZIP
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item 'target/${{ matrix.target }}/release/editor.exe' "$env:STAGE/editor.exe"
+          Compress-Archive -Path $env:STAGE -DestinationPath "target/release-dist/editor-$env:EDITOR_VERSION-${{ matrix.platform }}.zip" -Force
+      - name: Package Linux archive
+        if: runner.os == 'Linux'
+        run: |
+          cp "target/${{ matrix.target }}/release/editor" "$STAGE/editor"
+          chmod +x "$STAGE/editor"
+          ldd "$STAGE/editor" | tee target/linux-libraries.txt
+          if grep -q 'not found' target/linux-libraries.txt; then exit 1; fi
+          tar -czf "target/release-dist/editor-$EDITOR_VERSION-${{ matrix.platform }}.tar.gz" -C "$(dirname "$STAGE")" "$(basename "$STAGE")"
+      - name: Package macOS app with free ad-hoc signing
+        if: runner.os == 'macOS'
+        run: |
+          app="target/macos-bundle/editor.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp -R "$STAGE/." "$app/Contents/Resources/"
+          cp "target/${{ matrix.target }}/release/editor" "$app/Contents/MacOS/editor"
+          chmod +x "$app/Contents/MacOS/editor"
+          plist="$app/Contents/Info.plist"
+          plutil -create xml1 "$plist"
+          plutil -insert CFBundleName -string editor "$plist"
+          plutil -insert CFBundleIdentifier -string io.github.ailegion.editor "$plist"
+          plutil -insert CFBundleExecutable -string editor "$plist"
+          plutil -insert CFBundlePackageType -string APPL "$plist"
+          plutil -insert CFBundleShortVersionString -string "${EDITOR_VERSION%%-*}" "$plist"
+          plutil -insert CFBundleVersion -string "${EDITOR_VERSION%%-*}" "$plist"
+          plutil -insert LSMinimumSystemVersion -string 13.0 "$plist"
+          plutil -insert NSHighResolutionCapable -bool YES "$plist"
+          codesign --force --sign - "$app"
+          codesign --verify --deep --strict "$app"
+          cp docs/INSTALL.md target/macos-bundle/INSTALL.md
+          ditto -c -k --sequesterRsrc target/macos-bundle "target/release-dist/editor-$EDITOR_VERSION-${{ matrix.platform }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: editor-${{ matrix.platform }}
+          path: target/release-dist/*
+          if-no-files-found: error
+
+  release:
+    name: Create draft GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: editor-*
+          merge-multiple: true
+          path: target/release-dist
+      - name: Verify complete asset set and create checksums
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cd target/release-dist
+          version=${RELEASE_TAG#v}
+          test -s "editor-$version-windows-x86_64.zip"
+          test -s "editor-$version-linux-x86_64.tar.gz"
+          test -s "editor-$version-macos-aarch64.zip"
+          test -s "editor-$version-macos-x86_64.zip"
+          for archive in *.zip; do unzip -t "$archive" > /dev/null; done
+          tar -tzf "editor-$version-linux-x86_64.tar.gz" > /dev/null
+          sha256sum *.zip *.tar.gz > SHA256SUMS.txt
+      - name: Create or update draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --json isDraft > release-state.json 2>/dev/null; then
+            jq -e '.isDraft == true' release-state.json > /dev/null || { echo 'Refusing to overwrite a published release'; exit 1; }
+            gh release upload "$RELEASE_TAG" target/release-dist/* --clobber
+          else
+            extra=()
+            if [[ "$RELEASE_TAG" == *-* ]]; then extra+=(--prerelease); fi
+            gh release create "$RELEASE_TAG" target/release-dist/* --verify-tag --draft --title "editor $RELEASE_TAG" --generate-notes --notes-file docs/RELEASE_NOTES.md "${extra[@]}"
+          fi
