@@ -24,21 +24,26 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - name: Install Rust
         run: rustup toolchain install "$RUST_VERSION" --profile minimal && rustup default "$RUST_VERSION"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
-          path: ~/.cargo/bin/cargo-about
-          key: cargo-about-0.9.2-linux-x64
+          path: ${{ runner.temp }}/editor-tools/bin/cargo-about
+          key: cargo-about-0.9.2-linux-x64-explicit-root-v2
       - name: Install license generator
-        run: command -v cargo-about || cargo install cargo-about --version 0.9.2 --locked
+        run: |
+          tool="$RUNNER_TEMP/editor-tools/bin/cargo-about"
+          if [[ ! -x "$tool" ]] || [[ "$("$tool" --version)" != 'cargo-about 0.9.2' ]]; then
+            cargo install cargo-about --version 0.9.2 --locked --force --root "$RUNNER_TEMP/editor-tools"
+          fi
+          "$tool" --version
       - name: Generate license report and preserve component notices
         run: |
           mkdir -p target/release-licenses
-          cargo about generate --locked --fail scripts/licenses.hbs -o target/release-licenses/THIRD_PARTY_LICENSES.html
+          "$RUNNER_TEMP/editor-tools/bin/cargo-about" generate --locked --fail scripts/licenses.hbs -o target/release-licenses/THIRD_PARTY_LICENSES.html
           cargo metadata --locked --format-version 1 | jq -r '.packages[] | select(.name != "editor") | .manifest_path' | while IFS= read -r manifest; do
             source_dir=$(dirname "$manifest")
             crate=$(basename "$source_dir")
@@ -49,7 +54,7 @@ jobs:
               cp "$notice" "$destination"
             done < <(find "$source_dir" -type f \( -iname 'LICENSE*' -o -iname 'NOTICE*' -o -iname 'COPYING*' -o -iname 'OFL*' \) -not -path '*/target/*' -not -path '*/.git/*' -print0)
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: dependency-licenses
           path: target/release-licenses/
@@ -84,7 +89,7 @@ jobs:
       # Portable Windows build: link the MSVC runtime into the executable.
       RUSTFLAGS: ${{ matrix.platform == 'windows-x86_64' && '-C target-feature=+crt-static' || '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - name: Install Linux build dependencies
@@ -96,7 +101,7 @@ jobs:
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal --target "${{ matrix.target }}"
           rustup default "$RUST_VERSION"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -117,7 +122,7 @@ jobs:
           echo "EDITOR_VERSION=$version" >> "$GITHUB_ENV"
       - name: Build optimized editor
         run: cargo build --release --locked --target "${{ matrix.target }}" --bin editor
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: dependency-licenses
           path: target/release-licenses
@@ -175,7 +180,7 @@ jobs:
           codesign --verify --deep --strict "$app"
           cp docs/INSTALL.md target/macos-bundle/INSTALL.md
           ditto -c -k --sequesterRsrc target/macos-bundle "target/release-dist/editor-$EDITOR_VERSION-${{ matrix.platform }}.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: editor-${{ matrix.platform }}
           path: target/release-dist/*
@@ -189,10 +194,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: editor-*
           merge-multiple: true
