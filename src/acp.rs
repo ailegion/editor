@@ -809,16 +809,17 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
     Task::none()
 }
 
-pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer::Context<'a>) -> Element<'a, Message> {
-    let top_bar = row![
-        text("Conversation").size(12),
-        Space::new().width(Length::Fill),
+pub fn conversation_controls(state: &AcpState) -> Element<'_, Message> {
+    row![
         crate::icon_control(lucide_icons::Icon::Plus, "New conversation", (!state.streaming).then_some(Message::NewThread), false),
         crate::icon_control(lucide_icons::Icon::History, "Conversation history", Some(Message::ThreadMenuToggle), state.thread_menu_open),
     ]
     .spacing(4)
-    .width(Length::Fill);
-    let mut header = column![top_bar].spacing(4);
+    .into()
+}
+
+pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer::Context<'a>) -> Element<'a, Message> {
+    let mut header = column![].spacing(4);
     if state.thread_menu_open {
         let mut menu = column![].spacing(2);
         for (i, thread) in state.threads.iter().enumerate() {

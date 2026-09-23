@@ -1855,11 +1855,16 @@ fn view(state: &State) -> Element<'_, Message> {
 }
 
 fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
+    let controls = match state.ai_mode {
+        AiMode::Http => chat::conversation_controls(&state.chat).map(Message::Chat),
+        AiMode::Codex => acp::conversation_controls(&state.codex).map(Message::Codex),
+        AiMode::Acp => acp::conversation_controls(&state.acp).map(Message::Acp),
+    };
     let mode_row = row![
         text("Assistant").size(14),
         iced::widget::pick_list([AiMode::Http, AiMode::Acp, AiMode::Codex], Some(state.ai_mode), Message::AiModeSelected).text_size(12),
         Space::new().width(Length::Fill),
-        icon_control(lucide_icons::Icon::X, "Close AI panel", Some(Message::AiToggle), false)
+        controls
     ].spacing(6).padding(8);
     let composer = ai_composer::Context {
         sources: state.tree.as_ref().map(|tree| tree.drag_sources()).unwrap_or_default(),

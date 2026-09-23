@@ -439,14 +439,18 @@ pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Mes
     Task::none()
 }
 
+pub fn conversation_controls(state: &ChatState) -> Element<'_, Message> {
+    row![
+        crate::icon_control(lucide_icons::Icon::Plus, "New conversation", (!state.streaming && !state.messages.is_empty()).then_some(Message::NewConversation), false),
+    ].spacing(4).into()
+}
+
 pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>) -> Element<'a, Message> {
     let mut header = column![row![
         text("Conversation").size(12),
         Space::new().width(Length::Fill),
-        crate::icon_control(lucide_icons::Icon::Plus, "New conversation", (!state.streaming && !state.messages.is_empty()).then_some(Message::NewConversation), false),
         crate::icon_control(lucide_icons::Icon::Settings, "Model settings", Some(Message::ToggleSettings), state.settings_open),
-    ]]
-    .spacing(4);
+    ]].spacing(4);
 
     if state.settings_open {
         let field = |label: &'static str| text(label).width(Length::Fixed(70.0));
