@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod ai_usage;
+mod updater;
 mod ai_approval;
 mod ai_composer;
 mod ai_context;
@@ -207,6 +208,8 @@ fn tabs_to_close(count: usize, anchor: usize, scope: TabCloseScope) -> Vec<usize
 
 #[derive(Debug, Clone)]
 enum Message {
+    CheckUpdate,
+    RestartUpdate,
     TerminalToggle,
     Terminal(terminal::panel::Message),
     EditorAction(cosmic_text::Action),
@@ -307,6 +310,7 @@ struct EditorSession {
 }
 
 struct State {
+    updater: updater::Updater,
     root: Option<PathBuf>,
     saved_session: EditorSession,
     last_session_write: std::time::Instant,
@@ -406,6 +410,7 @@ impl State {
         };
 
         Self {
+            updater: updater::Updater::default(),
             root,
             saved_session: EditorSession::default(),
             last_session_write: std::time::Instant::now() - Duration::from_secs(1),
@@ -783,6 +788,22 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         return Task::none();
     }
     match message {
+        Message::CheckUpdate => state.updater.check(),
+        Message::RestartUpdate => {
+            state.last_session_write = std::time::Instant::now() - Duration::from_secs(1);
+            state.persist_session();
+            let recovery: Vec<_> = state.tabs.iter().filter(|tab| tab.dirty).map(|tab| RecoveryBuffer {
+                path: tab.path.clone(), text: tab.content.text(),
+            }).collect();
+            if recovery != state.saved_session.recovery {
+                state.notify("Could not save recovery. Save your files before updating.");
+                return Task::none();
+            }
+            match state.updater.restart() {
+                Ok(()) => { state.terminal.shutdown(); return iced::exit(); }
+                Err(error) => state.notify(error),
+            }
+        }
         Message::TerminalToggle => {
             state.terminal_visible = !state.terminal_visible;
             if state.terminal_visible {
@@ -1616,6 +1637,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             task = acp::update(&mut state.acp, msg, cwd).map(Message::Acp);
         }
         Message::Tick => {
+            state.updater.poll();
             state.terminal.poll();
             if state.notice.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(8)) { state.notice = None; }
             let cwd = state.root_or_cwd();
@@ -2098,6 +2120,15 @@ fn view_status_bar(state: &State) -> Element<'_, Message> {
         icon_control(lucide_icons::Icon::Search, "Search project", Some(Message::ToggleProjectSearch), state.sidebar_visible && state.sidebar_mode == SidebarMode::ProjectSearch),
         Space::new().width(Length::Fill),
     ].spacing(6);
+
+    if state.updater.enabled {
+        let action = if state.updater.ready() { Message::RestartUpdate } else { Message::CheckUpdate };
+        let mut control = button(text(&state.updater.label).size(12)).style(flat_button_style);
+        if !state.updater.busy() { control = control.on_press(action); }
+        bar = bar.push(iced::widget::tooltip(
+            control, text(&state.updater.detail).size(12), iced::widget::tooltip::Position::Top,
+        ));
+    }
 
     if let Some(tab) = state.tabs.get(state.active_tab) {
         let (line, col) = tab.content.cursor_line_col();
@@ -2794,6 +2825,8 @@ fn paint_hidden_window(raw: u64, maximized: bool) -> bool {
 }
 
 pub fn main() -> iced::Result {
+    if updater::run_helper() { return Ok(()); }
+    let _update_guard = updater::running_guard();
     let icon = iced::window::icon::from_file_data(include_bytes!("../icon.png"), None).ok();
     iced::application(State::boot, update, view)
         .title("editor")

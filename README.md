@@ -99,8 +99,10 @@ Linux x86-64, and macOS Apple Silicon and Intel packages.
 - Tags containing a prerelease suffix, such as `v0.2.0-beta.1`, create prereleases.
   Reruns can update draft assets but will not overwrite an already published release.
 
-Enable GitHub Actions for the repository. The workflow uses GitHub's built-in token;
-no signing accounts or custom secrets are required. Standard hosted runners are free
+Enable GitHub Actions for the repository. The workflow uses GitHub's built-in token
+and a free update-signing key; configure the `EDITOR_UPDATE_SIGNING_KEY` repository
+secret as described in [automatic update setup](docs/UPDATES.md) before pushing a release tag.
+No paid signing accounts are required. Standard hosted runners are free
 for public repositories; private repositories use your account's Actions allowance.
 The first cross-platform run must pass before a release is ready. Download and try
 each platform's package before publishing the draft.
@@ -108,6 +110,14 @@ each platform's package before publishing the draft.
 Packages contain themes, their original notices, the editor license, generated Rust
 dependency licenses, and embedded syntax/theme notices. Windows is unsigned; macOS
 uses free ad-hoc signing without Apple notarization. Linux ships as a `.tar.gz` archive.
+
+## Automatic updates
+
+Installed release builds check GitHub for newer stable versions on launch and every six
+hours. Verified updates download in the background. Click **Restart to update** in the
+status bar to apply one; unsaved edits are persisted through session recovery first.
+The status-bar control also checks manually and shows update errors on hover.
+See [update setup and recovery](docs/UPDATES.md).
 
 ## Local macOS bundling (optional)
 

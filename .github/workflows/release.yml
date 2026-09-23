@@ -120,6 +120,13 @@ jobs:
             exit 1
           fi
           echo "EDITOR_VERSION=$version" >> "$GITHUB_ENV"
+      - name: Check update signing configuration
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          EDITOR_UPDATE_SIGNING_KEY: ${{ secrets.EDITOR_UPDATE_SIGNING_KEY }}
+        run: |
+          test -n "$EDITOR_UPDATE_SIGNING_KEY" || { echo 'Add the EDITOR_UPDATE_SIGNING_KEY repository secret before tagging a release.'; exit 1; }
+          test -s update-public-key.txt
       - name: Build optimized editor
         run: cargo build --release --locked --target "${{ matrix.target }}" --bin editor
       - uses: actions/download-artifact@v7
@@ -136,6 +143,7 @@ jobs:
           mkdir -p "$stage/themes/vscode.theme-defaults"
           cp src/theme/default/LICENSE.txt "$stage/themes/vscode.theme-defaults/"
           cp LICENSE.md NOTICE README.md docs/INSTALL.md "$stage/"
+          printf '%s\n' 'editor-managed-installation-v1' > "$stage/UPDATE_INSTALLATION"
           cp -R target/release-licenses/. "$stage/"
           mkdir -p "$stage/licenses/iced-swdir-tree"
           cp vendor/iced-swdir-tree/LICENSE vendor/iced-swdir-tree/NOTICE "$stage/licenses/iced-swdir-tree/"
@@ -180,6 +188,14 @@ jobs:
           codesign --verify --deep --strict "$app"
           cp docs/INSTALL.md target/macos-bundle/INSTALL.md
           ditto -c -k --sequesterRsrc target/macos-bundle "target/release-dist/editor-$EDITOR_VERSION-${{ matrix.platform }}.zip"
+      - name: Sign automatic update package
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          EDITOR_UPDATE_SIGNING_KEY: ${{ secrets.EDITOR_UPDATE_SIGNING_KEY }}
+        run: |
+          archive="target/release-dist/editor-$EDITOR_VERSION-${{ matrix.platform }}"
+          if [[ '${{ runner.os }}' == 'Linux' ]]; then archive="$archive.tar.gz"; else archive="$archive.zip"; fi
+          cargo run --locked --target "${{ matrix.target }}" --example update_signer -- sign "$archive" '${{ matrix.platform }}'
       - uses: actions/upload-artifact@v6
         with:
           name: editor-${{ matrix.platform }}
@@ -212,6 +228,10 @@ jobs:
           test -s "editor-$version-linux-x86_64.tar.gz"
           test -s "editor-$version-macos-aarch64.zip"
           test -s "editor-$version-macos-x86_64.zip"
+          for platform in windows-x86_64 linux-x86_64 macos-aarch64 macos-x86_64; do
+            test -s "update-$platform.json"
+            test -s "update-$platform.json.sig"
+          done
           for archive in *.zip; do unzip -t "$archive" > /dev/null; done
           tar -tzf "editor-$version-linux-x86_64.tar.gz" > /dev/null
           sha256sum *.zip *.tar.gz > SHA256SUMS.txt

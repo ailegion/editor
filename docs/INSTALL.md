@@ -30,6 +30,13 @@ session, graphics drivers, Fontconfig, and XKB/Wayland/X11 libraries installed.
 If it does not start, run `ldd ./editor` to identify missing shared libraries.
 Other distributions may need equivalent runtime packages installed.
 
+## Updates
+
+New release installations automatically download signed stable updates from GitHub.
+Click **Restart to update** in the status bar when one is ready. Unsaved edits are
+recovered after restart. Close other editor windows first and use a writable installation
+folder. Older releases without the updater need one manual upgrade.
+
 ## Optional features
 
 - Git features need Git installed and available on PATH.
