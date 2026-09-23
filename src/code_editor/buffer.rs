@@ -23,6 +23,8 @@ pub struct Buffer {
     /// (0 or 2 entries -- same shape as `selection_pixels` so `render.rs` can treat them
     /// alike, just with a different style).
     matched_brackets: Vec<(usize, f32, f32)>,
+    /// Width in pixels of the widest laid-out line, so the widget can bound horizontal scroll.
+    content_width: f32,
     undo_stack: Vec<Change>,
     redo_stack: Vec<Change>,
     pub folds: std::collections::BTreeMap<usize, usize>,
@@ -47,6 +49,7 @@ impl Buffer {
             cursor_pixel: None,
             selection_pixels: Vec::new(),
             matched_brackets: Vec::new(),
+            content_width: 0.0,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             folds: Default::default(), collapsed: Default::default(),
@@ -166,6 +169,11 @@ impl Buffer {
     /// any -- see the `matched_brackets` field doc.
     pub fn matched_brackets(&self) -> &[(usize, f32, f32)] {
         &self.matched_brackets
+    }
+
+    /// Pixel width of the widest line (as of the last `sync`).
+    pub fn content_width(&self) -> f32 {
+        self.content_width
     }
 
     /// Applies a `cosmic_text::Action` (motion, insert, backspace, click, ...) to the buffer.
@@ -325,6 +333,12 @@ impl Buffer {
         self.collapsed.retain(|start| !self.folds.get(start).is_some_and(|end| self.cursor.line > *start && self.cursor.line <= *end));
         self.rebuild_visible();
         self.inner.shape_until_scroll(&mut self.font_system, false);
+        self.content_width = self
+            .inner
+            .lines
+            .iter()
+            .filter_map(|line| line.layout_opt().and_then(|lines| lines.first()).map(|line| line.w))
+            .fold(0.0, f32::max);
 
         let selection_bounds = {
             let mut editor = Editor::new(&mut self.inner);

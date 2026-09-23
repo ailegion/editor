@@ -63,38 +63,62 @@ impl<'a, Message> CodeEditor<'a, Message> {
         self
     }
 
-    /// If the cursor moved since `state.last_cursor` and now falls outside
-    /// `[scroll, scroll + viewport_height)`, returns the corrected scroll offset to bring it
-    /// back into view. Always updates `state.last_cursor`. Returns `None` both when the
-    /// cursor hasn't moved (so a manual scroll-away is left alone) and when it moved but is
-    /// still visible.
-    fn scroll_correction(&self, state: &mut State, viewport_height: f32) -> Option<f32> {
+    /// If the cursor moved since `state.last_cursor` and now falls outside the visible
+    /// window (vertically or horizontally), corrects `state.scroll`/`state.scroll_x` to
+    /// bring it back into view and returns `true`. Always updates `state.last_cursor`.
+    /// Returns `false` both when the cursor hasn't moved (so a manual scroll-away is left
+    /// alone) and when it moved but is still visible.
+    fn scroll_correction(&self, state: &mut State, viewport: iced::Size) -> bool {
         let current = self.content.cursor_pixel().and_then(|(x, _)| {
             self.content.visual_row(self.content.cursor.line).map(|row| (x, (row as f32 * self.style.line_height) as i32))
         });
         let moved = current != state.last_cursor;
         state.last_cursor = current;
         if !moved {
-            return None;
+            return false;
         }
 
-        let (_, y) = current?;
-        let y = y as f32;
+        let Some((x, y)) = current else { return false };
+        let (x, y) = (x as f32, y as f32);
         let line_height = self.style.line_height;
+        let mut changed = false;
         if y < state.scroll {
-            Some(y)
-        } else if y + line_height > state.scroll + viewport_height {
-            Some(y + line_height - viewport_height)
-        } else {
-            None
+            state.scroll = y;
+            changed = true;
+        } else if y + line_height > state.scroll + viewport.height {
+            state.scroll = y + line_height - viewport.height;
+            changed = true;
         }
+        // Keep a small margin so the cursor never sits flush against either edge.
+        let text_width = (viewport.width - self.style.gutter_width(self.content.line_count())).max(0.0);
+        let margin = H_SCROLL_PAD.min(text_width / 2.0);
+        if x - margin < state.scroll_x {
+            state.scroll_x = (x - margin).max(0.0);
+            changed = true;
+        } else if x + margin > state.scroll_x + text_width {
+            state.scroll_x = x + margin - text_width;
+            changed = true;
+        }
+        changed
+    }
+
+    fn max_scroll_x(&self, bounds: Rectangle) -> f32 {
+        let text_width = bounds.width - self.style.gutter_width(self.content.line_count());
+        (self.content.content_width() + H_SCROLL_PAD - text_width).max(0.0)
     }
 }
+
+/// Extra pixels of horizontal scroll past the widest line, so its last character doesn't
+/// sit flush against the canvas edge.
+const H_SCROLL_PAD: f32 = 40.0;
 
 #[derive(Default)]
 pub struct State {
     dragging: bool,
     scroll: f32,
+    scroll_x: f32,
+    /// Shift held, so a vertical wheel pans sideways (Windows doesn't do this conversion).
+    shift: bool,
     /// The cursor pixel position as of the last redraw check, so scroll-into-view only
     /// fires when the cursor itself moved -- not just because the user scrolled the
     /// viewport away from a stationary cursor to read elsewhere in the file.
@@ -115,7 +139,7 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
         _cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
-        render::draw(self.content, self.diff, &mut frame, &self.style, state.scroll);
+        render::draw(self.content, self.diff, &mut frame, &self.style, state.scroll, state.scroll_x);
         vec![frame.into_geometry()]
     }
 
@@ -135,10 +159,12 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
         if let Event::Window(iced::window::Event::RedrawRequested(_)) = event {
             let max_scroll = (self.content.visible_count() as f32 * self.style.line_height - bounds.height).max(0.0);
             state.scroll = state.scroll.min(max_scroll);
-            return self.scroll_correction(state, bounds.height).map(|scroll| {
-                state.scroll = scroll;
-                canvas::Action::request_redraw()
-            });
+            state.scroll_x = state.scroll_x.min(self.max_scroll_x(bounds));
+            return self.scroll_correction(state, bounds.size()).then(canvas::Action::request_redraw);
+        }
+        if let Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) = event {
+            state.shift = modifiers.shift();
+            return None;
         }
 
         // Rendered text starts `gutter_width` pixels right of the canvas origin and `scroll`
@@ -147,11 +173,12 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
         // be un-offset here before becoming a `Click`/`Drag` action.
         let gutter_width = self.style.gutter_width(self.content.line_count());
         let scroll = state.scroll;
+        let scroll_x = state.scroll_x;
         let buffer_position = |position: iced::Point| {
             let y = position.y + scroll;
             let row = (y / self.style.line_height).max(0.0) as usize;
             (
-                (position.x - gutter_width) as i32,
+                (position.x - gutter_width + scroll_x) as i32,
                 (self.content.source_line(row) as f32 * self.style.line_height
                     + y.rem_euclid(self.style.line_height)) as i32,
             )
@@ -194,14 +221,20 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
                 None
             }
             mouse::Event::WheelScrolled { delta } if cursor.is_over(bounds) => {
-                let dy = match *delta {
-                    mouse::ScrollDelta::Lines { y, .. } => y * self.style.line_height * 3.0,
-                    mouse::ScrollDelta::Pixels { y, .. } => y,
+                let (mut dx, mut dy) = match *delta {
+                    mouse::ScrollDelta::Lines { x, y } => {
+                        (x * self.style.line_height * 3.0, y * self.style.line_height * 3.0)
+                    }
+                    mouse::ScrollDelta::Pixels { x, y } => (x, y),
                 };
+                if state.shift && dx == 0.0 {
+                    (dx, dy) = (dy, 0.0);
+                }
                 let max_scroll = (self.content.visible_count() as f32 * self.style.line_height
                     - bounds.height)
                     .max(0.0);
                 state.scroll = (state.scroll - dy).clamp(0.0, max_scroll);
+                state.scroll_x = (state.scroll_x - dx).clamp(0.0, self.max_scroll_x(bounds));
                 Some(canvas::Action::request_redraw().and_capture())
             }
             _ => None,

@@ -9,7 +9,9 @@ use super::buffer::Buffer;
 use super::theme::Style;
 use crate::git_diff::LineStatus;
 
-/// Draws the buffer's text and a blinking cursor into `frame`, scrolled up by `scroll` pixels.
+/// Draws the buffer's text and a blinking cursor into `frame`, scrolled up by `scroll` pixels
+/// and left by `scroll_x` pixels. The gutter is painted after the text so anything scrolled
+/// under it is hidden.
 ///
 /// The blink phase is derived from wall-clock time rather than stored per-widget state, so it
 /// stays in sync across redraws without needing its own subscription: the app already redraws
@@ -20,10 +22,13 @@ pub fn draw(
     frame: &mut Frame,
     style: &Style,
     scroll: f32,
+    scroll_x: f32,
 ) {
     frame.fill_rectangle(Point::ORIGIN, frame.size(), style.background);
 
     let gutter_width = style.gutter_width(buffer.line_count());
+    // Where buffer x = 0 lands on the canvas.
+    let text_x = gutter_width - scroll_x;
     let line_height = style.line_height;
     let viewport_height = frame.size().height;
 
@@ -49,12 +54,88 @@ pub fn draw(
         }
         let width = (x1 - x0).max(4.0);
         frame.fill_rectangle(
-            Point::new(gutter_width + x0, y),
+            Point::new(text_x + x0, y),
             Size::new(width, line_height),
             style.selection_color,
         );
     }
 
+    for (i, line) in buffer.inner.lines.iter().enumerate() {
+        let Some(row) = buffer.visual_row(i) else { continue; };
+        let y = row as f32 * line_height - scroll;
+        if !is_visible(y) {
+            continue;
+        }
+        let text = line.text();
+        // Use shaped glyph positions, so guides follow actual spaces and tabs.
+        if let Some(layout) = line.layout_opt().and_then(|lines| lines.first()) {
+            let mut indent = 0usize;
+            for (offset, ch) in text.char_indices() {
+                if ch != ' ' && ch != '\t' { break; }
+                if indent > 0 && indent % 2 == 0 {
+                    if let Some(glyph) = layout.glyphs.iter().find(|glyph| glyph.start == offset) {
+                        frame.fill_rectangle(
+                            Point::new(text_x + glyph.x, y), Size::new(1.0, line_height),
+                            iced::Color { a: 0.14, ..style.text_color },
+                        );
+                    }
+                }
+                indent += if ch == '\t' { 4 } else { 1 };
+            }
+        }
+        match line.layout_opt().and_then(|lines| lines.first()) {
+            Some(layout_line) => draw_glyph_runs(frame, layout_line, text, y, text_x, style),
+            None => fill_run(
+                frame,
+                text,
+                0,
+                text.len(),
+                text_x,
+                style.text_color,
+                y,
+                style.font_size,
+            ),
+        }
+        if let Some(end) = buffer.folds.get(&i) {
+            if buffer.collapsed.contains(&i) {
+                let width = line.layout_opt().and_then(|lines| lines.first()).map(|line| line.w).unwrap_or(0.0);
+                frame.fill_text(Text {
+                    content: format!("  ⋯ {} lines", end - i),
+                    position: Point::new(text_x + width, y),
+                    color: style.gutter_text_color, size: iced::Pixels(style.font_size), ..Default::default()
+                });
+            }
+        }
+    }
+
+    for &(line_i, x0, x1) in buffer.matched_brackets() {
+        let Some(row) = buffer.visual_row(line_i) else { continue; };
+        let y = row as f32 * line_height - scroll;
+        if !is_visible(y) || x0 < scroll_x {
+            continue;
+        }
+        let width = (x1 - x0).max(4.0);
+        frame.stroke_rectangle(
+            Point::new(text_x + x0, y + 1.0),
+            Size::new(width, line_height - 2.0),
+            Stroke::default().with_color(style.bracket_match_color).with_width(1.0),
+        );
+    }
+
+    if blink_on() {
+        if let Some((x, _)) = buffer.cursor_pixel() {
+            let y = buffer.visual_row(buffer.cursor.line).unwrap_or(0) as f32 * line_height - scroll;
+            if is_visible(y) && x as f32 >= scroll_x {
+                frame.fill_rectangle(
+                    Point::new(text_x + x as f32, y),
+                    Size::new(1.5, line_height),
+                    style.cursor_color,
+                );
+            }
+        }
+    }
+
+    // Gutter goes on top of the text so lines scrolled left disappear under it.
     frame.fill_rectangle(
         Point::ORIGIN,
         Size::new(gutter_width, viewport_height),
@@ -83,86 +164,34 @@ pub fn draw(
         }
     }
 
-    for (i, line) in buffer.inner.lines.iter().enumerate() {
+    for i in 0..buffer.line_count() {
         let Some(row) = buffer.visual_row(i) else { continue; };
         let y = row as f32 * line_height - scroll;
         if !is_visible(y) {
             continue;
         }
-        let text = line.text();
-        // Use shaped glyph positions, so guides follow actual spaces and tabs.
-        if let Some(layout) = line.layout_opt().and_then(|lines| lines.first()) {
-            let mut indent = 0usize;
-            for (offset, ch) in text.char_indices() {
-                if ch != ' ' && ch != '\t' { break; }
-                if indent > 0 && indent % 2 == 0 {
-                    if let Some(glyph) = layout.glyphs.iter().find(|glyph| glyph.start == offset) {
-                        frame.fill_rectangle(
-                            Point::new(gutter_width + glyph.x, y), Size::new(1.0, line_height),
-                            iced::Color { a: 0.14, ..style.text_color },
-                        );
-                    }
-                }
-                indent += if ch == '\t' { 4 } else { 1 };
-            }
-        }
-        match line.layout_opt().and_then(|lines| lines.first()) {
-            Some(layout_line) => draw_glyph_runs(frame, layout_line, text, y, gutter_width, style),
-            None => fill_run(
-                frame,
-                text,
-                0,
-                text.len(),
-                gutter_width,
-                style.text_color,
-                y,
-                style.font_size,
-            ),
-        }
         draw_line_number(frame, i + 1, y, gutter_width, style);
-        if let Some(end) = buffer.folds.get(&i) {
-            let collapsed = buffer.collapsed.contains(&i);
+        if buffer.folds.contains_key(&i) {
             frame.fill_text(Text {
-                content: if collapsed { "▸" } else { "▾" }.into(),
+                content: if buffer.collapsed.contains(&i) { "▸" } else { "▾" }.into(),
                 position: Point::new(gutter_width - 16.0, y),
                 color: style.gutter_text_color, size: iced::Pixels(style.font_size), ..Default::default()
             });
-            if collapsed {
-                let width = line.layout_opt().and_then(|lines| lines.first()).map(|line| line.w).unwrap_or(0.0);
-                frame.fill_text(Text {
-                    content: format!("  ⋯ {} lines", end - i),
-                    position: Point::new(gutter_width + width, y),
-                    color: style.gutter_text_color, size: iced::Pixels(style.font_size), ..Default::default()
-                });
-            }
         }
     }
 
-    for &(line_i, x0, x1) in buffer.matched_brackets() {
-        let Some(row) = buffer.visual_row(line_i) else { continue; };
-        let y = row as f32 * line_height - scroll;
-        if !is_visible(y) {
-            continue;
-        }
-        let width = (x1 - x0).max(4.0);
-        frame.stroke_rectangle(
-            Point::new(gutter_width + x0, y + 1.0),
-            Size::new(width, line_height - 2.0),
-            Stroke::default().with_color(style.bracket_match_color).with_width(1.0),
+    // Horizontal scroll thumb along the bottom edge, only when the text overflows.
+    let track_width = (frame.size().width - gutter_width).max(0.0);
+    let total_width = buffer.content_width() + super::H_SCROLL_PAD;
+    if total_width > track_width && track_width > 0.0 {
+        let thumb_width = (track_width * track_width / total_width).max(20.0);
+        let thumb_x = (gutter_width + scroll_x / total_width * track_width)
+            .min(gutter_width + track_width - thumb_width);
+        frame.fill_rectangle(
+            Point::new(thumb_x, viewport_height - 6.0),
+            Size::new(thumb_width, 4.0),
+            iced::Color { a: 0.3, ..style.text_color },
         );
-    }
-
-    if blink_on() {
-        if let Some((x, _)) = buffer.cursor_pixel() {
-            let y = buffer.visual_row(buffer.cursor.line).unwrap_or(0) as f32 * line_height - scroll;
-            if is_visible(y) {
-                frame.fill_rectangle(
-                    Point::new(gutter_width + x as f32, y),
-                    Size::new(1.5, line_height),
-                    style.cursor_color,
-                );
-            }
-        }
     }
 }
 
