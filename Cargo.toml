@@ -1,12 +1,16 @@
 [package]
 name = "editor"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license-file = "LICENSE.md"
 publish = false
 
 [dependencies]
 base64 = "0.22"
+# Clipboard images pasted into the AI composer (iced's clipboard is text-only). `image` is
+# already in the tree via iced's "image" feature; here it PNG-encodes the clipboard's RGBA.
+arboard = "3.6"
+image = { version = "0.25.9", default-features = false, features = ["png"] }
 agent-client-protocol = "2.0.0"
 cosmic-text = "0.15.0"
 fuzzy-matcher = "0.3.7"

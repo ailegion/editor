@@ -10,6 +10,28 @@ pub enum Action {
     Reference,
     Remove(usize),
     Drop(Vec<PathBuf>),
+    /// Cmd/Ctrl+V in the input: attach a clipboard image, else paste text as usual.
+    Paste,
+}
+
+/// Key bindings shared by the AI panels' inputs: Cmd/Ctrl+Enter sends, and Cmd/Ctrl+V is
+/// routed through [`Action::Paste`] so a screenshot on the clipboard becomes an attachment.
+pub fn key_binding<M: Clone>(
+    key_press: iced::widget::text_editor::KeyPress, send: M, on_action: impl Fn(Action) -> M,
+) -> Option<iced::widget::text_editor::Binding<M>> {
+    use iced::keyboard::{key::Named, Key};
+    use iced::widget::text_editor::{Binding, Status};
+    let command = key_press.modifiers.command();
+    if command && key_press.key == Key::Named(Named::Enter) {
+        Some(Binding::Custom(send))
+    } else if command && !key_press.modifiers.alt()
+        && matches!(key_press.status, Status::Focused { .. })
+        && key_press.key.to_latin(key_press.physical_key) == Some('v')
+    {
+        Some(Binding::Custom(on_action(Action::Paste)))
+    } else {
+        Binding::from_key_press(key_press)
+    }
 }
 
 #[derive(Clone, Copy)]

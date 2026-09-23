@@ -106,17 +106,61 @@ impl<'a, Message> CodeEditor<'a, Message> {
         let text_width = bounds.width - self.style.gutter_width(self.content.line_count());
         (self.content.content_width() + H_SCROLL_PAD - text_width).max(0.0)
     }
+
+    /// `(track_start, track_length, content_length)` along `axis`, all in canvas pixels.
+    fn track(&self, bounds: Rectangle, axis: Axis) -> (f32, f32, f32) {
+        match axis {
+            Axis::X => {
+                let gutter = self.style.gutter_width(self.content.line_count());
+                (gutter, (bounds.width - gutter).max(0.0), self.content.content_width() + H_SCROLL_PAD)
+            }
+            Axis::Y => (0.0, bounds.height, self.content.visible_count() as f32 * self.style.line_height),
+        }
+    }
+
+    /// Thumb rectangle for `axis` in canvas coordinates, or `None` when nothing overflows.
+    fn thumb(&self, state: &State, bounds: Rectangle, axis: Axis) -> Option<Rectangle> {
+        let (start, track, content) = self.track(bounds, axis);
+        if content <= track || track <= 0.0 {
+            return None;
+        }
+        let offset = match axis { Axis::X => state.scroll_x, Axis::Y => state.scroll };
+        let len = (track * track / content).max(BAR * 2.0).min(track);
+        let pos = (start + offset / content * track).min(start + track - len);
+        Some(match axis {
+            Axis::X => Rectangle::new(iced::Point::new(pos, bounds.height - BAR), iced::Size::new(len, BAR)),
+            Axis::Y => Rectangle::new(iced::Point::new(bounds.width - BAR, pos), iced::Size::new(BAR, len)),
+        })
+    }
+
+    /// Scrolls so the thumb's leading edge lands at `pos` along `axis`.
+    fn scroll_to_thumb(&self, state: &mut State, bounds: Rectangle, axis: Axis, pos: f32) {
+        let (start, track, content) = self.track(bounds, axis);
+        let offset = ((pos - start) / track * content).clamp(0.0, (content - track).max(0.0));
+        match axis {
+            Axis::X => state.scroll_x = offset,
+            Axis::Y => state.scroll = offset,
+        }
+    }
 }
 
 /// Extra pixels of horizontal scroll past the widest line, so its last character doesn't
 /// sit flush against the canvas edge.
 const H_SCROLL_PAD: f32 = 40.0;
 
+/// Scrollbar thickness. The bars overlay the text along the right and bottom edges.
+pub(super) const BAR: f32 = 12.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Axis { X, Y }
+
 #[derive(Default)]
 pub struct State {
     dragging: bool,
     scroll: f32,
     scroll_x: f32,
+    /// A scrollbar thumb being dragged, with the grab offset from its leading edge.
+    thumb_drag: Option<(Axis, f32)>,
     /// Shift held, so a vertical wheel pans sideways (Windows doesn't do this conversion).
     shift: bool,
     /// The cursor pixel position as of the last redraw check, so scroll-into-view only
@@ -136,10 +180,22 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,
-        _cursor: mouse::Cursor,
+        cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
         render::draw(self.content, self.diff, &mut frame, &self.style, state.scroll, state.scroll_x);
+        // Scrollbars: semi-transparent overlays, brighter while hovered or dragged.
+        let local = Rectangle::with_size(bounds.size());
+        let position = cursor.position_in(bounds);
+        for axis in [Axis::X, Axis::Y] {
+            let Some(thumb) = self.thumb(state, local, axis) else { continue };
+            let over_track = position.is_some_and(|p| match axis {
+                Axis::X => p.y >= local.height - BAR,
+                Axis::Y => p.x >= local.width - BAR,
+            });
+            let active = over_track || state.thumb_drag.is_some_and(|(a, _)| a == axis);
+            render::draw_thumb(&mut frame, thumb, &self.style, active);
+        }
         vec![frame.into_geometry()]
     }
 
@@ -188,10 +244,27 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
             return None;
         };
 
+        // Scrollbar thumbs take precedence over the text underneath them.
+        let local = Rectangle::with_size(bounds.size());
         match mouse_event {
             mouse::Event::ButtonPressed(mouse::Button::Left) => {
-                let on_action = self.on_action.as_ref()?;
                 let position = cursor.position_in(bounds)?;
+                for axis in [Axis::X, Axis::Y] {
+                    let Some(thumb) = self.thumb(state, local, axis) else { continue };
+                    let (along, lead, len, in_track) = match axis {
+                        Axis::X => (position.x, thumb.x, thumb.width, position.y >= local.height - BAR),
+                        Axis::Y => (position.y, thumb.y, thumb.height, position.x >= local.width - BAR),
+                    };
+                    if !in_track {
+                        continue;
+                    }
+                    // On the thumb: grab where it was clicked. Off it: centre the thumb there.
+                    let grab = if thumb.contains(position) { along - lead } else { len / 2.0 };
+                    state.thumb_drag = Some((axis, grab));
+                    self.scroll_to_thumb(state, local, axis, along - grab);
+                    return Some(canvas::Action::request_redraw().and_capture());
+                }
+                let on_action = self.on_action.as_ref()?;
                 let row = ((position.y + state.scroll) / self.style.line_height).max(0.0) as usize;
                 let line = self.content.source_line(row);
                 if position.x >= gutter_width - 18.0 && position.x < gutter_width {
@@ -210,14 +283,27 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
                 };
                 Some(canvas::Action::publish(on_action(action)).and_capture())
             }
+            mouse::Event::CursorMoved { .. } if state.thumb_drag.is_some() => {
+                let (axis, grab) = state.thumb_drag?;
+                // Use the raw position so the drag keeps tracking outside the canvas.
+                let position = cursor.position()? - iced::Vector::new(bounds.x, bounds.y);
+                let along = match axis { Axis::X => position.x, Axis::Y => position.y };
+                self.scroll_to_thumb(state, local, axis, along - grab);
+                Some(canvas::Action::request_redraw().and_capture())
+            }
             mouse::Event::CursorMoved { .. } if state.dragging => {
                 let on_action = self.on_action.as_ref()?;
                 let position = cursor.position_in(bounds)?;
                 let (x, y) = buffer_position(position);
                 Some(canvas::Action::publish(on_action(cosmic_text::Action::Drag { x, y })).and_capture())
             }
+            mouse::Event::CursorMoved { .. } if cursor.is_over(bounds) => {
+                // Hover highlight on the bars needs a repaint.
+                Some(canvas::Action::request_redraw())
+            }
             mouse::Event::ButtonReleased(mouse::Button::Left) => {
                 state.dragging = false;
+                state.thumb_drag = None;
                 None
             }
             mouse::Event::WheelScrolled { delta } if cursor.is_over(bounds) => {
@@ -250,6 +336,13 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
         let Some(position) = cursor.position_in(bounds) else {
             return mouse::Interaction::default();
         };
+        let local = Rectangle::with_size(bounds.size());
+        let on_bar = state.thumb_drag.is_some()
+            || (self.thumb(state, local, Axis::X).is_some() && position.y >= local.height - BAR)
+            || (self.thumb(state, local, Axis::Y).is_some() && position.x >= local.width - BAR);
+        if on_bar {
+            return mouse::Interaction::default();
+        }
         // Same hit area as the fold toggle in `update`.
         let gutter_width = self.style.gutter_width(self.content.line_count());
         let row = ((position.y + state.scroll) / self.style.line_height).max(0.0) as usize;

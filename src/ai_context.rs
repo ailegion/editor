@@ -32,6 +32,29 @@ impl Attachment {
         Ok(Self { name: path.display().to_string(), content, mime: mime.map(str::to_string) })
     }
 
+    /// The image on the OS clipboard (e.g. from Snipping Tool or a macOS screenshot) as a
+    /// PNG attachment, or `Ok(None)` when the clipboard holds no image.
+    pub fn from_clipboard() -> Result<Option<Self>, String> {
+        let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+        let image = match clipboard.get_image() {
+            Ok(image) => image,
+            Err(arboard::Error::ContentNotAvailable) => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+        };
+        let (width, height) = (image.width as u32, image.height as u32);
+        let rgba = image::RgbaImage::from_raw(width, height, image.bytes.into_owned())
+            .ok_or("Clipboard image has an unexpected size.")?;
+        let mut png = std::io::Cursor::new(Vec::new());
+        rgba.write_to(&mut png, image::ImageFormat::Png).map_err(|e| e.to_string())?;
+        let png = png.into_inner();
+        if png.len() > MAX_BYTES { return Err("Attachments must be smaller than 8 MiB.".into()); }
+        Ok(Some(Self {
+            name: format!("Pasted image {width}x{height}.png"),
+            content: base64::engine::general_purpose::STANDARD.encode(png),
+            mime: Some("image/png".into()),
+        }))
+    }
+
     pub fn context_text(&self) -> String {
         format!("File reference: {}\n<file_content>\n{}\n</file_content>", self.name, self.content)
     }
@@ -62,5 +85,20 @@ mod tests {
         let code = Attachment { name: "src/main.rs (selection)".into(), content: "fn main() {}".into(), mime: None };
         assert!(code.http()["text"].as_str().unwrap().contains("fn main() {}"));
         assert!(matches!(code.acp(), ContentBlock::Text(_)));
+    }
+
+    /// Overwrites the OS clipboard, so it's opt-in: `cargo test -- --ignored clipboard`.
+    #[test]
+    #[ignore]
+    fn clipboard_image_becomes_png_attachment() {
+        let mut clipboard = arboard::Clipboard::new().unwrap();
+        clipboard.set_image(arboard::ImageData { width: 2, height: 1, bytes: vec![255, 0, 0, 255, 0, 0, 255, 255].into() }).unwrap();
+        let image = Attachment::from_clipboard().unwrap().expect("clipboard holds an image");
+        assert_eq!(image.mime.as_deref(), Some("image/png"));
+        assert_eq!(image.name, "Pasted image 2x1.png");
+        let png = base64::engine::general_purpose::STANDARD.decode(&image.content).unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        clipboard.set_text("plain text").unwrap();
+        assert!(Attachment::from_clipboard().unwrap().is_none());
     }
 }

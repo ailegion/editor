@@ -621,15 +621,7 @@ pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>)
                 .placeholder("Ask about your project… (Cmd/Ctrl+Enter to send)")
                 .on_action(Message::InputChanged)
                 .height(Length::Fixed(60.0))
-                .key_binding(|key_press| {
-                    let is_enter =
-                        key_press.key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter);
-                    if is_enter && key_press.modifiers.command() {
-                        Some(text_editor::Binding::Custom(Message::Send))
-                    } else {
-                        text_editor::Binding::from_key_press(key_press)
-                    }
-                }),
+                .key_binding(|key_press| crate::ai_composer::key_binding(key_press, Message::Send, Message::Composer)),
             row![
                 text(if state.model.is_empty() {
                     "No model selected".to_string()

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cosmic_text::LayoutLine;
-use iced::widget::canvas::{Frame, Stroke, Text};
+use iced::widget::canvas::{Frame, Path, Stroke, Text};
 use iced::{Color, Point, Size};
 
 use super::buffer::Buffer;
@@ -180,19 +180,18 @@ pub fn draw(
         }
     }
 
-    // Horizontal scroll thumb along the bottom edge, only when the text overflows.
-    let track_width = (frame.size().width - gutter_width).max(0.0);
-    let total_width = buffer.content_width() + super::H_SCROLL_PAD;
-    if total_width > track_width && track_width > 0.0 {
-        let thumb_width = (track_width * track_width / total_width).max(20.0);
-        let thumb_x = (gutter_width + scroll_x / total_width * track_width)
-            .min(gutter_width + track_width - thumb_width);
-        frame.fill_rectangle(
-            Point::new(thumb_x, viewport_height - 6.0),
-            Size::new(thumb_width, 4.0),
-            iced::Color { a: 0.3, ..style.text_color },
-        );
-    }
+}
+
+/// Draws a scrollbar thumb (see `CodeEditor::thumb`), semi-transparent so the text under it
+/// stays readable, and brighter while `active` (hovered or dragged).
+pub fn draw_thumb(frame: &mut Frame, thumb: iced::Rectangle, style: &Style, active: bool) {
+    let inset = 2.0;
+    let path = Path::rounded_rectangle(
+        Point::new(thumb.x + inset, thumb.y + inset),
+        Size::new(thumb.width - inset * 2.0, thumb.height - inset * 2.0),
+        ((super::BAR - inset * 2.0) / 2.0).into(),
+    );
+    frame.fill(&path, iced::Color { a: if active { 0.5 } else { 0.25 }, ..style.text_color });
 }
 
 fn draw_line_number(frame: &mut Frame, number: usize, y: f32, gutter_width: f32, style: &Style) {

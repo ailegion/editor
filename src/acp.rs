@@ -1037,15 +1037,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
                 .placeholder("Ask your assistant… (Cmd/Ctrl+Enter to send)")
                 .on_action(Message::InputChanged)
                 .height(Length::Fixed(60.0))
-                .key_binding(|key_press| {
-                    let is_enter =
-                        key_press.key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter);
-                    if is_enter && key_press.modifiers.command() {
-                        Some(text_editor::Binding::Custom(Message::Send))
-                    } else {
-                        text_editor::Binding::from_key_press(key_press)
-                    }
-                }),
+                .key_binding(|key_press| crate::ai_composer::key_binding(key_press, Message::Send, Message::Composer)),
             row![text(if state.stopping { "Stopping…" } else if awaiting_permission { "Waiting for approval" } else if state.streaming { "Working…" } else { "Ready" }).size(12).style(iced::widget::text::secondary), Space::new().width(Length::Fill), model_button, usage_ring, send_button].spacing(6).align_y(iced::Alignment::Center),
         ]
         .spacing(4).into(),

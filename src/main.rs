@@ -283,6 +283,9 @@ enum Message {
     AiAttachmentsLoaded(AiMode, PathBuf, Vec<Result<ai_context::Attachment, String>>),
     AiReference,
     AiRemoveAttachment(usize),
+    AiPaste,
+    /// Clipboard text for the AI input, used when `AiPaste` found no image.
+    AiPasteText(Option<String>),
     Codex(acp::Message),
     Chat(chat::Message),
     Acp(acp::Message),
@@ -1617,6 +1620,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 ai_composer::Action::Attach => Message::AiAttach,
                 ai_composer::Action::Reference => Message::AiReference,
                 ai_composer::Action::Remove(index) => Message::AiRemoveAttachment(index),
+                ai_composer::Action::Paste => Message::AiPaste,
                 ai_composer::Action::Drop(paths) => {
                     if let Some(tree) = &mut state.tree {
                         let _ = tree.update(DirectoryTreeEvent::Drag(iced_swdir_tree::DragMsg::Cancelled));
@@ -1664,6 +1668,29 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::AiRemoveAttachment(index) => {
             let attachments = match state.ai_mode { AiMode::Http => &mut state.chat.attachments, AiMode::Acp => &mut state.acp.attachments, AiMode::Codex => &mut state.codex.attachments };
             if index < attachments.len() { attachments.remove(index); }
+        }
+        Message::AiPaste => {
+            let mode = state.ai_mode;
+            let project = state.root_or_cwd();
+            task = Task::perform(
+                async { tokio::task::spawn_blocking(ai_context::Attachment::from_clipboard).await.unwrap_or_else(|e| Err(e.to_string())) },
+                move |result| match result {
+                    Ok(Some(image)) => Message::AiAttachmentsLoaded(mode, project.clone(), vec![Ok(image)]),
+                    Ok(None) => Message::AiPasteText(None),
+                    Err(error) => Message::AiAttachmentsLoaded(mode, project.clone(), vec![Err(error)]),
+                },
+            );
+        }
+        Message::AiPasteText(None) => task = iced::clipboard::read().map(|text| Message::AiPasteText(Some(text.unwrap_or_default()))),
+        Message::AiPasteText(Some(text)) => {
+            use iced::widget::text_editor;
+            let paste = text_editor::Action::Edit(text_editor::Edit::Paste(std::sync::Arc::new(text)));
+            let next = match state.ai_mode {
+                AiMode::Http => Message::Chat(chat::Message::InputChanged(paste)),
+                AiMode::Acp => Message::Acp(acp::Message::InputChanged(paste)),
+                AiMode::Codex => Message::Codex(acp::Message::InputChanged(paste)),
+            };
+            return update(state, next);
         }
         Message::AiReference => {
             if let Some(tab) = state.tabs.get_mut(state.active_tab) {
