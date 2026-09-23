@@ -138,6 +138,8 @@ pub struct ChatState {
     streaming: bool,
     settings_open: bool,
     files_changed: bool,
+    /// Selectable copies of `messages`' text, kept in step by `sync_selectable`.
+    selectable: crate::ai_selectable::Cache,
 }
 
 impl Default for ChatState {
@@ -162,6 +164,7 @@ impl Default for ChatState {
             streaming: false,
             settings_open: false,
             files_changed: false,
+            selectable: Default::default(),
         }
     }
 }
@@ -189,9 +192,21 @@ pub enum Message {
     RememberPermission(bool),
     ResetPermissions,
     OllamaPreset,
+    /// Selection or caret movement inside message `usize`'s text.
+    Selectable(usize, text_editor::Action),
 }
 
 impl ChatState {
+    /// Keeps the selectable text in step with `messages`; called after every change.
+    fn sync_selectable(&mut self) {
+        self.selectable.sync(self.messages.iter().map(|message| message.content.as_str()));
+    }
+
+    pub fn poll(&mut self) {
+        self.poll_events();
+        self.sync_selectable();
+    }
+
     pub fn set_project(&mut self, cwd: &Path) {
         if self.cwd.as_deref().is_some_and(|previous| previous != cwd) {
             self.stop();
@@ -203,7 +218,7 @@ impl ChatState {
         self.cwd = Some(cwd.to_path_buf());
     }
 
-    pub fn poll(&mut self) {
+    fn poll_events(&mut self) {
         if let Some(rx) = &self.test_rx {
             let mut finished = false;
             while let Ok(event) = rx.try_recv() {
@@ -435,7 +450,9 @@ pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Mes
                 let _ = pending.respond.send(allowed);
             }
         }
+        Message::Selectable(index, action) => state.selectable.perform(index, action),
     }
+    state.sync_selectable();
     Task::none()
 }
 
@@ -582,6 +599,11 @@ pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>)
             }
             continue;
         }
+        // Selectable text when the cache has caught up with this message; plain text otherwise.
+        let body: Element<'a, Message> = match state.selectable.get(i) {
+            Some(selectable) => crate::ai_selectable::view(selectable, 13.0, move |action| Message::Selectable(i, action)),
+            None => text(message.content.clone()).size(13).into(),
+        };
         messages_col = messages_col.push(column![
             row![
                 text(message.role.label()).size(12),
@@ -590,7 +612,7 @@ pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>)
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center),
-            text(message.content.clone()).size(13),
+            body,
         ]);
     }
     let messages = scrollable(messages_col.spacing(16)).anchor_bottom().height(Length::Fill);

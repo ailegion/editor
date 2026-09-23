@@ -185,6 +185,8 @@ pub struct AcpState {
     thread_menu_open: bool,
     stopping: bool,
     expanded_thinking: Vec<usize>,
+    /// Selectable copies of `entries`' message text, kept in step by `sync_selectable`.
+    selectable: crate::ai_selectable::Cache,
 }
 
 impl Default for AcpState {
@@ -218,6 +220,7 @@ impl Default for AcpState {
             thread_menu_open: false,
             stopping: false,
             expanded_thinking: Vec::new(),
+            selectable: Default::default(),
         }
     }
 }
@@ -241,10 +244,25 @@ pub enum Message {
     RememberPermission(bool),
     ResetPermissions,
     Copy(String),
+    /// Selection or caret movement inside message `usize`'s text.
+    Selectable(usize, text_editor::Action),
 }
 
 impl AcpState {
     pub fn codex() -> Self { Self { provider: "Codex", ..Self::default() } }
+
+    /// Keeps the selectable text in step with `entries`; called after every change.
+    fn sync_selectable(&mut self) {
+        self.selectable.sync(self.entries.iter().map(|entry| match entry {
+            Entry::User { content } | Entry::Assistant { content } => content.as_str(),
+            _ => "",
+        }));
+    }
+
+    pub fn poll(&mut self) {
+        self.poll_events();
+        self.sync_selectable();
+    }
 
     /// Returns true (once) the first time this is called after a turn finishes,
     /// so the caller can react (e.g. reload files the agent may have edited).
@@ -252,7 +270,7 @@ impl AcpState {
         std::mem::take(&mut self.just_finished)
     }
 
-    pub fn poll(&mut self) {
+    fn poll_events(&mut self) {
         let Some(rx) = &self.rx else { return };
         let mut finished = false;
         let mut new_session_id = None;
@@ -818,7 +836,9 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
             }
         }
         Message::Copy(text) => return iced::clipboard::write(text),
+        Message::Selectable(index, action) => state.selectable.perform(index, action),
     }
+    state.sync_selectable();
     Task::none()
 }
 
@@ -863,7 +883,12 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
     let project = cwd.file_name().unwrap_or(cwd.as_os_str()).to_string_lossy().into_owned();
     header = header.push(text(format!("Project · {project}")).size(12).style(iced::widget::text::secondary));
 
-    let labeled_copyable = |label: &'static str, content: &str| -> Element<'_, Message> {
+    let labeled_copyable = |label: &'static str, index: usize, content: &str| -> Element<'_, Message> {
+        // Selectable text when the cache has caught up with this entry; plain text otherwise.
+        let body: Element<'_, Message> = match state.selectable.get(index) {
+            Some(selectable) => crate::ai_selectable::view(selectable, 13.0, move |action| Message::Selectable(index, action)),
+            None => text(content.to_string()).size(13).into(),
+        };
         column![
             row![
                 text(label).size(12),
@@ -872,7 +897,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center),
-            text(content.to_string()).size(13),
+            body,
         ]
         .into()
     };
@@ -937,7 +962,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
                     }
                 }).into()
             }
-            Entry::User { content } => labeled_copyable("You", content),
+            Entry::User { content } => labeled_copyable("You", i, content),
             Entry::Thinking { content } => {
                 let expanded = state.expanded_thinking.contains(&i);
                 let mut section = column![button(if expanded { "Hide thinking" } else { "Show thinking" })
@@ -946,7 +971,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
                 section.into()
             },
             Entry::Assistant { content } => {
-                container(labeled_copyable(state.provider, content)).padding(12).width(Length::Fill)
+                container(labeled_copyable(state.provider, i, content)).padding(12).width(Length::Fill)
                     .style(|theme: &iced::Theme| {
                         let palette = theme.extended_palette();
                         iced::widget::container::Style {

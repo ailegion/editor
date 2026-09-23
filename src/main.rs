@@ -6,6 +6,7 @@ mod updater;
 mod ai_approval;
 mod ai_composer;
 mod ai_context;
+mod ai_selectable;
 mod acp;
 mod terminal;
 mod chat;
