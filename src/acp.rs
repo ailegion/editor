@@ -9,8 +9,8 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest,
     PermissionOptionId, PermissionOptionKind, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
-    SessionUpdate, TextContent, ToolCallStatus,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigValueId, SessionId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, TextContent, ToolCallStatus,
 };
 use agent_client_protocol::{AcpAgent, Agent, ConnectionTo};
 use serde::{Deserialize, Serialize};
@@ -69,6 +69,23 @@ struct Thread {
 struct ThreadStore {
     threads: Vec<Thread>,
     active: usize,
+    /// Model the user last picked; applied to every new or resumed session.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// The agent's model selector as reported through session config options.
+#[derive(Debug, Clone, PartialEq)]
+struct ModelOptions {
+    config_id: String,
+    current: String,
+    choices: Vec<(String, String)>,
+}
+
+impl ModelOptions {
+    fn current_name(&self) -> String {
+        self.choices.iter().find(|(id, _)| id == &self.current).map_or_else(|| self.current.clone(), |(_, name)| name.clone())
+    }
 }
 
 struct Usage {
@@ -91,7 +108,7 @@ enum Event {
     Delta(String),
     ThoughtDelta(String),
     Usage(u64, u64, Option<(f64, String)>),
-    Model(Option<String>),
+    Models(Option<ModelOptions>),
     SessionId(String),
     Permission(PendingPermission),
     ToolCall {
@@ -122,10 +139,14 @@ pub struct AcpState {
     rx: Option<Receiver<Event>>,
     prompt_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<ContentBlock>>>,
     cancel_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    model_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, String)>>,
     streaming: bool,
     started: bool,
     usage: Option<Usage>,
-    model: Option<String>,
+    models: Option<ModelOptions>,
+    models_reported: bool,
+    preferred_model: Option<String>,
+    model_menu_open: bool,
     usage_open: bool,
     pending_permission: Option<PendingPermission>,
     permission_queue: std::collections::VecDeque<PendingPermission>,
@@ -150,10 +171,14 @@ impl Default for AcpState {
             rx: None,
             prompt_tx: None,
             cancel_tx: None,
+            model_tx: None,
             streaming: false,
             started: false,
             usage: None,
-            model: None,
+            models: None,
+            models_reported: false,
+            preferred_model: None,
+            model_menu_open: false,
             usage_open: false,
             pending_permission: None,
             permission_queue: Default::default(),
@@ -170,6 +195,8 @@ pub enum Message {
     Composer(crate::ai_composer::Action),
     ToggleUsage,
     CloseUsage,
+    ToggleModelMenu,
+    SelectModel(String),
     NewThread,
     SwitchThread(usize),
     ThreadMenuToggle,
@@ -203,7 +230,10 @@ impl AcpState {
             match event {
                 Event::Delta(text) => Self::append_chunk(&mut self.entries, text, false),
                 Event::ThoughtDelta(text) => Self::append_chunk(&mut self.entries, text, true),
-                Event::Model(model) => self.model = model,
+                Event::Models(models) => {
+                    self.models = models;
+                    self.models_reported = true;
+                }
                 Event::Usage(used, size, cost) => {
                     self.usage = Some(Usage { used, size, cost });
                 }
@@ -238,6 +268,7 @@ impl AcpState {
             self.started = false;
             self.prompt_tx = None;
             self.cancel_tx = None;
+            self.model_tx = None;
             finished = true;
         }
         if let Some(id) = new_session_id {
@@ -328,6 +359,7 @@ impl AcpState {
         if let Some(path) = threads_path(cwd, self.provider) {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 if let Ok(store) = serde_json::from_str::<ThreadStore>(&text) {
+                    self.preferred_model = store.model;
                     if !store.threads.is_empty() {
                         self.threads = store.threads;
                         self.active_thread = store.active.min(self.threads.len() - 1);
@@ -364,6 +396,7 @@ impl AcpState {
         let store = ThreadStore {
             threads: self.threads.clone(),
             active: self.active_thread,
+            model: self.preferred_model.clone(),
         };
         if let Ok(text) = serde_json::to_string(&store) {
             let _ = std::fs::write(path, text);
@@ -372,7 +405,10 @@ impl AcpState {
 
     fn reset_connection(&mut self) {
         self.session_grants.clear();
-        self.model = None;
+        self.models = None;
+        self.models_reported = false;
+        self.model_menu_open = false;
+        self.model_tx = None;
         self.usage_open = false;
         self.stopping = false;
         self.expanded_thinking.clear();
@@ -397,8 +433,11 @@ impl AcpState {
         self.prompt_tx = Some(prompt_tx);
         let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         self.cancel_tx = Some(cancel_tx);
+        let (model_tx, mut model_rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+        self.model_tx = Some(model_tx);
 
         let provider = self.provider;
+        let preferred_model = self.preferred_model.clone();
         std::thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -412,7 +451,7 @@ impl AcpState {
             };
 
             runtime.block_on(async move {
-                let agent = match AcpAgent::from_args([if cfg!(windows) { "npx.cmd" } else { "npx" }, "--yes", if provider == "Codex" { "@zed-industries/codex-acp" } else { "@agentclientprotocol/claude-agent-acp" }])
+                let agent = match AcpAgent::from_args([if cfg!(windows) { "npx.cmd" } else { "npx" }, "--yes", if provider == "Codex" { "@agentclientprotocol/codex-acp" } else { "@agentclientprotocol/claude-agent-acp" }])
                 {
                     Ok(agent) => agent,
                     Err(err) => {
@@ -447,7 +486,7 @@ impl AcpState {
                                     }
                                 }
                                 SessionUpdate::ConfigOptionUpdate(update) => {
-                                    let _ = notify_tx.send(Event::Model(model_from_options(&update.config_options)));
+                                    let _ = notify_tx.send(Event::Models(model_from_options(&update.config_options)));
                                 }
                                 SessionUpdate::UsageUpdate(usage) => {
                                     let cost = usage.cost.map(|c| (c.amount, c.currency));
@@ -531,6 +570,7 @@ impl AcpState {
                             .await?;
 
                         let mut loaded_session_id = None;
+                        let mut config_options = Vec::new();
                         if init_response.agent_capabilities.load_session {
                             if let Some(id) = resume_session_id.clone() {
                                 let loaded = connection
@@ -538,7 +578,7 @@ impl AcpState {
                                     .block_task()
                                     .await;
                                 if let Ok(loaded) = loaded {
-                                    let _ = loop_tx.send(Event::Model(model_from_options(loaded.config_options.as_deref().unwrap_or_default())));
+                                    config_options = loaded.config_options.unwrap_or_default();
                                     loaded_session_id = Some(SessionId::new(id));
                                 }
                             }
@@ -551,12 +591,36 @@ impl AcpState {
                                     .send_request(NewSessionRequest::new(cwd))
                                     .block_task()
                                     .await?;
-                                let _ = loop_tx.send(Event::Model(model_from_options(session.config_options.as_deref().unwrap_or_default())));
+                                config_options = session.config_options.unwrap_or_default();
                                 session.session_id
                             }
                         };
+                        // Apply the remembered model before the first prompt can be sent.
+                        let mut models = model_from_options(&config_options);
+                        if let (Some(options), Some(preferred)) = (&models, &preferred_model) {
+                            if &options.current != preferred && options.choices.iter().any(|(id, _)| id == preferred) {
+                                let request = SetSessionConfigOptionRequest::new(session_id.clone(), options.config_id.clone(), SessionConfigValueId::new(preferred.as_str()));
+                                if let Ok(response) = connection.send_request(request).block_task().await {
+                                    models = model_from_options(&response.config_options);
+                                }
+                            }
+                        }
+                        let _ = loop_tx.send(Event::Models(models));
                         let _ = loop_tx.send(Event::SessionId(session_id.0.to_string()));
                         loop_accepting.store(true, Ordering::Relaxed);
+
+                        let model_connection = connection.clone();
+                        let model_session_id = session_id.clone();
+                        let model_event_tx = loop_tx.clone();
+                        tokio::spawn(async move {
+                            while let Some((config_id, value)) = model_rx.recv().await {
+                                let request = SetSessionConfigOptionRequest::new(model_session_id.clone(), config_id, SessionConfigValueId::new(value));
+                                match model_connection.send_request(request).block_task().await {
+                                    Ok(response) => { let _ = model_event_tx.send(Event::Models(model_from_options(&response.config_options))); }
+                                    Err(err) => { let _ = model_event_tx.send(Event::Error(format!("could not change model: {err}"))); }
+                                }
+                            }
+                        });
 
                         let cancel_connection = connection.clone();
                         let cancel_session_id = session_id.clone();
@@ -607,11 +671,7 @@ impl AcpState {
         }
         let text = text.trim_end().to_string();
         self.input = text_editor::Content::new();
-        let resume_session_id = self
-            .threads
-            .get(self.active_thread)
-            .and_then(|t| t.session_id.clone());
-        self.start(cwd, resume_session_id);
+        self.connect(cwd);
         let mut prompt = vec![ContentBlock::Text(TextContent::new(text.clone()))];
         let mut display = text;
         for attachment in self.attachments.drain(..) {
@@ -622,6 +682,25 @@ impl AcpState {
         self.streaming = true;
         if let Some(tx) = &self.prompt_tx {
             let _ = tx.send(prompt);
+        }
+    }
+
+    /// Starts (or resumes) the active thread's agent session if it is not running yet.
+    fn connect(&mut self, cwd: PathBuf) {
+        let resume_session_id = self
+            .threads
+            .get(self.active_thread)
+            .and_then(|t| t.session_id.clone());
+        self.start(cwd, resume_session_id);
+    }
+
+    fn select_model(&mut self, value: String) {
+        self.model_menu_open = false;
+        self.preferred_model = Some(value.clone());
+        let Some(models) = &mut self.models else { return };
+        if models.current == value { return; }
+        if let Some(tx) = &self.model_tx {
+            if tx.send((models.config_id.clone(), value.clone())).is_ok() { models.current = value; }
         }
     }
 
@@ -671,6 +750,15 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
         Message::Composer(_) => {},
         Message::ToggleUsage => state.usage_open = !state.usage_open,
         Message::CloseUsage => state.usage_open = false,
+        Message::ToggleModelMenu => {
+            state.model_menu_open = !state.model_menu_open;
+            // Models are only reported once a session exists, so connect early to list them.
+            if state.model_menu_open { state.connect(cwd); }
+        }
+        Message::SelectModel(value) => {
+            state.select_model(value);
+            state.persist(&cwd);
+        }
         Message::NewThread => state.new_thread(&cwd),
         Message::SwitchThread(i) => {
             state.switch_thread(i, &cwd);
@@ -869,8 +957,38 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
     if !state.session_grants.is_empty() {
         bottom = bottom.push(button("Reset session approvals").style(crate::flat_button_style).on_press(Message::ResetPermissions));
     }
+    if state.model_menu_open {
+        let mut menu = column![].spacing(2);
+        match &state.models {
+            Some(models) if !models.choices.is_empty() => {
+                for (id, name) in &models.choices {
+                    let label = if id == &models.current { format!("✓ {name}") } else { name.clone() };
+                    menu = menu.push(button(text(label).size(12)).width(Length::Fill).padding([4, 8])
+                        .style(crate::flat_button_style)
+                        .on_press_maybe((!state.streaming).then(|| Message::SelectModel(id.clone()))));
+                }
+            }
+            _ if state.started && !state.models_reported => {
+                menu = menu.push(text("Loading models…").size(12).style(iced::widget::text::secondary));
+            }
+            _ => {
+                menu = menu.push(text(format!("{} did not report any selectable models.", state.provider)).size(12).style(iced::widget::text::secondary));
+            }
+        }
+        bottom = bottom.push(container(scrollable(menu)).padding(4).max_height(240).style(|theme: &iced::Theme| {
+            let palette = theme.extended_palette();
+            iced::widget::container::Style {
+                background: Some(palette.background.weak.color.into()),
+                border: iced::Border::default().rounded(6.0),
+                ..iced::widget::container::Style::default()
+            }
+        }));
+    }
+    let model_name = state.models.as_ref().map(ModelOptions::current_name);
+    let model_button = button(text(format!("{} ▾", model_name.clone().or_else(|| state.preferred_model.clone()).unwrap_or_else(|| "Model".into()))).size(12))
+        .padding([2, 6]).style(crate::flat_button_style).on_press(Message::ToggleModelMenu);
     let usage_ring = crate::ai_usage::view(crate::ai_usage::Info {
-        provider: format!("{} ACP", state.provider), model: state.model.clone(),
+        provider: format!("{} ACP", state.provider), model: model_name,
         used: state.usage.as_ref().map(|u| u.used), capacity: state.usage.as_ref().map(|u| u.size),
         cost: state.usage.as_ref().and_then(|u| u.cost.clone()),
     }, state.usage_open, Message::ToggleUsage, Message::CloseUsage);
@@ -898,7 +1016,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
                         text_editor::Binding::from_key_press(key_press)
                     }
                 }),
-            row![text(if state.stopping { "Stopping…" } else if awaiting_permission { "Waiting for approval" } else if state.streaming { "Working…" } else { "Ready" }).size(12).style(iced::widget::text::secondary), Space::new().width(Length::Fill), usage_ring, send_button].spacing(6).align_y(iced::Alignment::Center),
+            row![text(if state.stopping { "Stopping…" } else if awaiting_permission { "Waiting for approval" } else if state.streaming { "Working…" } else { "Ready" }).size(12).style(iced::widget::text::secondary), Space::new().width(Length::Fill), model_button, usage_ring, send_button].spacing(6).align_y(iced::Alignment::Center),
         ]
         .spacing(4).into(),
         &state.attachments, composer, Message::Composer,
@@ -939,14 +1057,21 @@ fn threads_path(cwd: &Path, provider: &str) -> Option<PathBuf> {
     )
 }
 
-fn model_from_options(options: &[agent_client_protocol::schema::v1::SessionConfigOption]) -> Option<String> {
-    use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigOptionCategory};
+fn model_from_options(options: &[agent_client_protocol::schema::v1::SessionConfigOption]) -> Option<ModelOptions> {
+    use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigOptionCategory, SessionConfigSelectOptions};
     options.iter().find_map(|option| {
         if option.category != Some(SessionConfigOptionCategory::Model) && option.id.0.as_ref() != "model" { return None; }
-        match &option.kind {
-            SessionConfigKind::Select(select) => Some(select.current_value.0.to_string()),
-            _ => None,
-        }
+        let SessionConfigKind::Select(select) = &option.kind else { return None };
+        let choices: Vec<_> = match &select.options {
+            SessionConfigSelectOptions::Ungrouped(options) => options.iter().collect(),
+            SessionConfigSelectOptions::Grouped(groups) => groups.iter().flat_map(|group| &group.options).collect(),
+            _ => Vec::new(),
+        };
+        Some(ModelOptions {
+            config_id: option.id.0.to_string(),
+            current: select.current_value.0.to_string(),
+            choices: choices.into_iter().map(|choice| (choice.value.0.to_string(), choice.name.clone())).collect(),
+        })
     })
 }
 
@@ -958,10 +1083,30 @@ mod tests {
     fn model_metadata_is_read_from_session_configuration() {
         let options = serde_json::from_value::<Vec<agent_client_protocol::schema::v1::SessionConfigOption>>(serde_json::json!([
             {"id":"mode", "name":"Mode", "type":"select", "currentValue":"code", "options":[]},
-            {"id":"agent-model", "category":"model", "name":"Model", "type":"select", "currentValue":"reported-model", "options":[]}
+            {"id":"agent-model", "category":"model", "name":"Model", "type":"select", "currentValue":"fast", "options":[
+                {"group":"recommended", "name":"Recommended", "options":[{"value":"fast", "name":"Fast model"}]},
+                {"group":"other", "name":"Other", "options":[{"value":"deep", "name":"Deep model"}]}
+            ]}
         ])).unwrap();
-        assert_eq!(model_from_options(&options).as_deref(), Some("reported-model"));
+        let models = model_from_options(&options).unwrap();
+        assert_eq!(models.config_id, "agent-model");
+        assert_eq!(models.current_name(), "Fast model");
+        assert_eq!(models.choices, vec![("fast".into(), "Fast model".into()), ("deep".into(), "Deep model".into())]);
         assert_eq!(model_from_options(&[]), None);
+    }
+
+    #[test]
+    fn selecting_a_model_requests_the_change_and_remembers_it() {
+        let mut state = AcpState::default();
+        let (model_tx, mut model_rx) = tokio::sync::mpsc::unbounded_channel();
+        state.model_tx = Some(model_tx);
+        state.models = Some(ModelOptions { config_id: "model".into(), current: "fast".into(), choices: vec![("fast".into(), "Fast".into()), ("deep".into(), "Deep".into())] });
+        state.model_menu_open = true;
+        state.select_model("deep".into());
+        assert_eq!(model_rx.try_recv().unwrap(), ("model".into(), "deep".into()));
+        assert_eq!(state.models.as_ref().unwrap().current, "deep");
+        assert_eq!(state.preferred_model.as_deref(), Some("deep"));
+        assert!(!state.model_menu_open);
     }
 
     #[test]

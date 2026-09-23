@@ -26,8 +26,8 @@ model. Other OpenAI-compatible servers use the same base URL, key, and model set
 Image prompts require a vision-capable model.
 
 ACP starts `npx --yes @agentclientprotocol/claude-agent-acp` or
-`npx --yes @zed-industries/codex-acp`. Node/npm must be on PATH; configure the agent's
-credentials before chatting. Codex adapter setup: https://github.com/zed-industries/codex-acp.
+`npx --yes @agentclientprotocol/codex-acp`. Node/npm must be on PATH; configure the agent's
+credentials before chatting. Codex adapter setup: https://github.com/agentclientprotocol/codex-acp.
 The first launch may download the adapter. Connection errors appear in the conversation.
 
 - Drag project-tree files or external files/images onto the AI message composer.
