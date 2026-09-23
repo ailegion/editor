@@ -441,7 +441,7 @@ impl State {
             goto_line: goto_line::GotoLineState::default(),
             about: about::AboutState::default(),
             recent_files: recent_files::load(),
-            git: git::GitState::default(),
+            git: git::GitState::new(),
             git_preview: None,
             gutter_due: None,
             app_theme,

@@ -9,8 +9,9 @@ pub mod repo;
 pub mod status;
 mod watch;
 
-use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
+use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_input, Space};
 use iced::{Element, Length, Task};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -30,21 +31,35 @@ pub struct GitState {
     project: Option<Option<PathBuf>>,
     repo: Option<Arc<repo::Repo>>,
     watch: Option<watch::Watch>,
+    /// Show changed files as a directory tree rather than a flat list. Persisted.
+    tree_view: bool,
+    /// Directories collapsed in tree view, by repository-relative path.
+    collapsed: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Refresh,
     OpenDiff(String),
-    Stage(ChangedFile, bool),
+    /// Stage (`true`) or unstage (`false`) these files in one git call.
+    Stage(Vec<ChangedFile>, bool),
     Staged(Result<(), String>),
     Refreshed(Result<status::Status, String>),
     CommitMessageChanged(String),
     Commit,
     Committed(Result<(), String>),
+    ToggleTreeView,
+    ToggleDir(String),
 }
 
 impl GitState {
+    pub fn new() -> Self {
+        let tree_view = crate::config_path("git_tree_view")
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .map_or(true, |text| text.trim() != "false");
+        Self { tree_view, ..Self::default() }
+    }
+
     /// Follows the open project: finds its repository and starts watching it. Returns whether
     /// the project changed, so views derived from the previous repository can be reloaded.
     pub fn set_project(&mut self, root: Option<&Path>) -> bool {
@@ -70,14 +85,24 @@ impl GitState {
 pub fn update(state: &mut GitState, message: Message, cwd: PathBuf) -> Task<Message> {
     match message {
         Message::OpenDiff(_) => {},
-        Message::Stage(file, stage) => {
-            if state.committing { return Task::none(); }
+        Message::Stage(files, stage) => {
+            if state.committing || files.is_empty() { return Task::none(); }
             state.committing = true;
             let unborn = state.status.branch.unborn();
             return Task::perform(async move {
-                tokio::task::spawn_blocking(move || stage_file(&cwd, &file, stage, unborn))
+                tokio::task::spawn_blocking(move || stage_files(&cwd, &files, stage, unborn))
                     .await.map_err(|err| err.to_string())?
             }, Message::Staged);
+        }
+        Message::ToggleTreeView => {
+            state.tree_view = !state.tree_view;
+            if let Some(path) = crate::config_path("git_tree_view") {
+                if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
+                let _ = std::fs::write(path, if state.tree_view { "true" } else { "false" });
+            }
+        }
+        Message::ToggleDir(path) => {
+            if !state.collapsed.remove(&path) { state.collapsed.insert(path); }
         }
         Message::Staged(result) => {
             state.committing = false;
@@ -155,54 +180,83 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
     if ahead > 0 || behind > 0 {
         branch = branch.push(text(format!("↑{ahead} ↓{behind}")).size(12).style(iced::widget::text::secondary));
     }
-    let mut files_col = column![].spacing(4);
+    let mut files_col = column![].spacing(2);
     if state.status.files.is_empty() && state.error.is_none() {
         files_col = files_col.push(container(text("Working tree clean").size(13)).padding([16, 0]));
     }
-    for (title, staged) in [("Staged changes", true), ("Unstaged changes", false)] {
-    let files: Vec<_> = state.status.files.iter().filter(|file| if staged { file.staged() } else { file.unstaged() }).collect();
-    files_col = files_col.push(text(format!("{title} ({})", files.len())).size(12));
-    for file in files {
-        let is_selected = selected == Some(file.path.as_str());
-        let path = Path::new(&file.path);
-        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or(&file.path);
-        let parent = path.parent().and_then(|path| path.to_str()).unwrap_or("");
-        let mut label = column![text(name).size(13)].spacing(2);
-        if !parent.is_empty() {
-            label = label.push(text(parent).size(11).style(iced::widget::text::secondary));
+    let lucide = iced::Font::with_name("lucide");
+    for entry in rows(&state.status.files, state.tree_view, &state.collapsed) {
+        let (files, depth): (Vec<&ChangedFile>, usize) = match &entry {
+            Row::Dir { files, depth, .. } => (files.clone(), *depth),
+            Row::File { file, depth } => (vec![file], *depth),
+        };
+        // Checked = staged. A minus glyph marks partial staging (some edits still unstaged,
+        // or only some files under a directory); clicking it finishes staging.
+        let (checked, partial) = stage_state(&files);
+        let owned: Vec<ChangedFile> = files.iter().map(|file| (*file).clone()).collect();
+        let all_staged = checked && !partial;
+        let mut check = checkbox(checked).size(14)
+            .on_toggle_maybe((!state.committing).then_some(move |_| Message::Stage(owned.clone(), !all_staged)));
+        if partial {
+            check = check.icon(checkbox::Icon {
+                font: lucide, code_point: lucide_icons::Icon::Minus.into(), size: Some(iced::Pixels(11.0)),
+                line_height: iced::widget::text::LineHeight::default(), shaping: iced::widget::text::Shaping::Basic,
+            });
         }
-        let file_button = button(row![
-                label.width(Length::Fill),
-                text(file.status.trim()).size(12).style(|theme: &iced::Theme| {
-                    let palette = theme.extended_palette();
-                    let color = if file.status.contains('U') || file.status.contains('D') {
-                        palette.danger.base.color
-                    } else if file.status.contains('A') || file.status == "??" {
-                        palette.success.base.color
-                    } else {
-                        palette.primary.base.color
-                    };
-                    iced::widget::text::Style { color: Some(color) }
-                }),
-            ].spacing(8).align_y(iced::Alignment::Center))
-            .padding([6, 8])
-            .width(Length::Fill)
-            .style(move |theme, status| {
-                let mut style = crate::flat_button_style(theme, status);
-                if is_selected {
-                    style.background = Some(theme.extended_palette().primary.weak.color.into());
-                    style.text_color = theme.extended_palette().primary.weak.text;
+        let indent = Space::new().width(Length::Fixed(depth as f32 * 14.0));
+        let label: Element<'a, Message> = match &entry {
+            Row::Dir { path, name, open, .. } => {
+                let chevron: char = if *open { lucide_icons::Icon::ChevronDown } else { lucide_icons::Icon::ChevronRight }.into();
+                let folder: char = if *open { lucide_icons::Icon::FolderOpen } else { lucide_icons::Icon::Folder }.into();
+                button(row![
+                    text(chevron).font(lucide).size(12),
+                    text(folder).font(lucide).size(13).style(iced::widget::text::secondary),
+                    text(name.clone()).size(13).width(Length::Fill),
+                    text(files.len().to_string()).size(11).style(iced::widget::text::secondary),
+                ].spacing(6).align_y(iced::Alignment::Center))
+                .padding([4, 6]).width(Length::Fill).style(crate::flat_button_style)
+                .on_press(Message::ToggleDir(path.clone())).into()
+            }
+            Row::File { file, .. } => {
+                let file: &'a ChangedFile = file;
+                let is_selected = selected == Some(file.path.as_str());
+                let path = Path::new(&file.path);
+                let name = path.file_name().and_then(|name| name.to_str()).unwrap_or(&file.path);
+                let parent = path.parent().and_then(|path| path.to_str()).unwrap_or("");
+                let mut label = row![text(name).size(13)].spacing(6).align_y(iced::Alignment::Center);
+                // The tree already shows the directory; the flat list needs it on the row.
+                if !state.tree_view && !parent.is_empty() {
+                    label = label.push(text(parent).size(11).style(iced::widget::text::secondary));
                 }
-                style
-            })
-            .on_press(Message::OpenDiff(file.path.clone()));
-        let action = if file.conflicted() && !staged { "Mark resolved" } else if staged { "Unstage" } else { "Stage" };
-        files_col = files_col.push(row![file_button,
-            button(text(action).size(11))
-                .style(crate::flat_button_style)
-                .on_press_maybe((!state.committing).then(|| Message::Stage(file.clone(), !staged))),
-        ].spacing(4).align_y(iced::Alignment::Center));
-    }
+                button(row![
+                        label.width(Length::Fill),
+                        // Checking a conflicted file's box runs `git add`, i.e. marks it resolved.
+                        text(if file.conflicted() { "conflict" } else { file.status.trim() }).size(12).style(|theme: &iced::Theme| {
+                            let palette = theme.extended_palette();
+                            let color = if file.status.contains('U') || file.status.contains('D') {
+                                palette.danger.base.color
+                            } else if file.status.contains('A') || file.status == "??" {
+                                palette.success.base.color
+                            } else {
+                                palette.primary.base.color
+                            };
+                            iced::widget::text::Style { color: Some(color) }
+                        }),
+                    ].spacing(8).align_y(iced::Alignment::Center))
+                    .padding([4, 6])
+                    .width(Length::Fill)
+                    .style(move |theme, status| {
+                        let mut style = crate::flat_button_style(theme, status);
+                        if is_selected {
+                            style.background = Some(theme.extended_palette().primary.weak.color.into());
+                            style.text_color = theme.extended_palette().primary.weak.text;
+                        }
+                        style
+                    })
+                    .on_press(Message::OpenDiff(file.path.clone())).into()
+            }
+        };
+        files_col = files_col.push(row![indent, check, label].spacing(4).align_y(iced::Alignment::Center));
     }
     let files_list = scrollable(files_col).height(Length::Fill);
 
@@ -222,11 +276,17 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
             .padding([8, 12])
             .on_press_maybe(can_commit.then_some(Message::Commit)),
     );
+    let to_stage: Vec<ChangedFile> = state.status.files.iter().filter(|file| file.unstaged() || !file.staged()).cloned().collect();
+    let to_unstage: Vec<ChangedFile> = state.status.files.iter().filter(|file| file.staged()).cloned().collect();
+    let staged_count = to_unstage.len();
     let changes = row![
         text("Changes").size(13),
+        text(format!("{} staged of {}", staged_count, state.status.files.len())).size(12).style(iced::widget::text::secondary),
         Space::new().width(Length::Fill),
-        text(state.status.files.len().to_string()).size(12).style(iced::widget::text::secondary),
-    ];
+        crate::icon_control(lucide_icons::Icon::Plus, "Stage all", (!state.committing && !to_stage.is_empty()).then(|| Message::Stage(to_stage.clone(), true)), false),
+        crate::icon_control(lucide_icons::Icon::Minus, "Unstage all", (!state.committing && !to_unstage.is_empty()).then(|| Message::Stage(to_unstage.clone(), false)), false),
+        crate::icon_control(lucide_icons::Icon::ListTree, if state.tree_view { "Show as flat list" } else { "Show as tree" }, Some(Message::ToggleTreeView), state.tree_view),
+    ].spacing(6).align_y(iced::Alignment::Center);
 
     container(column![header, branch, bottom, iced::widget::rule::horizontal(1), changes, files_list].spacing(8))
         .padding(8)
@@ -234,12 +294,84 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
         .into()
 }
 
+/// One line of the changes list: a directory (tree view only) or a file.
+enum Row<'a> {
+    Dir { path: String, name: String, depth: usize, open: bool, files: Vec<&'a ChangedFile> },
+    File { file: &'a ChangedFile, depth: usize },
+}
+
+#[cfg(test)]
+impl Row<'_> {
+    fn path(&self) -> &str {
+        match self { Row::Dir { path, .. } => path, Row::File { file, .. } => &file.path }
+    }
+    fn depth(&self) -> usize {
+        match self { Row::Dir { depth, .. } | Row::File { depth, .. } => *depth }
+    }
+}
+
+/// Lays the changed files out as rows: sorted by path when flat, otherwise a directory tree
+/// with directories first, single-child directory chains compacted (`src/git`) and
+/// `collapsed` directories closed.
+fn rows<'a>(files: &'a [ChangedFile], tree: bool, collapsed: &HashSet<String>) -> Vec<Row<'a>> {
+    if !tree {
+        let mut flat: Vec<&ChangedFile> = files.iter().collect();
+        flat.sort_by(|a, b| a.path.cmp(&b.path));
+        return flat.into_iter().map(|file| Row::File { file, depth: 0 }).collect();
+    }
+    #[derive(Default)]
+    struct Dir<'a> { dirs: BTreeMap<String, Dir<'a>>, files: Vec<&'a ChangedFile> }
+    impl<'a> Dir<'a> {
+        fn all_files(&self) -> Vec<&'a ChangedFile> {
+            let mut all = self.files.clone();
+            for dir in self.dirs.values() { all.extend(dir.all_files()); }
+            all
+        }
+    }
+    let mut root = Dir::default();
+    for file in files {
+        let mut dir = &mut root;
+        let mut parts = file.path.split('/').peekable();
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() { dir.files.push(file); break; }
+            dir = dir.dirs.entry(part.to_string()).or_default();
+        }
+    }
+    fn walk<'a>(dir: Dir<'a>, prefix: &str, depth: usize, collapsed: &HashSet<String>, out: &mut Vec<Row<'a>>) {
+        for (mut name, mut sub) in dir.dirs {
+            while sub.files.is_empty() && sub.dirs.len() == 1 {
+                let (child_name, child) = sub.dirs.into_iter().next().expect("one child");
+                name = format!("{name}/{child_name}");
+                sub = child;
+            }
+            let path = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+            let open = !collapsed.contains(&path);
+            out.push(Row::Dir { path: path.clone(), name, depth, open, files: sub.all_files() });
+            if open { walk(sub, &path, depth + 1, collapsed, out); }
+        }
+        let mut files = dir.files;
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        out.extend(files.into_iter().map(|file| Row::File { file, depth }));
+    }
+    let mut out = Vec::new();
+    walk(root, "", 0, collapsed, &mut out);
+    out
+}
+
+/// `(checked, partial)` for a checkbox covering `files`: checked once anything is staged,
+/// partial while any of it still has unstaged changes.
+fn stage_state(files: &[&ChangedFile]) -> (bool, bool) {
+    let any_staged = files.iter().any(|file| file.staged());
+    let all_staged = files.iter().all(|file| file.staged() && !file.unstaged());
+    (any_staged, any_staged && !all_staged)
+}
+
 /// Commits the index with `git commit`, so commit hooks and signing run as configured.
 fn commit(cwd: &Path, message: &str) -> Result<(), String> {
     cli::run(cwd, &["commit", "-F", "-"], Some(message.as_bytes()), Access::Write).map(|_| ())
 }
 
-fn stage_file(cwd: &Path, file: &ChangedFile, stage: bool, unborn: bool) -> Result<(), String> {
+fn stage_files(cwd: &Path, files: &[ChangedFile], stage: bool, unborn: bool) -> Result<(), String> {
     // Literal pathspecs also support filenames containing Git wildcard characters.
     let mut args = if stage {
         vec!["--literal-pathspecs", "add", "-A", "--"]
@@ -249,8 +381,10 @@ fn stage_file(cwd: &Path, file: &ChangedFile, stage: bool, unborn: bool) -> Resu
     } else {
         vec!["--literal-pathspecs", "restore", "--staged", "--"]
     };
-    args.push(&file.path);
-    if let Some(original) = &file.original { args.push(original); }
+    for file in files {
+        args.push(&file.path);
+        if let Some(original) = &file.original { args.push(original); }
+    }
     cli::run(cwd, &args, None, Access::Write).map(|_| ())
 }
 
@@ -274,24 +408,44 @@ mod tests {
         std::fs::write(root.join("a [1].txt"), "initial\n").unwrap();
         std::fs::write(root.join("b.txt"), "other\n").unwrap();
         let file = file("a [1].txt", "??");
-        stage_file(&root, &file, true, true).unwrap();
+        stage_files(&root, std::slice::from_ref(&file), true, true).unwrap();
         assert_eq!(git(&root, &["diff", "--cached", "--name-only"]).trim(), "a [1].txt");
-        stage_file(&root, &file, false, true).unwrap();
+        stage_files(&root, std::slice::from_ref(&file), false, true).unwrap();
         assert!(git(&root, &["ls-files"]).is_empty());
         assert_eq!(std::fs::read_to_string(root.join(&file.path)).unwrap(), "initial\n");
-        stage_file(&root, &file, true, true).unwrap();
+        stage_files(&root, std::slice::from_ref(&file), true, true).unwrap();
         git(&root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "Initial"]);
         std::fs::write(root.join(&file.path), "updated\n").unwrap();
-        stage_file(&root, &file, true, false).unwrap();
-        stage_file(&root, &file, false, false).unwrap();
+        stage_files(&root, std::slice::from_ref(&file), true, false).unwrap();
+        stage_files(&root, std::slice::from_ref(&file), false, false).unwrap();
         assert!(git(&root, &["diff", "--cached"]).is_empty());
         assert_eq!(std::fs::read_to_string(root.join(&file.path)).unwrap(), "updated\n");
         std::fs::remove_file(root.join(&file.path)).unwrap();
-        stage_file(&root, &file, true, false).unwrap();
+        stage_files(&root, std::slice::from_ref(&file), true, false).unwrap();
         assert!(git(&root, &["diff", "--cached", "--summary"]).contains("delete mode"));
-        stage_file(&root, &file, false, false).unwrap();
+        stage_files(&root, std::slice::from_ref(&file), false, false).unwrap();
         assert!(!root.join(&file.path).exists());
+        // Several files in one call, as the tree's directory checkboxes do.
+        let many = [self::tests::file("b.txt", "??"), self::tests::file("a [1].txt", " D")];
+        stage_files(&root, &many, true, false).unwrap();
+        assert_eq!(git(&root, &["diff", "--cached", "--name-only"]).lines().count(), 2);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tree_rows_nest_compact_and_collapse() {
+        let files = [file("src/git/status.rs", "M "), file("src/main.rs", " M"), file("README.md", "??"), file("src/git/cli.rs", "MM")];
+        let flat = rows(&files, false, &HashSet::new());
+        assert_eq!(flat.iter().map(Row::path).collect::<Vec<_>>(), ["README.md", "src/git/cli.rs", "src/git/status.rs", "src/main.rs"]);
+        let tree = rows(&files, true, &HashSet::new());
+        let labels: Vec<_> = tree.iter().map(|row| (row.depth(), row.path())).collect();
+        assert_eq!(labels, [(0, "src"), (1, "src/git"), (2, "src/git/cli.rs"), (2, "src/git/status.rs"), (1, "src/main.rs"), (0, "README.md")]);
+        let Row::Dir { files: under_git, .. } = &tree[1] else { panic!() };
+        assert_eq!(stage_state(under_git), (true, true)); // cli.rs still has unstaged edits
+        let collapsed = rows(&files, true, &HashSet::from(["src/git".to_string()]));
+        assert_eq!(collapsed.iter().map(Row::path).collect::<Vec<_>>(), ["src", "src/git", "src/main.rs", "README.md"]);
+        assert_eq!(stage_state(&[&files[0]]), (true, false));
+        assert_eq!(stage_state(&[&files[2]]), (false, false));
     }
 
     #[test]
@@ -303,7 +457,7 @@ mod tests {
         git(&root, &["config", "user.email", "test@example.com"]);
         git(&root, &["config", "commit.gpgsign", "false"]);
         std::fs::write(root.join("a.txt"), "a\n").unwrap();
-        stage_file(&root, &file("a.txt", "??"), true, true).unwrap();
+        stage_files(&root, &[file("a.txt", "??")], true, true).unwrap();
         let hook = root.join(".git/hooks/pre-commit");
         let write_hook = |script: &str| {
             std::fs::write(&hook, script).unwrap();
