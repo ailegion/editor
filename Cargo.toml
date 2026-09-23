@@ -10,7 +10,7 @@ base64 = "0.22"
 agent-client-protocol = "2.0.0"
 cosmic-text = "0.15.0"
 fuzzy-matcher = "0.3.7"
-iced = { version = "0.14.0", features = ["highlighter", "tokio", "image"] }
+iced = { version = "0.14.0", features = ["highlighter", "tokio", "image", "markdown"] }
 iced_aw = { version = "0.14.0", features = ["full"] }
 iced-swdir-tree = { path = "vendor/iced-swdir-tree", version = "0.9", features = ["icons"] }
 lucide-icons = "1.28.0"
@@ -35,6 +35,11 @@ flate2 = "1"
 # Theme installs (.vsix). flate2's decoder backend comes from its default features, already
 # enabled elsewhere in the tree; `theme::openvsx` tests extract a deflated archive.
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
+
+# Routes the native "About editor" app-menu item to the in-app About panel. Already in the tree via winit.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = "0.3"
 
 [package.metadata.bundle]
 name = "editor"

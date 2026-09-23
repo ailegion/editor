@@ -13,6 +13,7 @@ use std::{
 };
 
 const RELEASES: &str = "https://api.github.com/repos/ailegion/editor/releases/latest";
+const RELEASE_TAGS: &str = "https://api.github.com/repos/ailegion/editor/releases/tags";
 const DOWNLOADS: &str = "https://github.com/ailegion/editor/releases/download";
 const MARKER: &str = "editor-managed-installation-v1";
 const MAX_EXTRACTED: u64 = 1024 * 1024 * 1024;
@@ -239,6 +240,28 @@ struct Release {
 #[derive(Deserialize)]
 struct Asset {
     name: String,
+}
+
+#[derive(Deserialize)]
+struct Notes {
+    body: Option<String>,
+}
+
+/// Markdown notes of the GitHub release for this build's version. `None` if it has no release.
+pub fn release_notes() -> Result<Option<String>, String> {
+    let url = format!("{RELEASE_TAGS}/v{}", env!("CARGO_PKG_VERSION"));
+    let mut response = match agent().get(&url).header("User-Agent", "ailegion-editor-updater").call() {
+        Err(ureq::Error::StatusCode(404)) => return Ok(None),
+        result => result.map_err(|e| format!("Could not load release notes: {e}"))?,
+    };
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(2 * 1024 * 1024)
+        .read_to_vec()
+        .map_err(|e| e.to_string())?;
+    let notes: Notes = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    Ok(notes.body.filter(|body| !body.trim().is_empty()))
 }
 
 fn newer_version(tag: &str, current: &str) -> Result<Option<String>, String> {

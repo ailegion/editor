@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod about;
 mod ai_usage;
 mod updater;
 mod ai_approval;
@@ -224,6 +225,7 @@ enum Message {
     ToggleCommandPalette,
     GotoLine(goto_line::Message),
     ToggleGotoLine,
+    About(about::Message),
     Git(git::Message),
     GitPanelToggle,
     GitPreviewLoaded(PathBuf, String, Result<String, String>),
@@ -332,6 +334,7 @@ struct State {
     theme_install: theme_install::ThemeInstallState,
     command_palette: command_palette::PaletteState,
     goto_line: goto_line::GotoLineState,
+    about: about::AboutState,
     recent_files: Vec<PathBuf>,
     git: git::GitState,
     git_preview: Option<git_preview::Preview>,
@@ -431,6 +434,7 @@ impl State {
             theme_install: theme_install::ThemeInstallState::default(),
             command_palette: command_palette::PaletteState::default(),
             goto_line: goto_line::GotoLineState::default(),
+            about: about::AboutState::default(),
             recent_files: recent_files::load(),
             git: git::GitState::default(),
             git_preview: None,
@@ -789,6 +793,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
     }
     match message {
         Message::CheckUpdate => state.updater.check(),
+        Message::About(msg) => task = about::update(&mut state.about, msg).map(Message::About),
         Message::RestartUpdate => {
             state.last_session_write = std::time::Instant::now() - Duration::from_secs(1);
             state.persist_session();
@@ -1316,6 +1321,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
 
         Message::KeyPressed(key, modifiers) => {
+            // About is modal: Escape closes it and nothing reaches the panes behind it.
+            if state.about.visible {
+                if key == keyboard::Key::Named(keyboard::key::Named::Escape) {
+                    return update(state, Message::About(about::Message::Close));
+                }
+                return Task::none();
+            }
             if modifiers.control() && key.as_ref() == keyboard::Key::Character("`") {
                 return update(state, Message::TerminalToggle);
             }
@@ -1637,6 +1649,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             task = acp::update(&mut state.acp, msg, cwd).map(Message::Acp);
         }
         Message::Tick => {
+            if about::native_menu_requested() {
+                task = about::update(&mut state.about, about::Message::Open).map(Message::About);
+            }
             state.updater.poll();
             state.terminal.poll();
             if state.notice.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(8)) { state.notice = None; }
@@ -1724,7 +1739,7 @@ fn view(state: &State) -> Element<'_, Message> {
         let content: Element<'_, Message> = match kind {
             PaneKind::Terminal => state.terminal.view(
                 !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible
-                    && !state.theme_install.visible).map(Message::Terminal),
+                    && !state.theme_install.visible && !state.about.visible).map(Message::Terminal),
             PaneKind::Sidebar => container(view_sidebar(state))
                 .padding(0)
                 .width(Length::Fill)
@@ -1792,6 +1807,8 @@ fn view(state: &State) -> Element<'_, Message> {
             goto_line::view(&state.goto_line, line_count).map(Message::GotoLine),
         ]
         .into()
+    } else if state.about.visible {
+        iced::widget::stack![base, about::view(&state.about, &state.app_theme.iced).map(Message::About)].into()
     } else {
         base
     }
@@ -2759,6 +2776,23 @@ fn reveal_label() -> &'static str {
         "Show in Explorer"
     } else {
         "Open Containing Folder"
+    }
+}
+
+pub(crate) fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler");
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = std::process::Command::new("xdg-open");
+    // Release notes are remote content; hand only web links to the OS.
+    if url.starts_with("https://") || url.starts_with("http://") {
+        let _ = command.arg(url).spawn();
     }
 }
 
