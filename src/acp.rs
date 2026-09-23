@@ -138,6 +138,7 @@ enum Event {
     ThoughtDelta(String),
     Usage(u64, u64, Option<(f64, String)>),
     Models(Option<ModelOptions>),
+    ModelChanged(Result<ModelOptions, String>),
     SessionId(String),
     Permission(PendingPermission),
     ToolCall {
@@ -174,6 +175,7 @@ pub struct AcpState {
     usage: Option<Usage>,
     models: Option<ModelOptions>,
     models_reported: bool,
+    model_switching: bool,
     preferred_model: Option<String>,
     model_menu_open: bool,
     usage_open: bool,
@@ -206,6 +208,7 @@ impl Default for AcpState {
             usage: None,
             models: None,
             models_reported: false,
+            model_switching: false,
             preferred_model: None,
             model_menu_open: false,
             usage_open: false,
@@ -263,6 +266,17 @@ impl AcpState {
                     self.models = models;
                     self.models_reported = true;
                 }
+                Event::ModelChanged(result) => {
+                    self.model_switching = false;
+                    transcript_changed = true;
+                    match result {
+                        Ok(models) => {
+                            self.preferred_model = Some(models.current.clone());
+                            self.models = Some(models);
+                        }
+                        Err(err) => Self::append_chunk(&mut self.entries, format!("\n[error: could not change model: {err}]"), false),
+                    }
+                }
                 Event::Usage(used, size, cost) => {
                     self.usage = Some(Usage { used, size, cost });
                 }
@@ -294,6 +308,7 @@ impl AcpState {
         if self.pending_permission.is_none() { self.pending_permission = self.permission_queue.pop_front(); }
         let disconnected = self.prompt_tx.as_ref().is_some_and(|tx| tx.is_closed());
         if disconnected {
+            self.model_switching = false;
             self.session_grants.clear();
             self.started = false;
             self.prompt_tx = None;
@@ -438,6 +453,7 @@ impl AcpState {
         self.session_grants.clear();
         self.models = None;
         self.models_reported = false;
+        self.model_switching = false;
         self.model_menu_open = false;
         self.model_tx = None;
         self.usage_open = false;
@@ -627,12 +643,12 @@ impl AcpState {
                         };
                         // Apply the remembered model before the first prompt can be sent.
                         let mut models = model_from_options(&config_options);
-                        if let (Some(options), Some(preferred)) = (&models, &preferred_model) {
-                            if &options.current != preferred && options.choices.iter().any(|(id, _)| id == preferred) {
-                                let request = SetSessionConfigOptionRequest::new(session_id.clone(), options.config_id.clone(), SessionConfigValueId::new(preferred.as_str()));
-                                if let Ok(response) = connection.send_request(request).block_task().await {
-                                    models = model_from_options(&response.config_options);
-                                }
+                        if let Some(preferred) = &preferred_model {
+                            let _ = loop_tx.send(Event::Models(models.clone()));
+                            let options = models.as_ref().ok_or_else(|| agent_client_protocol::Error::internal_error().data("Agent did not report a model; saved selection cannot be confirmed"))?;
+                            if &options.current != preferred {
+                                models = Some(change_model(&connection, &session_id, &options.config_id, preferred).await
+                                    .map_err(|err| agent_client_protocol::Error::internal_error().data(err))?);
                             }
                         }
                         let _ = loop_tx.send(Event::Models(models));
@@ -644,11 +660,8 @@ impl AcpState {
                         let model_event_tx = loop_tx.clone();
                         tokio::spawn(async move {
                             while let Some((config_id, value)) = model_rx.recv().await {
-                                let request = SetSessionConfigOptionRequest::new(model_session_id.clone(), config_id, SessionConfigValueId::new(value));
-                                match model_connection.send_request(request).block_task().await {
-                                    Ok(response) => { let _ = model_event_tx.send(Event::Models(model_from_options(&response.config_options))); }
-                                    Err(err) => { let _ = model_event_tx.send(Event::Error(format!("could not change model: {err}"))); }
-                                }
+                                let result = change_model(&model_connection, &model_session_id, &config_id, &value).await;
+                                let _ = model_event_tx.send(Event::ModelChanged(result));
                             }
                         });
 
@@ -680,7 +693,7 @@ impl AcpState {
 
     fn send(&mut self, cwd: PathBuf) {
         let text = self.input.text();
-        if (text.trim().is_empty() && self.attachments.is_empty()) || self.streaming {
+        if (text.trim().is_empty() && self.attachments.is_empty()) || self.streaming || self.model_switching {
             return;
         }
         let text = text.trim_end().to_string();
@@ -711,12 +724,12 @@ impl AcpState {
     }
 
     fn select_model(&mut self, value: String) {
+        if self.streaming || self.model_switching { return; }
         self.model_menu_open = false;
-        self.preferred_model = Some(value.clone());
         let Some(models) = &mut self.models else { return };
         if models.current == value { return; }
         if let Some(tx) = &self.model_tx {
-            if tx.send((models.config_id.clone(), value.clone())).is_ok() { models.current = value; }
+            if tx.send((models.config_id.clone(), value)).is_ok() { self.model_switching = true; }
         }
     }
 
@@ -982,7 +995,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
                     let label = if id == &models.current { format!("✓ {name}") } else { name.clone() };
                     menu = menu.push(button(text(label).size(12)).width(Length::Fill).padding([4, 8])
                         .style(crate::flat_button_style)
-                        .on_press_maybe((!state.streaming).then(|| Message::SelectModel(id.clone()))));
+                        .on_press_maybe((!state.streaming && !state.model_switching).then(|| Message::SelectModel(id.clone()))));
                 }
             }
             _ if state.started && !state.models_reported => {
@@ -1002,7 +1015,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
         }));
     }
     let model_name = state.models.as_ref().map(ModelOptions::current_name);
-    let model_button = button(text(format!("{} ▾", model_name.clone().or_else(|| state.preferred_model.clone()).unwrap_or_else(|| "Model".into()))).size(12))
+    let model_button = button(text(if state.model_switching { "Switching…".into() } else { format!("{} ▾", model_name.clone().unwrap_or_else(|| "Model".into())) }).size(12))
         .padding([2, 6]).style(crate::flat_button_style).on_press(Message::ToggleModelMenu);
     let usage_ring = crate::ai_usage::view(crate::ai_usage::Info {
         provider: format!("{} ACP", state.provider), model: model_name,
@@ -1015,7 +1028,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
         crate::icon_control(lucide_icons::Icon::CircleStop, "Stop response", (!state.stopping).then_some(Message::Stop), false)
     } else {
         crate::icon_control(lucide_icons::Icon::SendHorizonal, "Send message (Cmd/Ctrl+Enter)",
-            (!awaiting_permission && (!state.input.text().trim().is_empty() || !state.attachments.is_empty())).then_some(Message::Send), false)
+            (!state.model_switching && !awaiting_permission && (!state.input.text().trim().is_empty() || !state.attachments.is_empty())).then_some(Message::Send), false)
     };
     bottom = bottom.push(crate::ai_composer::view(
         column![
@@ -1074,6 +1087,15 @@ fn threads_path(cwd: &Path, provider: &str) -> Option<PathBuf> {
     )
 }
 
+async fn change_model(connection: &ConnectionTo<Agent>, session: &SessionId, config_id: &str, value: &str) -> Result<ModelOptions, String> {
+    let response = connection.send_request(SetSessionConfigOptionRequest::new(
+        session.clone(), config_id.to_owned(), SessionConfigValueId::new(value),
+    )).block_task().await.map_err(|err| err.to_string())?;
+    let models = model_from_options(&response.config_options).ok_or("Agent did not confirm a model")?;
+    if models.current != value { return Err(format!("Requested {value}, but agent reported {}", models.current)); }
+    Ok(models)
+}
+
 fn model_from_options(options: &[agent_client_protocol::schema::v1::SessionConfigOption]) -> Option<ModelOptions> {
     use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigOptionCategory, SessionConfigSelectOptions};
     options.iter().find_map(|option| {
@@ -1121,9 +1143,32 @@ mod tests {
         state.model_menu_open = true;
         state.select_model("deep".into());
         assert_eq!(model_rx.try_recv().unwrap(), ("model".into(), "deep".into()));
+        assert_eq!(state.models.as_ref().unwrap().current, "fast");
+        assert_eq!(state.preferred_model, None);
+        assert!(state.model_switching);
+        assert!(!state.model_menu_open);
+        state.input = text_editor::Content::with_text("keep this draft");
+        state.send(PathBuf::from("."));
+        assert_eq!(state.input.text(), "keep this draft");
+        assert!(!state.started);
+        let (tx, rx) = mpsc::channel();
+        state.rx = Some(rx);
+        let mut confirmed = state.models.clone().unwrap();
+        confirmed.current = "deep".into();
+        tx.send(Event::ModelChanged(Ok(confirmed))).unwrap();
+        state.poll();
+        assert!(!state.model_switching);
         assert_eq!(state.models.as_ref().unwrap().current, "deep");
         assert_eq!(state.preferred_model.as_deref(), Some("deep"));
-        assert!(!state.model_menu_open);
+
+        state.select_model("fast".into());
+        assert!(state.model_switching);
+        tx.send(Event::ModelChanged(Err("rejected".into()))).unwrap();
+        state.poll();
+        assert!(!state.model_switching);
+        assert_eq!(state.models.as_ref().unwrap().current, "deep");
+        assert_eq!(state.preferred_model.as_deref(), Some("deep"));
+        assert!(state.entries.iter().any(|entry| matches!(entry, Entry::Assistant { content } if content.contains("rejected"))));
     }
 
     #[test]
