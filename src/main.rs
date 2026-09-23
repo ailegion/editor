@@ -230,6 +230,7 @@ enum Message {
     GitPanelToggle,
     GitPreviewLoaded(PathBuf, String, Result<String, String>),
     CloseGitPreview,
+    GitPreviewScrolled(bool, f32),
     GitDiffLoaded(PathBuf, Vec<(usize, git_diff::LineStatus)>),
     TabSelected(usize),
     TabClosed(usize),
@@ -273,7 +274,6 @@ enum Message {
     Noop,
 
     SidebarToggle,
-    SidebarSelected(SidebarMode),
     AiToggle,
     AiModeSelected(AiMode),
     TreeDragReleased,
@@ -1037,6 +1037,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::CloseGitPreview => state.git_preview = None,
+        Message::GitPreviewScrolled(left, y) => {
+            task = iced::widget::operation::scroll_to(
+                if left { git_preview::RIGHT_SCROLL } else { git_preview::LEFT_SCROLL },
+                scrollable::AbsoluteOffset { x: None, y: Some(y) },
+            );
+        }
         Message::Git(msg) => {
             match &msg {
                 git::Message::Committed(Ok(())) => state.notify("Commit created"),
@@ -1570,15 +1576,6 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Noop => {}
 
-        Message::SidebarSelected(mode) => {
-            if state.sidebar_mode != mode || !state.sidebar_visible {
-                return update(state, match mode {
-                    SidebarMode::Tree => Message::SidebarToggle,
-                    SidebarMode::ProjectSearch => Message::ToggleProjectSearch,
-                    SidebarMode::Git => Message::GitPanelToggle,
-                });
-            }
-        }
         Message::SidebarToggle => {
             state.toggle_sidebar_mode(SidebarMode::Tree);
         }
@@ -2227,20 +2224,11 @@ pub(crate) fn overlay_style(theme: &iced::Theme) -> iced::widget::container::Sty
 }
 
 fn view_sidebar(state: &State) -> Element<'_, Message> {
-    let nav = [
-        ("Files", lucide_icons::Icon::Folder, SidebarMode::Tree),
-        ("Search", lucide_icons::Icon::Search, SidebarMode::ProjectSearch),
-        ("Source control", lucide_icons::Icon::GitBranch, SidebarMode::Git),
-    ].into_iter().fold(row![].spacing(2), |nav, (label, icon, mode)| {
-        nav.push(icon_control(icon, label, Some(Message::SidebarSelected(mode)), state.sidebar_mode == mode))
-    });
-    let content = match state.sidebar_mode {
+    match state.sidebar_mode {
         SidebarMode::Tree => view_tree(state),
         SidebarMode::ProjectSearch => project_search::view(&state.project_search, state.root.as_deref()).map(Message::ProjectSearch),
         SidebarMode::Git => git::view(&state.git, state.git_preview.as_ref().map(|preview| preview.path.as_str())).map(Message::Git),
-    };
-    column![container(nav).padding([3, 6]), iced::widget::rule::horizontal(1), content]
-        .height(Length::Fill).into()
+    }
 }
 
 fn view_tree(state: &State) -> Element<'_, Message> {
@@ -2379,7 +2367,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             scrollable(tab_row).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())),
             header,
 
-            git_preview::view(preview, &state.app_theme.iced),
+            git_preview::view(preview, &state.app_theme.iced, Message::GitPreviewScrolled),
         ].width(Length::Fill).height(Length::Fill).into();
     }
     let mut editor_column = column![];

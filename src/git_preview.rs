@@ -236,7 +236,14 @@ fn cell<Message: 'static>(line: &Option<(usize, String)>, other: &Option<(usize,
     }).into()
 }
 
-pub fn view<'a, Message: 'static>(preview: &'a Preview, theme: &'a iced::Theme) -> Element<'a, Message> {
+pub const LEFT_SCROLL: &str = "git-diff-before";
+pub const RIGHT_SCROLL: &str = "git-diff-after";
+
+pub fn view<'a, Message: 'static>(
+    preview: &'a Preview,
+    theme: &'a iced::Theme,
+    on_scroll: impl Fn(bool, f32) -> Message + Copy + 'a,
+) -> Element<'a, Message> {
     let patch = match &preview.result {
         None => return container(text("Loading diff…")).padding(16).into(),
         Some(Err(err)) => return container(text(err).style(iced::widget::text::danger)).padding(16).into(),
@@ -244,8 +251,7 @@ pub fn view<'a, Message: 'static>(preview: &'a Preview, theme: &'a iced::Theme) 
     };
     let rows = split_diff(patch);
     responsive(move |size| {
-        // Both axes scroll together. Explicit finite widths avoid Fill inside the
-        // horizontal scrollable's unbounded content layout.
+        // Explicit finite widths avoid Fill inside an unbounded content layout.
         let longest = rows.iter().filter_map(|row| match row {
             DiffRow::Lines { old, new, .. } => Some(old.iter().chain(new.iter())
                 .map(|(_, text)| text.replace('\t', "    ").chars().count()).max().unwrap_or(0)),
@@ -271,21 +277,21 @@ pub fn view<'a, Message: 'static>(preview: &'a Preview, theme: &'a iced::Theme) 
                 }
             }
         }
-        // One vertical scroll keeps corresponding rows aligned. Each half can
-        // scroll long lines horizontally without pushing the other offscreen.
-        let content_height = 34.0 + rows.iter().map(|entry| match entry {
-            DiffRow::Header(_) => 30.0, DiffRow::Lines { .. } => 22.0,
-        }).sum::<f32>();
-        let halves = row![
+        // Viewport-sized scrollables keep horizontal bars visible. Synchronize
+        // only their vertical offsets so each side can still pan independently.
+        row![
             scrollable(left.width(content_width))
-                .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default()))
-                .width(viewport_half),
-            container(iced::widget::rule::vertical(1)).height(content_height),
+                .id(LEFT_SCROLL)
+                .direction(scrollable::Direction::Both { vertical: Default::default(), horizontal: Default::default() })
+                .on_scroll(move |viewport| on_scroll(true, viewport.absolute_offset().y))
+                .width(viewport_half).height(Length::Fill),
+            iced::widget::rule::vertical(1),
             scrollable(right.width(content_width))
-                .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default()))
-                .width(viewport_half),
-        ];
-        scrollable(halves).width(Length::Fill).height(Length::Fill).into()
+                .id(RIGHT_SCROLL)
+                .direction(scrollable::Direction::Both { vertical: Default::default(), horizontal: Default::default() })
+                .on_scroll(move |viewport| on_scroll(false, viewport.absolute_offset().y))
+                .width(viewport_half).height(Length::Fill),
+        ].width(Length::Fill).height(Length::Fill).into()
     }).into()
 }
 

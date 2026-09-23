@@ -217,17 +217,19 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
-fn get(url: &str, limit: u64) -> Result<Vec<u8>, String> {
-    agent()
+fn get(url: &str) -> Result<Vec<u8>, String> {
+    let mut response = agent()
         .get(url)
         .header("User-Agent", "ailegion-editor-updater")
         .call()
-        .map_err(|e| format!("Update check failed: {e}"))?
+        .map_err(|e| format!("Update check failed: {e}"))?;
+    let mut bytes = Vec::new();
+    response
         .body_mut()
-        .with_config()
-        .limit(limit)
-        .read_to_vec()
-        .map_err(|e| e.to_string())
+        .as_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    Ok(bytes)
 }
 
 #[derive(Deserialize)]
@@ -273,7 +275,7 @@ fn newer_version(tag: &str, current: &str) -> Result<Option<String>, String> {
 
 fn prepare(send: &Sender<Event>) -> Result<Option<Prepared>, String> {
     let release: Release =
-        serde_json::from_slice(&get(RELEASES, 2 * 1024 * 1024)?).map_err(|e| e.to_string())?;
+        serde_json::from_slice(&get(RELEASES)?).map_err(|e| e.to_string())?;
     if release.draft || release.prerelease {
         return Ok(None);
     }
@@ -286,8 +288,8 @@ fn prepare(send: &Sender<Event>) -> Result<Option<Prepared>, String> {
         return Err("A newer release exists but does not include signed automatic updates".into());
     }
     let base = format!("{DOWNLOADS}/v{version}");
-    let bytes = get(&format!("{base}/{name}"), 16 * 1024)?;
-    let signature = get(&format!("{base}/{name}.sig"), 64)?;
+    let bytes = get(&format!("{base}/{name}"))?;
+    let signature = get(&format!("{base}/{name}.sig"))?;
     let manifest = protocol::verify(&bytes, &signature, protocol::PUBLIC_KEY)?;
     protocol::validate(&manifest, &version, platform)?;
     let root = install_root()?;
@@ -687,6 +689,49 @@ fn restore(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn downloads_and_verifies_64_byte_signatures() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use ring::{rand::SystemRandom, signature::{Ed25519KeyPair, KeyPair}};
+        use std::net::TcpListener;
+
+        let key = Ed25519KeyPair::from_pkcs8(
+            Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap().as_ref(),
+        ).unwrap();
+        let manifest = br#"{"version":"0.1.1","platform":"windows-x86_64","archive":"editor-0.1.1-windows-x86_64.zip","size":100,"sha256":"abc"}"#;
+        let signature = key.sign(manifest).as_ref().to_vec();
+        assert_eq!(signature.len(), 64);
+        let served = signature.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/update-windows-x86_64.json.sig", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for chunked in [false, true] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                if chunked {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n40\r\n").unwrap();
+                    socket.write_all(&served).unwrap();
+                    socket.write_all(b"\r\n0\r\n\r\n").unwrap();
+                } else {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n").unwrap();
+                    socket.write_all(&served).unwrap();
+                }
+            }
+        });
+        for _ in 0..2 {
+            let downloaded = get(&url).unwrap();
+            assert_eq!(downloaded, signature);
+            assert!(protocol::verify(manifest, &downloaded, &STANDARD.encode(key.public_key().as_ref())).is_ok());
+        }
+        server.join().unwrap();
+    }
+
     #[test]
     fn versions_do_not_downgrade_or_offer_prereleases() {
         assert_eq!(

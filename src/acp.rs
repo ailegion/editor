@@ -104,6 +104,35 @@ struct PendingPermission {
     respond: tokio::sync::oneshot::Sender<String>,
 }
 
+struct PendingPrompt {
+    content: Vec<ContentBlock>,
+    cancel: tokio::sync::oneshot::Receiver<()>,
+}
+
+async fn run_prompt(
+    connection: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    mut prompt: PendingPrompt,
+) -> agent_client_protocol::Result<()> {
+    // Stop during initialization must cancel this prompt, not an idle session.
+    if !matches!(prompt.cancel.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)) {
+        return Ok(());
+    }
+    let response = connection
+        .send_request(PromptRequest::new(session_id.clone(), prompt.content))
+        .block_task();
+    tokio::pin!(response);
+    tokio::select! {
+        result = &mut response => { result?; }
+        _ = &mut prompt.cancel => {
+            connection.send_notification(CancelNotification::new(session_id.clone()))?;
+            // Keep the turn active until the agent acknowledges its completion.
+            response.await?;
+        }
+    }
+    Ok(())
+}
+
 enum Event {
     Delta(String),
     ThoughtDelta(String),
@@ -137,8 +166,8 @@ pub struct AcpState {
     entries: Vec<Entry>,
     input: text_editor::Content,
     rx: Option<Receiver<Event>>,
-    prompt_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<ContentBlock>>>,
-    cancel_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    prompt_tx: Option<tokio::sync::mpsc::UnboundedSender<PendingPrompt>>,
+    cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
     model_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, String)>>,
     streaming: bool,
     started: bool,
@@ -239,6 +268,7 @@ impl AcpState {
                 }
                 Event::SessionId(id) => new_session_id = Some(id),
                 Event::Permission(pending) => {
+                    if self.stopping || finished { continue; }
                     if pending.scope.as_ref().is_some_and(|scope| self.session_grants.contains(scope)) && pending.allow_once.is_some() {
                         let _ = pending.respond.send(pending.allow_once.unwrap());
                     } else { self.permission_queue.push_back(pending); }
@@ -280,6 +310,7 @@ impl AcpState {
         if finished {
             self.streaming = false;
             self.stopping = false;
+            self.cancel_tx = None;
             self.pending_permission = None;
             self.permission_queue.clear();
             self.just_finished = true;
@@ -429,10 +460,8 @@ impl AcpState {
 
         let (tx, rx): (Sender<Event>, Receiver<Event>) = mpsc::channel();
         self.rx = Some(rx);
-        let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<ContentBlock>>();
+        let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel::<PendingPrompt>();
         self.prompt_tx = Some(prompt_tx);
-        let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        self.cancel_tx = Some(cancel_tx);
         let (model_tx, mut model_rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
         self.model_tx = Some(model_tx);
 
@@ -520,7 +549,7 @@ impl AcpState {
                         agent_client_protocol::on_receive_notification!(),
                     )
                     .on_receive_request(
-                        async move |request: RequestPermissionRequest, responder, _connection| {
+                        async move |request: RequestPermissionRequest, responder, connection| {
                             let title = request
                                 .tool_call
                                 .fields
@@ -550,7 +579,8 @@ impl AcpState {
                                 respond: respond_tx,
                             }));
 
-                            match respond_rx.await {
+                            // Waiting for UI approval must not block protocol messages, including Stop.
+                            connection.spawn(async move { match respond_rx.await {
                                 Ok(option_id) => responder.respond(RequestPermissionResponse::new(
                                     RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
                                         PermissionOptionId::new(option_id),
@@ -559,7 +589,7 @@ impl AcpState {
                                 Err(_) => responder.respond(RequestPermissionResponse::new(
                                     RequestPermissionOutcome::Cancelled,
                                 )),
-                            }
+                            } })
                         },
                         agent_client_protocol::on_receive_request!(),
                     )
@@ -622,28 +652,12 @@ impl AcpState {
                             }
                         });
 
-                        let cancel_connection = connection.clone();
-                        let cancel_session_id = session_id.clone();
-                        tokio::spawn(async move {
-                            while cancel_rx.recv().await.is_some() {
-                                let _ = cancel_connection.send_notification(CancelNotification::new(
-                                    cancel_session_id.clone(),
-                                ));
-                            }
-                        });
-
                         while let Some(prompt) = prompt_rx.recv().await {
-                            if !init_response.agent_capabilities.prompt_capabilities.image && prompt.iter().any(|b| matches!(b, ContentBlock::Image(_))) {
+                            if !init_response.agent_capabilities.prompt_capabilities.image && prompt.content.iter().any(|b| matches!(b, ContentBlock::Image(_))) {
                                 let _ = loop_tx.send(Event::Error("This agent does not support image prompts. Remove images and try again.".into()));
                                 continue;
                             }
-                            let result = connection
-                                .send_request(PromptRequest::new(
-                                    session_id.clone(),
-                                    prompt,
-                                ))
-                                .block_task()
-                                .await;
+                            let result = run_prompt(&connection, &session_id, prompt).await;
                             match result {
                                 Ok(_) => {
                                     let _ = loop_tx.send(Event::Done);
@@ -681,7 +695,9 @@ impl AcpState {
         self.entries.push(Entry::User { content: display });
         self.streaming = true;
         if let Some(tx) = &self.prompt_tx {
-            let _ = tx.send(prompt);
+            let (cancel_tx, cancel) = tokio::sync::oneshot::channel();
+            self.cancel_tx = Some(cancel_tx);
+            let _ = tx.send(PendingPrompt { content: prompt, cancel });
         }
     }
 
@@ -705,7 +721,7 @@ impl AcpState {
     }
 
     fn stop(&mut self) {
-        if let Some(tx) = &self.cancel_tx {
+        if let Some(tx) = self.cancel_tx.take() {
             let _ = tx.send(());
         }
         self.stopping = true;
@@ -1188,6 +1204,87 @@ mod tests {
         state.stop();
         assert!(matches!(first_reply.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)));
         assert!(matches!(second_reply.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)));
+    }
+
+    #[test]
+    fn stop_rejects_late_permissions_but_keeps_session_grants() {
+        let mut state = AcpState::codex();
+        let (tx, rx) = mpsc::channel();
+        state.rx = Some(rx);
+        state.streaming = true;
+        state.session_grants.insert("same".into());
+        state.stop();
+        for scope in ["same", "new"] {
+            let (pending, mut reply) = permission(scope);
+            tx.send(Event::Permission(pending)).unwrap();
+            state.poll();
+            assert!(matches!(reply.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)));
+        }
+        assert!(state.pending_permission.is_none());
+        assert!(state.permission_queue.is_empty());
+        tx.send(Event::Done).unwrap();
+        state.poll();
+        assert!(state.session_grants.contains("same"));
+        state.streaming = true;
+        let (pending, mut reply) = permission("same");
+        tx.send(Event::Permission(pending)).unwrap();
+        state.poll();
+        assert_eq!(reply.try_recv().unwrap(), "accept");
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_only_its_prompt_before_and_after_dispatch() {
+        use agent_client_protocol::schema::v1::{PromptResponse, StopReason};
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let notify_cancelled = cancelled.clone();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let agent = Agent.builder()
+            .on_receive_notification(async move |_cancel: CancelNotification, _cx| {
+                notify_cancelled.notify_one();
+                Ok(())
+            }, agent_client_protocol::on_receive_notification!())
+            .on_receive_request(async move |request: PromptRequest, responder, cx| {
+                let text = match &request.prompt[0] {
+                    ContentBlock::Text(text) => text.text.as_str(),
+                    _ => panic!("expected text prompt"),
+                };
+                assert_ne!(text, "stopped during startup");
+                if text == "next turn" {
+                    return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                }
+                started_tx.send(()).unwrap();
+                let cancelled = cancelled.clone();
+                cx.spawn(async move {
+                    cancelled.notified().await;
+                    responder.respond(PromptResponse::new(StopReason::Cancelled))
+                })
+            }, agent_client_protocol::on_receive_request!());
+        let test = agent_client_protocol::Client.builder().connect_with(agent, async move |connection| {
+            let session = SessionId::new("test");
+            let (stop, cancel) = tokio::sync::oneshot::channel();
+            stop.send(()).unwrap();
+            run_prompt(&connection, &session, PendingPrompt {
+                content: vec![ContentBlock::Text(TextContent::new("stopped during startup"))], cancel,
+            }).await?;
+            assert!(started_rx.try_recv().is_err());
+
+            let (stop, cancel) = tokio::sync::oneshot::channel();
+            let prompt = run_prompt(&connection, &session, PendingPrompt {
+                content: vec![ContentBlock::Text(TextContent::new("working"))], cancel,
+            });
+            let send_stop = async {
+                started_rx.recv().await.unwrap();
+                stop.send(()).unwrap();
+            };
+            let (result, ()) = tokio::join!(prompt, send_stop);
+            result?;
+
+            let (_stop, cancel) = tokio::sync::oneshot::channel();
+            run_prompt(&connection, &session, PendingPrompt {
+                content: vec![ContentBlock::Text(TextContent::new("next turn"))], cancel,
+            }).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), test).await.unwrap().unwrap();
     }
 
     #[test]
