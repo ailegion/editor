@@ -202,7 +202,7 @@ mod tests {
 }
 
 /// `std::fs::canonicalize` without Windows' `\\?\` prefix, so prefix stripping compares like paths.
-fn dunce_canonicalize(path: &Path) -> Option<PathBuf> {
+pub(super) fn dunce_canonicalize(path: &Path) -> Option<PathBuf> {
     let canonical = std::fs::canonicalize(path).ok()?;
     #[cfg(windows)]
     {

@@ -90,25 +90,41 @@ enum Kind {
 /// Decides which events matter: git's own state files, and working-tree paths git does not ignore.
 struct Filter {
     repo: gix::Repository,
-    workdir: PathBuf,
-    git_dirs: [PathBuf; 2],
+    /// Each directory as opened and, if different, fully resolved: some platforms report
+    /// events by resolved path (macOS FSEvents turns `/var/...` into `/private/var/...`).
+    workdirs: Vec<PathBuf>,
+    git_dirs: Vec<PathBuf>,
     excludes: Option<gix::worktree::Stack>,
+}
+
+fn with_resolved(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut all = Vec::new();
+    for path in paths {
+        let resolved = super::repo::dunce_canonicalize(&path);
+        all.push(path);
+        all.extend(resolved.filter(|resolved| !all.contains(resolved)));
+    }
+    all
 }
 
 impl Filter {
     fn new(repo: &Repo) -> Filter {
-        Filter { repo: repo.thread_local(), workdir: repo.workdir().to_path_buf(), git_dirs: [repo.git_dir(), repo.common_dir()], excludes: None }
+        Filter {
+            repo: repo.thread_local(),
+            workdirs: with_resolved([repo.workdir().to_path_buf()]),
+            git_dirs: with_resolved([repo.git_dir(), repo.common_dir()]),
+            excludes: None,
+        }
     }
 
     fn classify(&mut self, path: &Path) -> Option<Kind> {
-        for git_dir in &self.git_dirs {
-            if let Ok(inside) = path.strip_prefix(git_dir) {
-                let first = inside.components().next()?.as_os_str().to_str()?;
-                return matches!(first, "index" | "HEAD" | "packed-refs" | "refs" | "MERGE_HEAD" | "REBASE_HEAD" | "CHERRY_PICK_HEAD")
-                    .then_some(Kind::Repository);
-            }
+        if let Some(inside) = self.git_dirs.iter().find_map(|dir| path.strip_prefix(dir).ok()) {
+            let first = inside.components().next()?.as_os_str().to_str()?;
+            return matches!(first, "index" | "HEAD" | "packed-refs" | "refs" | "MERGE_HEAD" | "REBASE_HEAD" | "CHERRY_PICK_HEAD")
+                .then_some(Kind::Repository);
         }
-        let rela = path.strip_prefix(&self.workdir).ok()?;
+        let rela = self.workdirs.iter().find_map(|dir| path.strip_prefix(dir).ok())?.to_path_buf();
+        let rela = rela.as_path();
         if rela.file_name().is_some_and(|name| name == ".gitignore") {
             self.excludes = None; // Reload ignore rules on next use.
         }
@@ -144,9 +160,9 @@ mod tests {
         super::super::cli::run(root, args, None, super::super::cli::Access::Write).unwrap();
     }
 
-    /// Waits for the next settled batch of changes, or returns `None` after a few seconds.
-    fn next_changes(watch: &Watch) -> Option<Changes> {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    /// Waits up to `timeout` for the next settled batch of changes.
+    fn next_changes(watch: &Watch, timeout: Duration) -> Option<Changes> {
+        let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if let Some(changes) = watch.take_settled() { return Some(changes); }
             std::thread::sleep(Duration::from_millis(50));
@@ -154,25 +170,68 @@ mod tests {
         None
     }
 
-    #[test]
-    fn reports_worktree_and_index_changes_but_not_ignored_files() {
-        let root = std::env::temp_dir().join(format!("editor-watch-{}", std::process::id()));
+    fn repo_with_ignored_target(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("editor-{name}-{}", std::process::id()));
         std::fs::create_dir_all(root.join("target/debug")).unwrap();
         git(&root, &["init"]);
         std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        root
+    }
+
+    /// Event paths may be the resolved form of the opened directory (macOS reports
+    /// `/private/var/...` for `/var/...`; Windows may expand 8.3 short names).
+    #[test]
+    fn classifies_paths_given_as_opened_or_resolved() {
+        let root = repo_with_ignored_target("watch-paths");
+        // Open the project through a link so the opened and resolved paths always differ.
+        let link = root.with_file_name(format!("editor-watch-link-{}", std::process::id()));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&link).arg(&root).output().unwrap().status.success());
+        let mut filter = Filter::new(&Repo::discover(&link).unwrap());
+        let resolved = super::super::repo::dunce_canonicalize(&root).unwrap();
+        for base in [&link, &resolved] {
+            assert!(matches!(filter.classify(&base.join("main.rs")), Some(Kind::Worktree)), "{}", base.display());
+            assert!(filter.classify(&base.join("target/debug/build.o")).is_none(), "{}", base.display());
+            assert!(matches!(filter.classify(&base.join(".git/index")), Some(Kind::Repository)), "{}", base.display());
+            assert!(filter.classify(&base.join(".git/objects/ab/cdef")).is_none(), "{}", base.display());
+        }
+        // Removes the link itself, not the directory it points to.
+        #[cfg(unix)]
+        std::fs::remove_file(&link).unwrap();
+        #[cfg(windows)]
+        std::fs::remove_dir(&link).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reports_worktree_and_index_changes_but_not_ignored_files() {
+        let root = repo_with_ignored_target("watch-events");
         let watch = Watch::start(Arc::new(Repo::discover(&root).unwrap()));
-        // Registration happens on a background thread.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while watch._watcher.lock().unwrap().is_none() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(20)); }
+
+        // Registration runs on a background thread and some backends (FSEvents) start
+        // delivering shortly after; write until an event arrives so the checks below are live.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            std::fs::write(root.join("main.rs"), format!("// {attempt}\n")).unwrap();
+            if next_changes(&watch, Duration::from_secs(1)).is_some_and(|changes| changes.worktree) { break; }
+            assert!(Instant::now() < deadline, "no file-system events were delivered");
+        }
+        // Drop events from any earlier write still in flight.
+        std::thread::sleep(Duration::from_secs(1));
+        watch.take_settled();
 
         std::fs::write(root.join("target/debug/build.o"), "object").unwrap();
-        assert_eq!(next_changes(&watch), None, "ignored build output must not trigger a refresh");
+        assert_eq!(next_changes(&watch, Duration::from_secs(2)), None, "ignored build output must not trigger a refresh");
 
         std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
-        assert_eq!(next_changes(&watch).map(|c| c.worktree), Some(true));
+        assert_eq!(next_changes(&watch, Duration::from_secs(10)).map(|c| c.worktree), Some(true));
 
         git(&root, &["add", "main.rs"]);
-        assert_eq!(next_changes(&watch).map(|c| c.repository), Some(true));
+        assert_eq!(next_changes(&watch, Duration::from_secs(10)).map(|c| c.repository), Some(true));
         drop(watch);
         std::fs::remove_dir_all(root).unwrap();
     }
