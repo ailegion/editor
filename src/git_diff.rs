@@ -1,9 +1,11 @@
-//! Per-file diff gutter markers (added/modified/removed lines vs. git HEAD), computed by
-//! shelling out to `git diff -U0` -- same approach as `git.rs`'s status/commit -- and parsed
-//! from the unified-diff hunk headers. Zero context lines (`-U0`) means every hunk boundary
-//! maps directly to a contiguous run of changed lines, nothing to trim.
+//! Per-file diff gutter markers: the open buffer compared with the file's staged version, the
+//! same comparison as `git diff`. Computed in-process from the cached blob, so markers follow
+//! unsaved edits and opening or editing a tab never starts `git`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use gix::diff::blob::{diff_with_slider_heuristics, Algorithm, InternedInput};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineStatus {
@@ -15,63 +17,59 @@ pub enum LineStatus {
     Removed,
 }
 
-/// Runs `git diff -U0` for `path` (which must be inside `cwd`, the project root) and returns
-/// new-file line numbers (0-indexed) paired with their diff status. Returns an empty list on
-/// any failure (not a git repo, `git` missing, file untracked with no diff, ...) -- the
-/// gutter just shows nothing rather than an error, matching how a brand new/clean file has
-/// nothing to mark anyway.
-pub async fn diff_for_file(cwd: PathBuf, path: PathBuf) -> Vec<(usize, LineStatus)> {
-    tokio::task::spawn_blocking(move || {
-        let Ok(relative) = path.strip_prefix(&cwd) else {
-            return Vec::new();
-        };
-        let Ok(output) = std::process::Command::new("git")
-            .args(["diff", "--no-color", "-U0", "--"])
-            .arg(relative)
-            .current_dir(&cwd)
-            .output()
-        else {
-            return Vec::new();
-        };
-        if !output.status.success() {
-            return Vec::new();
-        }
-        parse_hunks(&String::from_utf8_lossy(&output.stdout))
+/// Markers for `text`, the buffer of `path` (relative to the project root). Empty when the
+/// project is not a repository or the file is untracked, matching a clean file.
+pub async fn diff_for_buffer(repo: Option<Arc<crate::git::repo::Repo>>, path: PathBuf, text: String) -> Vec<(usize, LineStatus)> {
+    let Some(repo) = repo else { return Vec::new() };
+    tokio::task::spawn_blocking(move || match repo.buffer_base(&path) {
+        Ok(Some(base)) => line_changes(&base, &text),
+        _ => Vec::new(),
     })
     .await
     .unwrap_or_default()
 }
 
-fn parse_hunks(diff: &str) -> Vec<(usize, LineStatus)> {
+/// 0-indexed buffer lines paired with their status relative to `base`. Line endings are
+/// compared by content, as the buffer holds lines without their terminators.
+fn line_changes(base: &[u8], text: &str) -> Vec<(usize, LineStatus)> {
+    if base[..base.len().min(8000)].contains(&0) { return Vec::new(); }
+    let normalize = |text: &str| {
+        let mut text = text.replace("\r\n", "\n");
+        if !text.ends_with('\n') { text.push('\n'); }
+        text
+    };
+    let (before, after) = (normalize(&String::from_utf8_lossy(base)), normalize(text));
+    let input = InternedInput::new(before.as_bytes(), after.as_bytes());
+    let diff = diff_with_slider_heuristics(Algorithm::Histogram, &input);
     let mut result = Vec::new();
-    for line in diff.lines() {
-        let Some(rest) = line.strip_prefix("@@ -") else { continue };
-        let Some(header_end) = rest.find(" @@") else { continue };
-        let Some((old_part, new_part)) = rest[..header_end].split_once(" +") else { continue };
-        let (_, old_count) = parse_range(old_part);
-        let (new_start, new_count) = parse_range(new_part);
-
-        if new_count == 0 {
-            // A zero-length new-range hunk header already points at the new-file line right
-            // after the deletion (1-indexed start of an empty range == that many lines *in*
-            // from a 0-indexed position) -- unlike the add/modify branch below, no
-            // 1-indexed-to-0-indexed shift is needed here.
-            result.push((new_start, LineStatus::Removed));
+    for hunk in diff.hunks() {
+        if hunk.after.is_empty() {
+            result.push((hunk.after.start as usize, LineStatus::Removed));
         } else {
-            let status = if old_count == 0 { LineStatus::Added } else { LineStatus::Modified };
-            for line_i in new_start..new_start + new_count {
-                result.push((line_i.saturating_sub(1), status));
-            }
+            let status = if hunk.before.is_empty() { LineStatus::Added } else { LineStatus::Modified };
+            result.extend(hunk.after.map(|line| (line as usize, status)));
         }
     }
     result
 }
 
-/// Parses a `start[,count]` hunk range; `count` defaults to 1 when omitted (unified diff
-/// format elides it for single-line ranges).
-fn parse_range(part: &str) -> (usize, usize) {
-    match part.split_once(',') {
-        Some((start, count)) => (start.parse().unwrap_or(0), count.parse().unwrap_or(0)),
-        None => (part.parse().unwrap_or(0), 1),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_added_modified_and_removed_lines() {
+        let base = b"one\ntwo\nthree\nfour\n";
+        assert_eq!(line_changes(base, "one\ntwo\nthree\nfour"), vec![]);
+        assert_eq!(line_changes(base, "zero\none\ntwo\nthree\nfour"), vec![(0, LineStatus::Added)]);
+        assert_eq!(line_changes(base, "one\nTWO\nthree\nfour"), vec![(1, LineStatus::Modified)]);
+        assert_eq!(line_changes(base, "one\nfour"), vec![(1, LineStatus::Removed)]);
+        assert_eq!(line_changes(base, "two\nthree\nfour"), vec![(0, LineStatus::Removed)]);
+    }
+
+    #[test]
+    fn line_endings_and_binary_files_do_not_produce_markers() {
+        assert!(line_changes(b"a\r\nb\r\n", "a\nb").is_empty());
+        assert!(line_changes(b"a\0b", "changed").is_empty());
     }
 }

@@ -65,9 +65,9 @@ struct Tab {
     search: code_editor::search::SearchState,
     dirty: bool,
     line_ending: LineEnding,
-    /// Diff gutter markers vs. git HEAD, keyed by 0-indexed line number. Loaded
-    /// asynchronously (see `Message::GitDiffLoaded`) whenever the tab is opened or saved, so
-    /// it reflects on-disk content, same as the git sidebar panel.
+    /// Diff gutter markers vs. the staged version, keyed by 0-indexed line number. Computed
+    /// in-process from the buffer (see `Message::GitDiffLoaded`) when the tab opens, shortly
+    /// after edits, and when the index changes.
     diff: std::collections::HashMap<usize, git_diff::LineStatus>,
 }
 
@@ -338,6 +338,8 @@ struct State {
     recent_files: Vec<PathBuf>,
     git: git::GitState,
     git_preview: Option<git_preview::Preview>,
+    /// When the active tab's diff markers should be recomputed after typing pauses.
+    gutter_due: Option<std::time::Instant>,
 
     app_theme: theme::EditorTheme,
     themes: theme::ThemeRegistry,
@@ -438,6 +440,7 @@ impl State {
             recent_files: recent_files::load(),
             git: git::GitState::default(),
             git_preview: None,
+            gutter_due: None,
             app_theme,
             themes,
             highlighter: code_editor::Highlighter::new(),
@@ -600,6 +603,7 @@ impl State {
     /// Reloads open, unmodified tabs from disk, in case the AI sidebar just edited them.
     fn reload_open_tabs(&mut self) -> Task<Message> {
         let mut tasks = Vec::new();
+        let repo = self.git.repo();
         for tab in &mut self.tabs {
             if tab.dirty {
                 continue;
@@ -611,7 +615,7 @@ impl State {
                     tab.content =
                         code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
                     tab.content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
-                    tasks.push(load_diff_task(self.root.clone(), path));
+                    tasks.push(load_diff_task(repo.clone(), self.root.as_deref(), path, text));
                 }
             }
         }
@@ -627,7 +631,7 @@ impl State {
         {
             self.active_tab = index;
             recent_files::record(&mut self.recent_files, path.clone());
-            return load_diff_task(self.root.clone(), path);
+            return Task::none();
         }
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
@@ -642,7 +646,7 @@ impl State {
         let mut content = code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
         content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
         recent_files::record(&mut self.recent_files, path.clone());
-        let task = load_diff_task(self.root.clone(), path.clone());
+        let task = load_diff_task(self.git.repo(), self.root.as_deref(), path.clone(), text);
         self.tabs.push(Tab {
             path: Some(path),
             content,
@@ -705,8 +709,9 @@ impl State {
             if result.is_ok() {
                 tab.path = Some(path.clone());
                 tab.dirty = false;
+                // Saving changes neither the buffer nor the index, so the markers stay valid.
                 self.notify(format!("Saved {}", path.file_name().unwrap_or_default().to_string_lossy()));
-                return load_diff_task(self.root.clone(), path);
+                return Task::none();
             }
             if let Err(err) = result { self.notify(format!("Save failed: {err}")); }
         }
@@ -738,6 +743,59 @@ impl State {
         tab.dirty = true;
         let extension = tab.extension();
         tab.content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
+        self.gutter_due = Some(std::time::Instant::now() + GUTTER_DEBOUNCE);
+    }
+
+    /// Reacts to repository changes and pending edits: markers follow the index and the
+    /// buffer, and status reloads only while the source control panel is showing.
+    fn poll_git(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+        if self.git.set_project(self.root.as_deref()) {
+            tasks.push(self.reload_git_views());
+            if self.sidebar_visible && self.sidebar_mode == SidebarMode::Git {
+                tasks.push(Task::done(Message::Git(git::Message::Refresh)));
+            }
+        }
+        if let Some(changes) = self.git.take_changes() {
+            if changes.repository {
+                tasks.push(self.reload_git_views());
+            } else if let Some(preview) = &mut self.git_preview {
+                // Working-tree edits only change the unstaged half of an open preview.
+                tasks.push(load_preview_task(self.git.repo(), preview.root.clone(), preview.path.clone()));
+            }
+            if self.sidebar_visible && self.sidebar_mode == SidebarMode::Git {
+                let cwd = self.root_or_cwd();
+                tasks.push(git::update(&mut self.git, git::Message::Refresh, cwd).map(Message::Git));
+            }
+        }
+        if self.gutter_due.is_some_and(|due| std::time::Instant::now() >= due) {
+            self.gutter_due = None;
+            if let Some(tab) = self.tabs.get(self.active_tab) {
+                if let Some(path) = tab.path.clone() {
+                    tasks.push(load_diff_task(self.git.repo(), self.root.as_deref(), path, tab.content.text()));
+                }
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    /// Reloads the open diff preview and every tab's markers from current repository state.
+    fn reload_git_views(&mut self) -> Task<Message> {
+        let mut tasks = vec![self.reload_all_diffs()];
+        if let Some(preview) = &mut self.git_preview {
+            preview.result = None;
+            tasks.push(load_preview_task(self.git.repo(), preview.root.clone(), preview.path.clone()));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Recomputes the diff markers of every open tab, e.g. after the index changed.
+    fn reload_all_diffs(&self) -> Task<Message> {
+        let repo = self.git.repo();
+        Task::batch(self.tabs.iter().filter_map(|tab| {
+            let path = tab.path.clone()?;
+            Some(load_diff_task(repo.clone(), self.root.as_deref(), path, tab.content.text()))
+        }))
     }
 
     /// Applies `action` to `self.zoom`, then re-shapes every open tab's buffer at the new
@@ -969,9 +1027,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.git_preview = Some(git_preview::Preview {
                 root: root.clone(), path: path.clone(), result: None,
             });
-            task = Task::perform(git_preview::load(root.clone(), path.clone()), move |result| {
-                Message::GitPreviewLoaded(root.clone(), path.clone(), result)
-            });
+            task = load_preview_task(state.git.repo(), root, path);
         }
         Message::GitPreviewLoaded(root, path, result) => {
             if let Some(preview) = &mut state.git_preview {
@@ -989,29 +1045,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 _ => {},
             }
             let cwd = state.root_or_cwd();
-            let is_refresh = matches!(msg, git::Message::Refresh | git::Message::Staged(Ok(())) | git::Message::Committed(Ok(())));
-            if is_refresh {
-                if let Some(preview) = &mut state.git_preview {
-                    let root = preview.root.clone();
-                    let path = preview.path.clone();
-                    preview.result = None;
-                    task = Task::perform(git_preview::load(root.clone(), path.clone()), move |result| Message::GitPreviewLoaded(root.clone(), path.clone(), result));
-                }
+            if matches!(msg, git::Message::Refresh) {
+                task = state.reload_git_views();
             }
             task = Task::batch([task, git::update(&mut state.git, msg, cwd).map(Message::Git)]);
-            if is_refresh {
-                if let Some(path) = state.tabs.get(state.active_tab).and_then(|t| t.path.clone()) {
-                    task = Task::batch([task, load_diff_task(state.root.clone(), path)]);
-                }
-            }
         }
         Message::GitPanelToggle => {
             if state.toggle_sidebar_mode(SidebarMode::Git) {
                 let cwd = state.root_or_cwd();
                 task = git::update(&mut state.git, git::Message::Refresh, cwd).map(Message::Git);
-                if let Some(path) = state.tabs.get(state.active_tab).and_then(|t| t.path.clone()) {
-                    task = Task::batch([task, load_diff_task(state.root.clone(), path)]);
-                }
             }
         }
         Message::GitDiffLoaded(path, diff) => {
@@ -1682,6 +1724,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Windowed));
                 task = Task::batch([task, reveal]);
             }
+            task = Task::batch([task, state.poll_git()]);
         }
 
         Message::WindowOpened(id) => {
@@ -2604,6 +2647,8 @@ fn load_ai_ratio() -> f32 {
 }
 
 const MIN_WINDOW_SIZE: iced::Size = iced::Size::new(800.0, 600.0);
+/// Pause in typing before the active tab's diff markers are recomputed.
+const GUTTER_DEBOUNCE: Duration = Duration::from_millis(150);
 
 fn valid_window_size(size: iced::Size) -> bool {
     size.width.is_finite() && size.height.is_finite()
@@ -2702,18 +2747,22 @@ fn refresh_dir_task(dir: PathBuf) -> Task<Message> {
     Task::done(Message::Tree(DirectoryTreeEvent::Refresh(dir)))
 }
 
-/// Kicks off an async `git diff` for `path` against `root` (the open project folder),
-/// producing `Message::GitDiffLoaded` once it resolves. A no-op when there's no open project
-/// (nothing to diff against). A free function rather than a `State` method so callers already
-/// holding a `&mut` borrow of part of `state` (e.g. iterating `&mut self.tabs`) can still call
-/// it without a borrow conflict.
-fn load_diff_task(root: Option<PathBuf>, path: PathBuf) -> Task<Message> {
-    let Some(root) = root else {
+/// Computes diff markers for `text`, the buffer of `path`, against its staged version,
+/// producing `Message::GitDiffLoaded`. A no-op outside the open project (`root`). A free
+/// function rather than a `State` method so callers already holding a `&mut` borrow of part
+/// of `state` (e.g. iterating `&mut self.tabs`) can still call it without a borrow conflict.
+fn load_diff_task(repo: Option<std::sync::Arc<git::repo::Repo>>, root: Option<&Path>, path: PathBuf, text: String) -> Task<Message> {
+    let Some(relative) = root.and_then(|root| path.strip_prefix(root).ok()).map(Path::to_path_buf) else {
         return Task::none();
     };
-    let for_message = path.clone();
-    Task::perform(git_diff::diff_for_file(root, path), move |diff| {
-        Message::GitDiffLoaded(for_message.clone(), diff)
+    Task::perform(git_diff::diff_for_buffer(repo, relative, text), move |diff| {
+        Message::GitDiffLoaded(path.clone(), diff)
+    })
+}
+
+fn load_preview_task(repo: Option<std::sync::Arc<git::repo::Repo>>, root: PathBuf, path: String) -> Task<Message> {
+    Task::perform(git_preview::load(repo, root.clone(), path.clone()), move |result| {
+        Message::GitPreviewLoaded(root.clone(), path.clone(), result)
     })
 }
 

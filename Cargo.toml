@@ -35,6 +35,8 @@ flate2 = "1"
 # Theme installs (.vsix). flate2's decoder backend comes from its default features, already
 # enabled elsewhere in the tree; `theme::openvsx` tests extract a deflated archive.
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
+gix = { version = "0.87.1", default-features = false, features = ["blob-diff", "index", "excludes", "attributes", "sha1", "parallel"] }
+notify = "8.2.0"
 
 # Routes the native "About editor" app-menu item to the in-app About panel. Already in the tree via winit.
 [target.'cfg(target_os = "macos")'.dependencies]

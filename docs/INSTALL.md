@@ -39,7 +39,8 @@ folder. Older releases without the updater need one manual upgrade.
 
 ## Optional features
 
-- Git features need Git installed and available on PATH.
+- Git features need Git installed and available on PATH. Staging and commits run `git`
+  itself, so your hooks, commit signing and filters (e.g. Git LFS) apply as in a terminal.
 - Claude/Codex ACP features need Node.js/npm on PATH and the agent's credentials.
   On macOS, Finder-launched applications may not inherit paths from shell startup files.
 - Local AI requires your own running model server; remote APIs require your own credentials.

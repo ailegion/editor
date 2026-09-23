@@ -20,7 +20,9 @@ for a "minimal, no-bloat" positioning.
   `EditAction`/`ViewAction`/`FileAction` labels the menus use, same overlay presentation
   and keyboard handling as Quick Open
 - Git sidebar panel: current branch, staged/unstaged status lists, per-file stage/unstage, commit staged changes, refresh
-  — shells out to the `git` CLI
+  — stage/unstage/commit run the real `git` (hooks, signing and filters apply) without a
+  console window; status is one `git status --porcelain=v2` per settled file-system change
+  while the panel is visible; diff previews and gutter markers are computed in-process
 - Sidebar is a collapsible "activity bar": Tree / Git / Search, toggled from status-bar
   icons, click-active-icon-again to collapse
 - Tabs with dirty-state tracking, close-with-confirm, per-tab line-ending (LF/CRLF) detection
@@ -118,16 +120,15 @@ numbers only draw on a buffer line's first visual row. That's a renderer-archite
 not a toggle -- worth scoping as its own task rather than folding into "Phase 2 polish."
 
 ### Phase 3 — Deeper git integration
-8. ~~**Diff gutter in editor**~~ — done: `src/git_diff.rs` shells out to `git diff -U0` and
-   parses hunk headers into per-line added/modified/removed markers (0-indexed, matching
-   `Buffer`'s line numbering), rendered as a thin colored bar in the gutter's left edge
-   (`code_editor/render.rs`). Computed async (`Task::perform` + `spawn_blocking`, same
-   pattern as `git.rs`) and refreshed on file open, save, git-panel refresh/open, and
-   whenever the AI agent edits files on disk (`reload_open_tabs`). Reflects on-disk content
-   like the git sidebar already does, not unsaved buffer edits. Known gap: untracked
-   (never-`git add`ed) new files show no markers, since `git diff` itself shows nothing for
-   them -- fixable later by detecting untracked status and marking the whole file Added, but
-   out of scope for the first pass.
+8. ~~**Diff gutter in editor**~~ — done: `src/git_diff.rs` diffs the open buffer against the
+   file's staged version in-process (gitoxide reads the blob, imara-diff with git's slider
+   heuristics computes hunks) into per-line added/modified/removed markers (0-indexed,
+   matching `Buffer`'s line numbering), rendered as a thin colored bar in the gutter's left
+   edge (`code_editor/render.rs`). Recomputed on file open, 150 ms after typing pauses, when
+   the index changes (file watcher, `src/git/watch.rs`), and when the AI agent edits files on
+   disk (`reload_open_tabs`); none of these start a process. Files stored through an external
+   filter driver (e.g. Git LFS) show no markers. Known gap: untracked (never-`git add`ed) new
+   files show no markers, matching `git diff`.
 9. ~~**Stage individual files**~~ — done: separate staged/unstaged lists, per-file
    stage/unstage actions, and commits restricted to staged content. Side-by-side diffs
    include character-level highlights. Hunk-level staging remains a future extension.
