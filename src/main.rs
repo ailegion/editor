@@ -73,6 +73,7 @@ struct Tab {
     diff: std::collections::HashMap<usize, git_diff::LineStatus>,
     /// Latest diagnostics from the file's language server, sorted by line.
     diagnostics: Vec<lsp::Diagnostic>,
+    blame: Vec<String>,
     /// Hover popup currently shown in the editor, if any.
     hover: Option<code_editor::Hover>,
 }
@@ -233,11 +234,14 @@ enum Message {
     ToggleGotoLine,
     About(about::Message),
     Git(git::Message),
+    DiscardGitConfirmed(PathBuf, Vec<git::ChangedFile>),
+    DiscardGitFinished(Vec<(PathBuf, String)>, git::Message),
     GitPanelToggle,
     GitPreviewLoaded(PathBuf, String, Result<String, String>),
     CloseGitPreview,
     GitPreviewScrolled(bool, f32),
-    GitDiffLoaded(PathBuf, Vec<(usize, git_diff::LineStatus)>),
+    GitDiffLoaded(PathBuf, String, Vec<(usize, git_diff::LineStatus)>),
+    GitBlameLoaded(PathBuf, String, Vec<String>),
     TabSelected(usize),
     TabClosed(usize),
     CloseTabs(usize, TabCloseScope),
@@ -512,7 +516,7 @@ impl State {
                 let tab = Tab {
                     path: recovery.path.clone(), content, dirty: true,
                     search: Default::default(), line_ending: LineEnding::detect(&recovery.text), diff: Default::default(),
-                    diagnostics: Vec::new(), hover: None,
+                    diagnostics: Vec::new(), blame: Vec::new(), hover: None,
                 };
                 if let Some(index) = state.tabs.iter().position(|tab| tab.path == recovery.path) {
                     state.tabs[index] = tab;
@@ -642,6 +646,7 @@ impl State {
                     tab.content =
                         code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
                     tab.content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
+                    tab.blame.clear();
                     self.lsp.changed(&path);
                     tasks.push(load_diff_task(repo.clone(), self.root.as_deref(), path, text));
                 }
@@ -684,7 +689,7 @@ impl State {
             dirty: false,
             line_ending,
             diff: std::collections::HashMap::new(),
-            diagnostics: Vec::new(),
+            diagnostics: Vec::new(), blame: Vec::new(),
             hover: None,
         });
         self.active_tab = self.tabs.len() - 1;
@@ -779,6 +784,7 @@ impl State {
             return;
         }
         tab.dirty = true;
+        tab.blame.clear();
         tab.hover = None;
         let extension = tab.extension();
         tab.content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
@@ -1132,6 +1138,34 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 scrollable::AbsoluteOffset { x: None, y: Some(y) },
             );
         }
+        Message::Git(git::Message::Discard(files)) => {
+            task = ask(state.window_handle, "Discard changes", format!("Discard unstaged changes in {} file(s)? Staged changes are kept. Untracked files will be deleted. Unsaved editor changes in these files will also be discarded. This cannot be undone.", files.len()), Message::DiscardGitConfirmed(state.root_or_cwd(), files));
+        }
+        Message::DiscardGitConfirmed(cwd, files) => {
+            if cwd != state.root_or_cwd() { return Task::none(); }
+            let paths: Vec<_> = state.tabs.iter().filter_map(|tab| {
+                let path = tab.path.as_ref()?;
+                files.iter().any(|file| cwd.join(&file.path) == *path).then(|| (path.clone(), tab.content.text()))
+            }).collect();
+            task = git::update(&mut state.git, git::Message::DiscardConfirmed(files), cwd).map(move |msg| Message::DiscardGitFinished(paths.clone(), msg));
+        }
+        Message::DiscardGitFinished(paths, msg) => {
+            if matches!(msg, git::Message::Discarded(Ok(()))) {
+                for index in (0..state.tabs.len()).rev() {
+                    let tab = &mut state.tabs[index];
+                    if paths.iter().any(|(path, snapshot)| tab.path.as_ref() == Some(path) && tab.content.text() == *snapshot) {
+                        if tab.path.as_ref().is_some_and(|p| !p.exists()) {
+                            state.remove_tab(index);
+                        } else { tab.dirty = false; }
+                    }
+                }
+                task = Task::batch([state.reload_open_tabs(), state.reload_git_views()]);
+                state.notify("Unstaged changes discarded");
+            }
+            if let git::Message::Discarded(Err(err)) = &msg { state.notify(format!("Git: {err}")); }
+            let cwd = state.root_or_cwd();
+            task = Task::batch([task, git::update(&mut state.git, msg, cwd).map(Message::Git)]);
+        }
         Message::Git(msg) => {
             match &msg {
                 git::Message::Committed(Ok(())) => state.notify("Commit created"),
@@ -1151,9 +1185,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 task = git::update(&mut state.git, git::Message::Refresh, cwd).map(Message::Git);
             }
         }
-        Message::GitDiffLoaded(path, diff) => {
+        Message::GitBlameLoaded(path, snapshot, blame) => {
             if let Some(tab) = state.tabs.iter_mut().find(|t| t.path.as_deref() == Some(path.as_path())) {
-                tab.diff = diff.into_iter().collect();
+                if tab.content.text() == snapshot { tab.blame = blame; }
+            }
+        }
+        Message::GitDiffLoaded(path, snapshot, diff) => {
+            if let Some(tab) = state.tabs.iter_mut().find(|t| t.path.as_deref() == Some(path.as_path())) {
+                if tab.content.text() == snapshot { tab.diff = diff.into_iter().collect(); }
             }
         }
         Message::TabSelected(i) => { state.git_preview = None; state.active_tab = i; },
@@ -2587,6 +2626,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             &tab.content,
             &tab.diff,
             &tab.diagnostics,
+            &tab.blame,
             &state.app_theme.editor,
             state.zoom,
             Message::EditorAction,
@@ -2958,9 +2998,19 @@ fn load_diff_task(repo: Option<std::sync::Arc<git::repo::Repo>>, root: Option<&P
     let Some(relative) = root.and_then(|root| path.strip_prefix(root).ok()).map(Path::to_path_buf) else {
         return Task::none();
     };
-    Task::perform(git_diff::diff_for_buffer(repo, relative, text), move |diff| {
-        Message::GitDiffLoaded(path.clone(), diff)
-    })
+    let root = root.unwrap().to_owned();
+    let blame_path = path.clone();
+    let blame_text = text.clone();
+    let blame_relative = relative.clone();
+    let blame = Task::perform(async move {
+        let snapshot = blame_text.clone();
+        let result = tokio::task::spawn_blocking(move || git::blame::load(&root, &blame_relative, &blame_text)).await.unwrap_or_default();
+        Message::GitBlameLoaded(blame_path, snapshot, result)
+    }, |message| message);
+    let snapshot = text.clone();
+    Task::batch([blame, Task::perform(git_diff::diff_for_buffer(repo, relative, text), move |diff| {
+        Message::GitDiffLoaded(path.clone(), snapshot.clone(), diff)
+    })])
 }
 
 fn load_preview_task(repo: Option<std::sync::Arc<git::repo::Repo>>, root: PathBuf, path: String) -> Task<Message> {

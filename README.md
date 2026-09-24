@@ -11,7 +11,9 @@ A minimal, no-bloat code editor in Rust, built on `iced`.
 - Status bar with AI and terminal visibility toggles
 - Reopens the last project with only the root expanded; restores tabs and the active file
 - Recovers unsaved edits from atomic local snapshots (every 500 ms and on normal window close)
-- Git panel with staged/unstaged lists, per-file staging, and side-by-side diffs with character highlights
+- Git panel with staging, confirmed discard of unstaged changes (file, folder, or all), and side-by-side diffs with character highlights
+- Inline Git blame on the current line: author and commit age, including uncommitted edits
+- Language-server diagnostics, hover, and go-to-definition run independently of editing
 - Clickable breadcrumbs and reveal-in-tree navigation
 - Notifications for saves, Git operations, and file-operation failures
 

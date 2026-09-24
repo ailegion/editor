@@ -5,6 +5,7 @@
 //! the panel is visible ([`watch`]); file versions for diffs are read in-process ([`repo`]).
 
 pub mod cli;
+pub mod blame;
 pub mod repo;
 pub mod status;
 mod watch;
@@ -40,6 +41,9 @@ pub struct GitState {
 #[derive(Debug, Clone)]
 pub enum Message {
     Refresh,
+    Discard(Vec<ChangedFile>),
+    DiscardConfirmed(Vec<ChangedFile>),
+    Discarded(Result<(), String>),
     OpenDiff(String),
     /// Stage (`true`) or unstage (`false`) these files in one git call.
     Stage(Vec<ChangedFile>, bool),
@@ -84,7 +88,21 @@ impl GitState {
 
 pub fn update(state: &mut GitState, message: Message, cwd: PathBuf) -> Task<Message> {
     match message {
-        Message::OpenDiff(_) => {},
+        Message::OpenDiff(_) | Message::Discard(_) => {},
+        Message::DiscardConfirmed(files) => {
+            if state.committing || files.is_empty() { return Task::none(); }
+            state.committing = true;
+            return Task::perform(async move {
+                tokio::task::spawn_blocking(move || discard_files(&cwd, &files)).await.map_err(|e| e.to_string())?
+            }, Message::Discarded);
+        }
+        Message::Discarded(result) => {
+            state.committing = false;
+            match result {
+                Ok(()) => return refresh(state, cwd),
+                Err(err) => state.error = Some(err),
+            }
+        }
         Message::Stage(files, stage) => {
             if state.committing || files.is_empty() { return Task::none(); }
             state.committing = true;
@@ -256,7 +274,9 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
                     .on_press(Message::OpenDiff(file.path.clone())).into()
             }
         };
-        files_col = files_col.push(row![indent, check, label].spacing(4).align_y(iced::Alignment::Center));
+        let discard: Vec<_> = files.iter().filter(|file| file.unstaged() && !file.conflicted()).map(|file| (*file).clone()).collect();
+        let discard = crate::icon_control(lucide_icons::Icon::Undo2, "Discard unstaged changes", (!state.committing && !discard.is_empty()).then_some(Message::Discard(discard)), false);
+        files_col = files_col.push(row![indent, check, label, discard].spacing(4).align_y(iced::Alignment::Center));
     }
     let files_list = scrollable(files_col).height(Length::Fill);
 
@@ -278,6 +298,7 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
     );
     let to_stage: Vec<ChangedFile> = state.status.files.iter().filter(|file| file.unstaged() || !file.staged()).cloned().collect();
     let to_unstage: Vec<ChangedFile> = state.status.files.iter().filter(|file| file.staged()).cloned().collect();
+    let to_discard: Vec<_> = state.status.files.iter().filter(|file| file.unstaged() && !file.conflicted()).cloned().collect();
     let staged_count = to_unstage.len();
     let changes = row![
         text("Changes").size(13),
@@ -285,6 +306,7 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
         Space::new().width(Length::Fill),
         crate::icon_control(lucide_icons::Icon::Plus, "Stage all", (!state.committing && !to_stage.is_empty()).then(|| Message::Stage(to_stage.clone(), true)), false),
         crate::icon_control(lucide_icons::Icon::Minus, "Unstage all", (!state.committing && !to_unstage.is_empty()).then(|| Message::Stage(to_unstage.clone(), false)), false),
+        crate::icon_control(lucide_icons::Icon::Undo2, "Discard all unstaged changes", (!state.committing && !to_discard.is_empty()).then_some(Message::Discard(to_discard)), false),
         crate::icon_control(lucide_icons::Icon::ListTree, if state.tree_view { "Show as flat list" } else { "Show as tree" }, Some(Message::ToggleTreeView), state.tree_view),
     ].spacing(6).align_y(iced::Alignment::Center);
 
@@ -292,6 +314,24 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
         .padding(8)
         .height(Length::Fill)
         .into()
+}
+
+/// Restore tracked files from the index, preserving staged changes. Untracked files are removed.
+fn discard_files(cwd: &Path, files: &[ChangedFile]) -> Result<(), String> {
+    for file in files {
+        if file.conflicted() { return Err("Resolve conflicts before discarding changes".into()); }
+        let path = Path::new(&file.path);
+        if path.is_absolute() || path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            return Err("Invalid repository path".into());
+        }
+        if file.status == "??" {
+            // Never recursively remove directories (including nested repositories).
+            std::fs::remove_file(cwd.join(path)).map_err(|e| e.to_string())?;
+        } else {
+            cli::run(cwd, &["--literal-pathspecs", "restore", "--worktree", "--", &file.path], None, Access::Write)?;
+        }
+    }
+    Ok(())
 }
 
 /// One line of the changes list: a directory (tree view only) or a file.
@@ -398,6 +438,32 @@ mod tests {
 
     fn file(path: &str, status: &str) -> ChangedFile {
         ChangedFile { path: path.into(), status: status.into(), original: None }
+    }
+
+    #[test]
+    fn discard_preserves_index_restores_deletions_and_uses_literal_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init"]);
+        for name in ["a[1].txt", "a1.txt", "deleted.txt"] { std::fs::write(root.join(name), "original\n").unwrap(); }
+        git(root, &["add", "."]);
+        git(root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "Initial"]);
+        std::fs::write(root.join("a[1].txt"), "staged\n").unwrap();
+        git(root, &["--literal-pathspecs", "add", "--", "a[1].txt"]);
+        std::fs::write(root.join("a[1].txt"), "unstaged\n").unwrap();
+        std::fs::write(root.join("a1.txt"), "keep\n").unwrap();
+        std::fs::remove_file(root.join("deleted.txt")).unwrap();
+        std::fs::write(root.join("new.txt"), "new\n").unwrap();
+        discard_files(root, &[file("a[1].txt", "MM"), file("deleted.txt", " D"), file("new.txt", "??")]).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("a[1].txt")).unwrap(), "staged\n");
+        assert_eq!(std::fs::read_to_string(root.join("a1.txt")).unwrap(), "keep\n");
+        assert_eq!(std::fs::read_to_string(root.join("deleted.txt")).unwrap(), "original\n");
+        assert!(!root.join("new.txt").exists());
+        assert!(git(root, &["diff", "--cached"]).contains("+staged"));
+        assert!(discard_files(root, &[file("../outside", "??")]).is_err());
+        let blame = blame::load(root, Path::new("a1.txt"), "original\ninserted\n");
+        assert!(blame[0].starts_with("Test, "));
+        assert_eq!(blame[1], "Uncommitted changes");
     }
 
     #[test]

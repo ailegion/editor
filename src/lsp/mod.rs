@@ -1,8 +1,8 @@
 //! Language Server Protocol support: one server process per language per workspace,
 //! document sync from the open tabs, and diagnostics back into them.
 //!
-//! Everything here runs on the UI thread and never blocks: process IO lives on the threads
-//! inside [`client::Client`], installs run on their own thread, and [`Manager::poll`] drains
+//! Server management runs on a dedicated worker; process IO lives on the threads
+//! inside [`client::Client`], installs run on their own thread, and [`Core::poll`] drains
 //! what arrived since the last tick. A server that crashes is restarted with backoff and
 //! given up on after three crashes, so a broken server costs a notice, never the editor.
 pub mod client;
@@ -76,13 +76,91 @@ struct Slot {
     disabled: bool,
 }
 
-#[derive(Default)]
+/// UI-side handle. No server discovery, process lifecycle or protocol processing runs here.
 pub struct Manager {
+    commands: std::sync::mpsc::Sender<Box<dyn FnOnce(&mut Core) + Send>>,
+    events: Receiver<Event>,
+    root: Option<PathBuf>,
+    documents: HashSet<PathBuf>,
+    due: HashMap<PathBuf, Instant>,
+}
+
+impl Default for Manager {
+    fn default() -> Self {
+        let (commands, incoming) = std::sync::mpsc::channel::<Box<dyn FnOnce(&mut Core) + Send>>();
+        let (outgoing, events) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut core = Core::default();
+            loop {
+                match incoming.recv_timeout(Duration::from_millis(10)) {
+                    Ok(command) => command(&mut core),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {},
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                for event in core.poll() {
+                    if outgoing.send(event).is_err() { return; }
+                }
+            }
+            core.shutdown_all();
+        });
+        Self { commands, events, root: None, documents: HashSet::new(), due: HashMap::new() }
+    }
+}
+
+impl Manager {
+    fn send(&self, command: impl FnOnce(&mut Core) + Send + 'static) {
+        let _ = self.commands.send(Box::new(command));
+    }
+    pub fn set_root(&mut self, root: &Path) {
+        if self.root.as_deref() == Some(root) { return; }
+        self.root = Some(root.to_owned());
+        self.due.clear();
+        self.documents.clear();
+        let root = root.to_owned();
+        self.send(move |core| core.set_root(&root));
+    }
+    pub fn open(&mut self, path: &Path, text: String) {
+        self.documents.insert(path.to_owned());
+        let path = path.to_owned(); self.send(move |core| core.open(&path, text));
+    }
+    pub fn changed(&mut self, path: &Path) {
+        if self.documents.contains(path) { self.due.insert(path.to_owned(), Instant::now() + CHANGE_DEBOUNCE); }
+    }
+    pub fn take_due(&mut self) -> Vec<PathBuf> {
+        let now = Instant::now();
+        let ready = self.due.iter().filter(|(_, at)| **at <= now).map(|(p, _)| p.clone()).collect::<Vec<_>>();
+        for path in &ready { self.due.remove(path); }
+        ready
+    }
+    pub fn change(&self, path: &Path, text: String) {
+        let path = path.to_owned(); self.send(move |core| core.change(&path, text));
+    }
+    pub fn saved(&mut self, path: &Path, text: String) {
+        self.due.remove(path);
+        let path = path.to_owned(); self.send(move |core| core.saved(&path, text));
+    }
+    pub fn closed(&mut self, path: &Path) {
+        self.documents.remove(path);
+        self.due.remove(path);
+        let path = path.to_owned(); self.send(move |core| core.closed(&path));
+    }
+    pub fn hover(&self, path: &Path, line: usize, column: usize) {
+        let path = path.to_owned(); self.send(move |core| core.hover(&path, line, column));
+    }
+    pub fn definition(&self, path: &Path, line: usize, column: usize) {
+        let path = path.to_owned(); self.send(move |core| core.definition(&path, line, column));
+    }
+    pub fn install(&self, server: &'static Server) { self.send(move |core| core.install(server)); }
+    pub fn dismiss(&self, server: &'static Server) { self.send(move |core| core.dismiss(server)); }
+    pub fn shutdown_all(&self) { self.send(Core::shutdown_all); }
+    pub fn poll(&self) -> Vec<Event> { self.events.try_iter().take(32).collect() }
+}
+
+#[derive(Default)]
+struct Core {
     root: Option<PathBuf>,
     slots: HashMap<&'static str, Slot>,
     docs: HashMap<PathBuf, Doc>,
-    /// Documents edited since their last `didChange`, with the moment to send it.
-    due: HashMap<PathBuf, Instant>,
     prompted: HashSet<&'static str>,
     installing: HashMap<&'static str, Receiver<Result<PathBuf, String>>>,
     /// Explicit binaries that beat [`Server::locate`], e.g. a freshly installed one.
@@ -94,7 +172,7 @@ pub struct Manager {
     events: Vec<Event>,
 }
 
-impl Manager {
+impl Core {
     /// Servers are per workspace: a new root shuts down the old ones.
     pub fn set_root(&mut self, root: &Path) {
         if self.root.as_deref() == Some(root) { return; }
@@ -103,7 +181,6 @@ impl Manager {
             if let Some(client) = slot.client { client.shutdown(); }
         }
         self.docs.clear();
-        self.due.clear();
     }
 
     /// A tab opened `path`. Starts the language's server if needed, or asks to install it.
@@ -126,21 +203,6 @@ impl Manager {
         }
     }
 
-    /// The buffer changed; the text is fetched when the debounce elapses (see [`Self::take_due`]).
-    pub fn changed(&mut self, path: &Path) {
-        if self.docs.contains_key(path) {
-            self.due.insert(path.to_path_buf(), Instant::now() + CHANGE_DEBOUNCE);
-        }
-    }
-
-    /// Documents whose debounce elapsed; feed each one's current text to [`Self::change`].
-    pub fn take_due(&mut self) -> Vec<PathBuf> {
-        let now = Instant::now();
-        let ready: Vec<PathBuf> = self.due.iter().filter(|(_, at)| **at <= now).map(|(path, _)| path.clone()).collect();
-        for path in &ready { self.due.remove(path); }
-        ready
-    }
-
     pub fn change(&mut self, path: &Path, text: String) {
         let Some(doc) = self.docs.get_mut(path) else { return };
         if doc.text == text { return; }
@@ -158,7 +220,6 @@ impl Manager {
     }
 
     pub fn saved(&mut self, path: &Path, text: String) {
-        self.due.remove(path);
         self.change(path, text);
         let Some(doc) = self.docs.get(path) else { return };
         if let Some(client) = self.ready_client(doc.server) {
@@ -167,7 +228,6 @@ impl Manager {
     }
 
     pub fn closed(&mut self, path: &Path) {
-        self.due.remove(path);
         let Some(doc) = self.docs.remove(path) else { return };
         if let Some(client) = self.ready_client(doc.server) {
             client.notify("textDocument/didClose", json!({"textDocument": {"uri": path_to_uri(path)}}));
@@ -558,6 +618,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stalled_worker_does_not_block_editor_or_ui_handle() {
+        let mut manager = Manager::default();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        manager.send(move |_| {
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut buffer = crate::code_editor::Buffer::new("", crate::code_editor::metrics_for_zoom(crate::code_editor::ZOOM_DEFAULT));
+        let start = Instant::now();
+        assert!(crate::code_editor::input::handle_key(&mut buffer, &iced::keyboard::Key::Character("x".into()), iced::keyboard::Modifiers::default()));
+        assert_eq!(buffer.text().trim_end(), "x");
+        manager.set_root(Path::new("."));
+        manager.open(Path::new("a.rs"), "before".into());
+        manager.changed(Path::new("a.rs"));
+        manager.change(Path::new("a.rs"), "after".into());
+        manager.hover(Path::new("a.rs"), 0, 0);
+        assert!(manager.poll().is_empty());
+        manager.closed(Path::new("a.rs"));
+        manager.shutdown_all();
+        assert!(start.elapsed() < Duration::from_secs(1), "UI must not wait for the worker");
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
     fn uris_round_trip_and_columns_convert() {
         let path = if cfg!(windows) { PathBuf::from(r"C:\Projects\my app\src\ma#in.rs") } else { PathBuf::from("/home/me/my app/src/ma#in.rs") };
         let uri = path_to_uri(&path);
@@ -631,7 +717,7 @@ mod tests {
     /// rather than being restarted.
     #[test]
     fn unusable_binary_prompts_instead_of_restarting() {
-        let mut manager = Manager::default();
+        let mut manager = Core::default();
         let server = registry::by_id("just-lsp").unwrap();
         // Any program that exits immediately without speaking LSP. `/usr/bin/true` exists on
         // both macOS and Linux; `/bin/true` does not on macOS.
@@ -678,11 +764,11 @@ mod tests {
         let main = root.join("src").join("main.rs");
         std::fs::write(&main, "fn main() { let x: i32 = \"no\"; }\n").unwrap();
 
-        let mut manager = Manager::default();
+        let mut manager = Core::default();
         manager.set_binary(registry::by_id("rust-analyzer").unwrap(), binary);
         manager.set_root(&root);
         manager.open(&main, std::fs::read_to_string(&main).unwrap());
-        let wait_for = |manager: &mut Manager, want_error: bool, secs: u64| -> bool {
+        let wait_for = |manager: &mut Core, want_error: bool, secs: u64| -> bool {
             let deadline = Instant::now() + Duration::from_secs(secs);
             while Instant::now() < deadline {
                 for event in manager.poll() {
@@ -711,7 +797,7 @@ mod tests {
         assert!(cleared_on_change || wait_for(&mut manager, false, 90), "expected the error to clear after the fix was saved");
 
         // `fn main() { let x: i32 = 1; let _ = x; }`: `x` is declared at column 16 and used at 36.
-        let wait_event = |manager: &mut Manager, secs: u64, accept: &dyn Fn(&Event) -> bool| -> bool {
+        let wait_event = |manager: &mut Core, secs: u64, accept: &dyn Fn(&Event) -> bool| -> bool {
             let deadline = Instant::now() + Duration::from_secs(secs);
             while Instant::now() < deadline {
                 for event in manager.poll() {
@@ -746,7 +832,7 @@ mod tests {
 
     #[test]
     fn manager_without_servers_prompts_once_and_tracks_debounce() {
-        let mut manager = Manager::default();
+        let mut manager = Core::default();
         manager.set_root(Path::new("."));
         // A language nobody here serves: silently ignored.
         manager.open(Path::new("notes.txt"), "x".into());
@@ -759,6 +845,8 @@ mod tests {
             manager.open(Path::new("other.just"), "".into());
             assert!(manager.poll().is_empty(), "prompted once per session");
         }
+        let mut manager = Manager::default();
+        manager.open(Path::new("justfile"), String::new());
         manager.changed(Path::new("justfile"));
         assert!(manager.take_due().is_empty(), "not before the debounce");
         std::thread::sleep(CHANGE_DEBOUNCE + Duration::from_millis(20));

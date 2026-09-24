@@ -38,6 +38,7 @@ pub struct CodeEditor<'a, Message> {
     content: &'a Buffer,
     diff: &'a HashMap<usize, LineStatus>,
     diagnostics: &'a [crate::lsp::Diagnostic],
+    blame: &'a [String],
     style: Style,
     on_fold: Option<Box<dyn Fn(usize) -> Message + 'a>>,
     on_action: Option<Box<dyn Fn(cosmic_text::Action) -> Message + 'a>>,
@@ -83,6 +84,7 @@ impl<'a, Message> CodeEditor<'a, Message> {
             content,
             diff,
             diagnostics,
+            blame: &[],
             style: Style::new(colors, zoom),
             on_action: None,
             on_fold: None,
@@ -248,7 +250,7 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
         cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
-        render::draw(self.content, self.diff, self.diagnostics, &mut frame, &self.style, state.scroll, state.scroll_x);
+        render::draw(self.content, self.diff, self.diagnostics, self.blame, &mut frame, &self.style, state.scroll, state.scroll_x);
         // Scrollbars: semi-transparent overlays, brighter while hovered or dragged.
         let local = Rectangle::with_size(bounds.size());
         let position = cursor.position_in(bounds);
@@ -461,6 +463,7 @@ pub fn code_editor<'a, Message>(
     content: &'a Buffer,
     diff: &'a HashMap<usize, LineStatus>,
     diagnostics: &'a [crate::lsp::Diagnostic],
+    blame: &'a [String],
     colors: &EditorColors,
     zoom: f32,
     on_action: impl Fn(cosmic_text::Action) -> Message + 'a,
@@ -471,6 +474,7 @@ where
     Message: 'a,
 {
     let mut editor = CodeEditor::new(content, diff, diagnostics, colors, zoom).on_action(on_action);
+    editor.blame = blame;
     editor.on_fold = Some(Box::new(on_fold));
     editor.on_probe = Some(Box::new(on_probe));
     Canvas::new(editor)

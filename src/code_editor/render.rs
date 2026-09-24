@@ -20,6 +20,7 @@ pub fn draw(
     buffer: &Buffer,
     diff: &HashMap<usize, LineStatus>,
     diagnostics: &[crate::lsp::Diagnostic],
+    blame: &[String],
     frame: &mut Frame,
     style: &Style,
     scroll: f32,
@@ -96,6 +97,22 @@ pub fn draw(
                 y,
                 style.font_size,
             ),
+        }
+        if i == buffer.cursor.line && !buffer.collapsed.contains(&i) {
+            if let Some(annotation) = blame.get(i) {
+                let width = line.layout_opt().and_then(|lines| lines.first()).map_or(0.0, |line| line.w);
+                let x = text_x + width + style.font_size * 3.0;
+                if x >= gutter_width {
+                    frame.fill_text(Text {
+                        content: format!("⑂ {annotation}"),
+                        position: Point::new(x, y),
+                        color: iced::Color { a: 0.65, ..style.gutter_text_color },
+                        size: iced::Pixels(style.font_size),
+                        font: iced::Font::MONOSPACE,
+                        ..Text::default()
+                    });
+                }
+            }
         }
         if let Some(end) = buffer.folds.get(&i) {
             if buffer.collapsed.contains(&i) {
