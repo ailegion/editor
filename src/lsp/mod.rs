@@ -633,8 +633,9 @@ mod tests {
     fn unusable_binary_prompts_instead_of_restarting() {
         let mut manager = Manager::default();
         let server = registry::by_id("just-lsp").unwrap();
-        // Any program that exits immediately without speaking LSP.
-        let stub = if cfg!(windows) { PathBuf::from("C:/Windows/System32/cmd.exe") } else { PathBuf::from("/bin/true") };
+        // Any program that exits immediately without speaking LSP. `/usr/bin/true` exists on
+        // both macOS and Linux; `/bin/true` does not on macOS.
+        let stub = if cfg!(windows) { PathBuf::from("C:/Windows/System32/cmd.exe") } else { PathBuf::from("/usr/bin/true") };
         manager.set_binary(server, stub);
         manager.set_root(Path::new("."));
         manager.open(Path::new("justfile"), "".into());
