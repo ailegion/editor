@@ -190,7 +190,15 @@ impl Buffer {
     pub fn perform(&mut self, action: cosmic_text::Action) {
         let mut editor = Editor::new(&mut self.inner);
         editor.set_cursor(self.cursor);
-        editor.set_selection(self.selection);
+        // A click/drag or a shift-motion can leave an empty selection. Cosmic treats
+        // deleting it as a completed edit, swallowing Backspace/Delete. Affinity can
+        // differ at syntax span boundaries, so compare text positions only.
+        let selection = match self.selection {
+            Selection::Normal(anchor)
+                if anchor.line == self.cursor.line && anchor.index == self.cursor.index => Selection::None,
+            selection => selection,
+        };
+        editor.set_selection(selection);
         editor.start_change();
         editor.action(&mut self.font_system, action);
         let change = editor.finish_change();
@@ -441,5 +449,38 @@ mod clipboard_tests {
         assert_eq!(buffer.text(), " world");
         buffer.undo();
         assert_eq!(buffer.text(), "hello world");
+    }
+}
+
+#[cfg(test)]
+mod deletion_tests {
+    use super::*;
+
+    #[test]
+    fn empty_selection_does_not_swallow_deletion_at_semicolon() {
+        for (action, index, expected) in [
+            (cosmic_text::Action::Backspace, 2, "x"),
+            (cosmic_text::Action::Delete, 1, "x"),
+        ] {
+            let mut buffer = Buffer::new("x;", Metrics::new(14.0, 20.0));
+            buffer.cursor = Cursor::new(0, index);
+            let mut anchor = buffer.cursor;
+            anchor.affinity = cosmic_text::Affinity::Before;
+            buffer.cursor.affinity = cosmic_text::Affinity::After;
+            buffer.selection = Selection::Normal(anchor);
+            buffer.perform(action);
+            assert_eq!(buffer.text(), expected);
+            assert_eq!(buffer.undo_count(), 1);
+            buffer.undo();
+            assert_eq!(buffer.text(), "x;");
+        }
+    }
+
+    #[test]
+    fn backspace_still_deletes_nonempty_selection() {
+        let mut buffer = Buffer::new("abc;", Metrics::new(14.0, 20.0));
+        buffer.select_range(Cursor::new(0, 1), Cursor::new(0, 4));
+        buffer.perform(cosmic_text::Action::Backspace);
+        assert_eq!(buffer.text(), "a");
     }
 }

@@ -66,6 +66,8 @@ struct Tab {
     content: code_editor::Buffer,
     search: code_editor::search::SearchState,
     dirty: bool,
+    /// Last successfully loaded or saved text, normalized like the editor buffer.
+    saved_text: Option<String>,
     line_ending: LineEnding,
     /// Diff gutter markers vs. the staged version, keyed by 0-indexed line number. Computed
     /// in-process from the buffer (see `Message::GitDiffLoaded`) when the tab opens, shortly
@@ -79,6 +81,10 @@ struct Tab {
 }
 
 impl Tab {
+    fn refresh_dirty(&mut self) {
+        self.dirty = self.saved_text.as_deref() != Some(self.content.text().as_str());
+    }
+
     fn title(&self) -> String {
         let name = self
             .path
@@ -513,11 +519,14 @@ impl State {
                 let extension = recovery.path.as_ref().and_then(|path| path.extension()).and_then(|ext| ext.to_str()).unwrap_or("txt");
                 content.highlight(&state.highlighter, extension, &state.app_theme.syntax);
                 if let Some(path) = &recovery.path { state.lsp.open(path, recovery.text.clone()); }
-                let tab = Tab {
+                let mut tab = Tab {
                     path: recovery.path.clone(), content, dirty: true,
+                    saved_text: recovery.path.as_ref().and_then(|path| std::fs::read_to_string(path).ok())
+                        .map(|text| text.replace("\r\n", "\n").replace('\r', "\n")),
                     search: Default::default(), line_ending: LineEnding::detect(&recovery.text), diff: Default::default(),
                     diagnostics: Vec::new(), blame: Vec::new(), hover: None,
                 };
+                tab.refresh_dirty();
                 if let Some(index) = state.tabs.iter().position(|tab| tab.path == recovery.path) {
                     state.tabs[index] = tab;
                 } else { state.tabs.push(tab); }
@@ -650,6 +659,7 @@ impl State {
                     self.lsp.changed(&path);
                     tasks.push(load_diff_task(repo.clone(), self.root.as_deref(), path, text));
                 }
+                tab.saved_text = Some(tab.content.text());
             }
         }
         Task::batch(tasks)
@@ -684,6 +694,7 @@ impl State {
         let task = load_diff_task(self.git.repo(), self.root.as_deref(), path.clone(), text);
         self.tabs.push(Tab {
             path: Some(path),
+            saved_text: Some(content.text()),
             content,
             search: code_editor::search::SearchState::default(),
             dirty: false,
@@ -750,6 +761,7 @@ impl State {
             if result.is_ok() {
                 let was_untitled = tab.path.is_none();
                 tab.path = Some(path.clone());
+                tab.saved_text = Some(text.clone());
                 tab.dirty = false;
                 if was_untitled { self.lsp.open(&path, text); } else { self.lsp.saved(&path, text); }
                 // Saving changes neither the buffer nor the index, so the markers stay valid.
@@ -773,7 +785,7 @@ impl State {
         handled
     }
 
-    /// Marks the active tab dirty and re-runs syntax highlighting if `before` (an
+    /// Refreshes the active tab's saved-state comparison and syntax highlighting if `before` (an
     /// `undo_count()` taken just before some editor operation) no longer matches -- i.e. the
     /// operation actually changed the document, as opposed to just moving the cursor.
     fn mark_edited_if_changed(&mut self, before: usize) {
@@ -783,7 +795,7 @@ impl State {
         if tab.content.undo_count() == before {
             return;
         }
-        tab.dirty = true;
+        tab.refresh_dirty();
         tab.blame.clear();
         tab.hover = None;
         let extension = tab.extension();
@@ -3278,5 +3290,48 @@ mod tab_close_tests {
         let mut tabs = vec!["a", "b", "c", "d", "e"];
         for index in tabs_to_close(tabs.len(), 2, TabCloseScope::Others) { tabs.remove(index); }
         assert_eq!(tabs, ["c"]);
+    }
+}
+
+#[cfg(test)]
+mod saved_state_tests {
+    use super::*;
+
+    #[test]
+    fn undo_and_redo_compare_text_with_the_latest_save() {
+        let mut tab = Tab {
+            path: None,
+            content: code_editor::Buffer::new("x;", code_editor::metrics_for_zoom(1.0)),
+            saved_text: Some("x;".into()),
+            dirty: false,
+            search: Default::default(),
+            line_ending: LineEnding::Lf,
+            diff: Default::default(),
+            diagnostics: Vec::new(), blame: Vec::new(), hover: None,
+        };
+        tab.content.goto(0, 2);
+        tab.content.perform(cosmic_text::Action::Backspace);
+        tab.refresh_dirty();
+        assert!(tab.dirty);
+        tab.content.undo();
+        tab.refresh_dirty();
+        assert!(!tab.dirty);
+        tab.content.redo();
+        tab.refresh_dirty();
+        assert!(tab.dirty);
+        tab.saved_text = Some(tab.content.text());
+        tab.refresh_dirty();
+        assert!(!tab.dirty);
+        tab.content.undo();
+        tab.refresh_dirty();
+        assert!(tab.dirty);
+        tab.content.redo();
+        tab.refresh_dirty();
+        assert!(!tab.dirty);
+        // Matching saved text through a new edit must also clear the indicator.
+        tab.content.perform(cosmic_text::Action::Insert(';'));
+        tab.content.perform(cosmic_text::Action::Backspace);
+        tab.refresh_dirty();
+        assert!(!tab.dirty);
     }
 }
