@@ -442,9 +442,19 @@ mod tests {
 
     #[test]
     fn discard_preserves_index_restores_deletions_and_uses_literal_paths() {
+        for autocrlf in [false, true] {
+            check_discard(autocrlf);
+        }
+    }
+
+    fn check_discard(autocrlf: bool) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         git(root, &["init"]);
+        // Exercise both checkout styles independently of the host's Git configuration.
+        git(root, &["config", "core.autocrlf", if autocrlf { "true" } else { "false" }]);
+        git(root, &["config", "core.eol", "lf"]);
+        let checkout_eol = if autocrlf { "\r\n" } else { "\n" };
         for name in ["a[1].txt", "a1.txt", "deleted.txt"] { std::fs::write(root.join(name), "original\n").unwrap(); }
         git(root, &["add", "."]);
         git(root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "Initial"]);
@@ -455,9 +465,9 @@ mod tests {
         std::fs::remove_file(root.join("deleted.txt")).unwrap();
         std::fs::write(root.join("new.txt"), "new\n").unwrap();
         discard_files(root, &[file("a[1].txt", "MM"), file("deleted.txt", " D"), file("new.txt", "??")]).unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("a[1].txt")).unwrap(), "staged\n");
+        assert_eq!(std::fs::read_to_string(root.join("a[1].txt")).unwrap(), format!("staged{checkout_eol}"));
         assert_eq!(std::fs::read_to_string(root.join("a1.txt")).unwrap(), "keep\n");
-        assert_eq!(std::fs::read_to_string(root.join("deleted.txt")).unwrap(), "original\n");
+        assert_eq!(std::fs::read_to_string(root.join("deleted.txt")).unwrap(), format!("original{checkout_eol}"));
         assert!(!root.join("new.txt").exists());
         assert!(git(root, &["diff", "--cached"]).contains("+staged"));
         assert!(discard_files(root, &[file("../outside", "??")]).is_err());
