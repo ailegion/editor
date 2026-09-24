@@ -38,10 +38,35 @@ pub struct CodeEditor<'a, Message> {
     content: &'a Buffer,
     diff: &'a HashMap<usize, LineStatus>,
     diagnostics: &'a [crate::lsp::Diagnostic],
+    hover: Option<&'a Hover>,
     style: Style,
     on_fold: Option<Box<dyn Fn(usize) -> Message + 'a>>,
     on_action: Option<Box<dyn Fn(cosmic_text::Action) -> Message + 'a>>,
+    on_probe: Option<Box<dyn Fn(Probe) -> Message + 'a>>,
 }
+
+/// Mouse gestures that ask the language server something about a buffer position
+/// (`line`, byte `index`), published through `code_editor`'s `on_probe`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    /// The mouse rested on this position long enough to want hover information.
+    Hover(usize, usize),
+    /// The mouse moved off the hovered position; hide any hover popup.
+    Leave,
+    /// Ctrl/Cmd+click: go to the definition of what's here.
+    Definition(usize, usize),
+}
+
+/// Hover text to show beneath (`line`, byte `index`), already wrapped into short lines.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hover {
+    pub line: usize,
+    pub index: usize,
+    pub lines: Vec<String>,
+}
+
+/// How long the mouse must rest on a word before hover information is requested.
+const HOVER_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 
 impl<'a, Message> CodeEditor<'a, Message> {
     pub fn new(
@@ -55,10 +80,29 @@ impl<'a, Message> CodeEditor<'a, Message> {
             content,
             diff,
             diagnostics,
+            hover: None,
             style: Style::new(colors, zoom),
             on_action: None,
             on_fold: None,
+            on_probe: None,
         }
+    }
+
+    /// Buffer position (`line`, byte `index`) under `position`, when it's over actual text
+    /// rather than the gutter, the scrollbars, or the empty space past a line's end.
+    fn cell_at(&self, state: &State, bounds: Rectangle, position: iced::Point) -> Option<(usize, usize)> {
+        let gutter_width = self.style.gutter_width(self.content.line_count());
+        if position.x < gutter_width || position.x >= bounds.width - BAR || position.y >= bounds.height - BAR {
+            return None;
+        }
+        let y = position.y + state.scroll;
+        let row = (y / self.style.line_height).max(0.0) as usize;
+        if row >= self.content.visible_count() { return None; }
+        let line = self.content.source_line(row);
+        let x = position.x - gutter_width + state.scroll_x;
+        let hit = self.content.inner.hit(x, line as f32 * self.style.line_height + y.rem_euclid(self.style.line_height))?;
+        let length = self.content.inner.lines.get(hit.line)?.text().len();
+        (hit.line == line && hit.index < length).then_some((hit.line, hit.index))
     }
 
     pub fn on_action(mut self, f: impl Fn(cosmic_text::Action) -> Message + 'a) -> Self {
@@ -166,6 +210,12 @@ pub struct State {
     thumb_drag: Option<(Axis, f32)>,
     /// Shift held, so a vertical wheel pans sideways (Windows doesn't do this conversion).
     shift: bool,
+    /// Ctrl (Cmd on macOS) held, so a click asks for the definition instead of moving the caret.
+    command: bool,
+    /// Where the mouse currently rests, since when, and whether a hover was already sent.
+    hover_cell: Option<(usize, usize)>,
+    hover_since: Option<std::time::Instant>,
+    hover_sent: bool,
     /// The cursor pixel position as of the last redraw check, so scroll-into-view only
     /// fires when the cursor itself moved -- not just because the user scrolled the
     /// viewport away from a stationary cursor to read elsewhere in the file.
@@ -199,7 +249,15 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
             let active = over_track || state.thumb_drag.is_some_and(|(a, _)| a == axis);
             render::draw_thumb(&mut frame, thumb, &self.style, active);
         }
-        vec![frame.into_geometry()]
+        let mut layers = vec![frame.into_geometry()];
+        // Canvas text always paints above its own layer's shapes, so the popup gets a layer
+        // of its own; otherwise the code underneath would show through its background.
+        if let Some(hover) = self.hover {
+            let mut overlay = canvas::Frame::new(renderer, bounds.size());
+            render::draw_hover(&mut overlay, self.content, hover, &self.style, state.scroll, state.scroll_x);
+            layers.push(overlay.into_geometry());
+        }
+        layers
     }
 
     fn update(
@@ -219,10 +277,17 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
             let max_scroll = (self.content.visible_count() as f32 * self.style.line_height - bounds.height).max(0.0);
             state.scroll = state.scroll.min(max_scroll);
             state.scroll_x = state.scroll_x.min(self.max_scroll_x(bounds));
+            if !state.hover_sent && state.hover_since.is_some_and(|since| since.elapsed() >= HOVER_DELAY) {
+                if let (Some((line, index)), Some(on_probe)) = (state.hover_cell, self.on_probe.as_ref()) {
+                    state.hover_sent = true;
+                    return Some(canvas::Action::publish(on_probe(Probe::Hover(line, index))));
+                }
+            }
             return self.scroll_correction(state, bounds.size()).then(canvas::Action::request_redraw);
         }
         if let Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) = event {
             state.shift = modifiers.shift();
+            state.command = modifiers.command();
             return None;
         }
 
@@ -267,6 +332,11 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
                     self.scroll_to_thumb(state, local, axis, along - grab);
                     return Some(canvas::Action::request_redraw().and_capture());
                 }
+                if state.command {
+                    if let (Some((line, index)), Some(on_probe)) = (self.cell_at(state, local, position), self.on_probe.as_ref()) {
+                        return Some(canvas::Action::publish(on_probe(Probe::Definition(line, index))).and_capture());
+                    }
+                }
                 let on_action = self.on_action.as_ref()?;
                 let row = ((position.y + state.scroll) / self.style.line_height).max(0.0) as usize;
                 let line = self.content.source_line(row);
@@ -300,9 +370,23 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
                 let (x, y) = buffer_position(position);
                 Some(canvas::Action::publish(on_action(cosmic_text::Action::Drag { x, y })).and_capture())
             }
-            mouse::Event::CursorMoved { .. } if cursor.is_over(bounds) => {
+            mouse::Event::CursorMoved { .. } => {
+                // Track where the mouse rests; the hover request itself fires from the
+                // redraw tick once it has stayed put for `HOVER_DELAY`.
+                let cell = cursor.position_in(bounds).and_then(|position| self.cell_at(state, local, position));
+                if cell != state.hover_cell {
+                    let left = state.hover_sent;
+                    state.hover_cell = cell;
+                    state.hover_since = cell.map(|_| std::time::Instant::now());
+                    state.hover_sent = false;
+                    if left {
+                        if let Some(on_probe) = self.on_probe.as_ref() {
+                            return Some(canvas::Action::publish(on_probe(Probe::Leave)));
+                        }
+                    }
+                }
                 // Hover highlight on the bars needs a repaint.
-                Some(canvas::Action::request_redraw())
+                cursor.is_over(bounds).then(canvas::Action::request_redraw)
             }
             mouse::Event::ButtonReleased(mouse::Button::Left) => {
                 state.dragging = false;
@@ -364,16 +448,20 @@ pub fn code_editor<'a, Message>(
     content: &'a Buffer,
     diff: &'a HashMap<usize, LineStatus>,
     diagnostics: &'a [crate::lsp::Diagnostic],
+    hover: Option<&'a Hover>,
     colors: &EditorColors,
     zoom: f32,
     on_action: impl Fn(cosmic_text::Action) -> Message + 'a,
     on_fold: impl Fn(usize) -> Message + 'a,
+    on_probe: impl Fn(Probe) -> Message + 'a,
 ) -> Element<'a, Message>
 where
     Message: 'a,
 {
     let mut editor = CodeEditor::new(content, diff, diagnostics, colors, zoom).on_action(on_action);
+    editor.hover = hover;
     editor.on_fold = Some(Box::new(on_fold));
+    editor.on_probe = Some(Box::new(on_probe));
     Canvas::new(editor)
         .width(Length::Fill)
         .height(Length::Fill)

@@ -73,6 +73,8 @@ struct Tab {
     diff: std::collections::HashMap<usize, git_diff::LineStatus>,
     /// Latest diagnostics from the file's language server, sorted by line.
     diagnostics: Vec<lsp::Diagnostic>,
+    /// Hover popup currently shown in the editor, if any.
+    hover: Option<code_editor::Hover>,
 }
 
 impl Tab {
@@ -293,6 +295,10 @@ enum Message {
     /// Install the language server with this id, or dismiss its prompt for the session.
     LspInstall(&'static str),
     LspDismiss(&'static str),
+    /// Hover / Ctrl+click gestures from the editor canvas.
+    EditorProbe(code_editor::Probe),
+    /// Go to the definition of the symbol under the caret (F12).
+    GoToDefinition,
     Codex(acp::Message),
     Chat(chat::Message),
     Acp(acp::Message),
@@ -353,6 +359,9 @@ struct State {
     lsp: lsp::Manager,
     /// A language server the open file needs but which isn't installed; shown as a toast.
     lsp_prompt: Option<&'static lsp::registry::Server>,
+    /// The (line, byte index) the mouse is resting on, awaiting hover text. A late answer for
+    /// any other position is ignored.
+    hover_request: Option<(usize, usize)>,
 
     app_theme: theme::EditorTheme,
     themes: theme::ThemeRegistry,
@@ -456,6 +465,7 @@ impl State {
             gutter_due: None,
             lsp: lsp::Manager::default(),
             lsp_prompt: None,
+            hover_request: None,
             app_theme,
             themes,
             highlighter: code_editor::Highlighter::new(),
@@ -502,7 +512,7 @@ impl State {
                 let tab = Tab {
                     path: recovery.path.clone(), content, dirty: true,
                     search: Default::default(), line_ending: LineEnding::detect(&recovery.text), diff: Default::default(),
-                    diagnostics: Vec::new(),
+                    diagnostics: Vec::new(), hover: None,
                 };
                 if let Some(index) = state.tabs.iter().position(|tab| tab.path == recovery.path) {
                     state.tabs[index] = tab;
@@ -675,6 +685,7 @@ impl State {
             line_ending,
             diff: std::collections::HashMap::new(),
             diagnostics: Vec::new(),
+            hover: None,
         });
         self.active_tab = self.tabs.len() - 1;
         task
@@ -768,6 +779,7 @@ impl State {
             return;
         }
         tab.dirty = true;
+        tab.hover = None;
         let extension = tab.extension();
         tab.content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
         if let Some(path) = &tab.path { self.lsp.changed(path); }
@@ -775,13 +787,14 @@ impl State {
     }
 
     /// Sends debounced edits to language servers and applies what they sent back.
-    fn poll_lsp(&mut self) {
+    fn poll_lsp(&mut self) -> Task<Message> {
         for path in self.lsp.take_due() {
             if let Some(tab) = self.tabs.iter().find(|tab| tab.path.as_deref() == Some(path.as_path())) {
                 let text = tab.content.text();
                 self.lsp.change(&path, text);
             }
         }
+        let mut tasks = Vec::new();
         for event in self.lsp.poll() {
             match event {
                 lsp::Event::Diagnostics(path, diagnostics) => {
@@ -791,8 +804,34 @@ impl State {
                 }
                 lsp::Event::Notice(text) => self.notify(text),
                 lsp::Event::Prompt(server) => self.lsp_prompt = Some(server),
+                lsp::Event::Hover { path, line, column, lines } => {
+                    if lines.is_empty() { continue; }
+                    if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.path.as_deref() == Some(path.as_path())) {
+                        let index = tab.content.inner.lines.get(line).map_or(0, |l| lsp::utf16_to_byte(l.text(), column));
+                        if self.hover_request == Some((line, index)) {
+                            tab.hover = Some(code_editor::Hover { line, index, lines });
+                        }
+                    }
+                }
+                lsp::Event::Definition { path, line, column } => {
+                    tasks.push(self.open_path(path.clone()));
+                    if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.path.as_deref() == Some(path.as_path())) {
+                        let index = tab.content.inner.lines.get(line).map_or(0, |l| lsp::utf16_to_byte(l.text(), column));
+                        tab.content.goto(line, index);
+                        tab.hover = None;
+                        self.focus = Focus::Editor;
+                    }
+                }
             }
         }
+        Task::batch(tasks)
+    }
+
+    /// UTF-16 column of byte `index` on `line` of the active tab, with the tab's path.
+    fn lsp_position(&self, line: usize, index: usize) -> Option<(PathBuf, usize)> {
+        let tab = self.tabs.get(self.active_tab)?;
+        let column = lsp::byte_to_utf16(tab.content.inner.lines.get(line)?.text(), index);
+        Some((tab.path.clone()?, column))
     }
 
     /// Reacts to repository changes and pending edits: markers follow the index and the
@@ -949,6 +988,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 .unwrap_or(0);
             if let Some(tab) = state.tabs.get_mut(state.active_tab) {
                 tab.content.perform(action);
+                tab.hover = None;
             }
             state.mark_edited_if_changed(before);
         }
@@ -1146,6 +1186,26 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::LspDismiss(id) => {
             state.lsp_prompt = None;
             if let Some(server) = lsp::registry::by_id(id) { state.lsp.dismiss(server); }
+        }
+        Message::EditorProbe(probe) => match probe {
+            code_editor::Probe::Leave => {
+                state.hover_request = None;
+                if let Some(tab) = state.tabs.get_mut(state.active_tab) { tab.hover = None; }
+            }
+            code_editor::Probe::Hover(line, index) => {
+                state.hover_request = Some((line, index));
+                if let Some((path, column)) = state.lsp_position(line, index) { state.lsp.hover(&path, line, column); }
+            }
+            code_editor::Probe::Definition(line, index) => {
+                if let Some((path, column)) = state.lsp_position(line, index) { state.lsp.definition(&path, line, column); }
+            }
+        },
+        Message::GoToDefinition => {
+            if let Some(cursor) = state.tabs.get(state.active_tab).map(|tab| tab.content.cursor) {
+                if let Some((path, column)) = state.lsp_position(cursor.line, cursor.index) {
+                    state.lsp.definition(&path, cursor.line, column);
+                }
+            }
         }
         Message::ReopenClosedTab => {
             if let Some(path) = state.closed_tabs.pop() { task = state.open_path(path); }
@@ -1447,6 +1507,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.creating = None;
                 state.renaming = None;
                 return Task::none();
+            }
+            if key == keyboard::Key::Named(keyboard::key::Named::F12) && state.focus == Focus::Editor {
+                return update(state, Message::GoToDefinition);
             }
             if modifiers.command() {
                 match key.as_ref() {
@@ -1778,7 +1841,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if state.notice.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(8)) { state.notice = None; }
             let cwd = state.root_or_cwd();
             state.lsp.set_root(&cwd);
-            state.poll_lsp();
+            task = Task::batch([task, state.poll_lsp()]);
             state.chat.set_project(&cwd);
             state.acp.ensure_loaded(&cwd);
             state.codex.ensure_loaded(&cwd);
@@ -2140,6 +2203,7 @@ fn command_list(state: &State) -> Vec<command_palette::Command> {
             message: Message::Search(code_editor::search::Message::Toggle),
         });
         commands.push(Command { label: "Go to Line (Cmd+G)".to_string(), message: Message::ToggleGotoLine });
+        commands.push(Command { label: "Go to Definition (F12)".to_string(), message: Message::GoToDefinition });
     }
 
     for (label, mode) in [("Install Theme...", theme_install::Mode::Install), ("Uninstall Theme...", theme_install::Mode::Uninstall)] {
@@ -2523,10 +2587,12 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             &tab.content,
             &tab.diff,
             &tab.diagnostics,
+            tab.hover.as_ref(),
             &state.app_theme.editor,
             state.zoom,
             Message::EditorAction,
             Message::ToggleFold,
+            Message::EditorProbe,
         );
         let can_undo = tab.content.can_undo();
         let can_redo = tab.content.can_redo();

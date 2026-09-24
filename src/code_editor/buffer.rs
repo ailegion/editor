@@ -154,6 +154,16 @@ impl Buffer {
         self.perform(cosmic_text::Action::Motion(cosmic_text::Motion::GotoLine(line)));
     }
 
+    /// Moves the cursor to (`line`, byte `index`), clamped to the text, dropping any selection.
+    /// Used by go-to-definition, which lands on a column rather than a whole line.
+    pub fn goto(&mut self, line: usize, index: usize) {
+        let line = line.min(self.line_count().saturating_sub(1));
+        let index = self.inner.lines.get(line).map_or(0, |l| index.min(l.text().len()));
+        self.cursor = Cursor::new(line, index);
+        self.selection = Selection::None;
+        self.sync();
+    }
+
     /// Pixel position of the top-left corner of the cursor, relative to the buffer origin.
     pub fn cursor_pixel(&self) -> Option<(i32, i32)> {
         self.cursor_pixel
