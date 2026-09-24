@@ -37,6 +37,7 @@ use crate::theme::EditorColors;
 pub struct CodeEditor<'a, Message> {
     content: &'a Buffer,
     diff: &'a HashMap<usize, LineStatus>,
+    diagnostics: &'a [crate::lsp::Diagnostic],
     style: Style,
     on_fold: Option<Box<dyn Fn(usize) -> Message + 'a>>,
     on_action: Option<Box<dyn Fn(cosmic_text::Action) -> Message + 'a>>,
@@ -46,12 +47,14 @@ impl<'a, Message> CodeEditor<'a, Message> {
     pub fn new(
         content: &'a Buffer,
         diff: &'a HashMap<usize, LineStatus>,
+        diagnostics: &'a [crate::lsp::Diagnostic],
         colors: &EditorColors,
         zoom: f32,
     ) -> Self {
         Self {
             content,
             diff,
+            diagnostics,
             style: Style::new(colors, zoom),
             on_action: None,
             on_fold: None,
@@ -183,7 +186,7 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
         cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
-        render::draw(self.content, self.diff, &mut frame, &self.style, state.scroll, state.scroll_x);
+        render::draw(self.content, self.diff, self.diagnostics, &mut frame, &self.style, state.scroll, state.scroll_x);
         // Scrollbars: semi-transparent overlays, brighter while hovered or dragged.
         let local = Rectangle::with_size(bounds.size());
         let position = cursor.position_in(bounds);
@@ -360,6 +363,7 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
 pub fn code_editor<'a, Message>(
     content: &'a Buffer,
     diff: &'a HashMap<usize, LineStatus>,
+    diagnostics: &'a [crate::lsp::Diagnostic],
     colors: &EditorColors,
     zoom: f32,
     on_action: impl Fn(cosmic_text::Action) -> Message + 'a,
@@ -368,7 +372,7 @@ pub fn code_editor<'a, Message>(
 where
     Message: 'a,
 {
-    let mut editor = CodeEditor::new(content, diff, colors, zoom).on_action(on_action);
+    let mut editor = CodeEditor::new(content, diff, diagnostics, colors, zoom).on_action(on_action);
     editor.on_fold = Some(Box::new(on_fold));
     Canvas::new(editor)
         .width(Length::Fill)

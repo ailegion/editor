@@ -7,6 +7,7 @@ mod ai_approval;
 mod ai_composer;
 mod ai_context;
 mod ai_selectable;
+mod lsp;
 mod acp;
 mod terminal;
 mod chat;
@@ -70,6 +71,8 @@ struct Tab {
     /// in-process from the buffer (see `Message::GitDiffLoaded`) when the tab opens, shortly
     /// after edits, and when the index changes.
     diff: std::collections::HashMap<usize, git_diff::LineStatus>,
+    /// Latest diagnostics from the file's language server, sorted by line.
+    diagnostics: Vec<lsp::Diagnostic>,
 }
 
 impl Tab {
@@ -287,6 +290,9 @@ enum Message {
     AiPaste,
     /// Clipboard text for the AI input, used when `AiPaste` found no image.
     AiPasteText(Option<String>),
+    /// Install the language server with this id, or dismiss its prompt for the session.
+    LspInstall(&'static str),
+    LspDismiss(&'static str),
     Codex(acp::Message),
     Chat(chat::Message),
     Acp(acp::Message),
@@ -344,6 +350,9 @@ struct State {
     git_preview: Option<git_preview::Preview>,
     /// When the active tab's diff markers should be recomputed after typing pauses.
     gutter_due: Option<std::time::Instant>,
+    lsp: lsp::Manager,
+    /// A language server the open file needs but which isn't installed; shown as a toast.
+    lsp_prompt: Option<&'static lsp::registry::Server>,
 
     app_theme: theme::EditorTheme,
     themes: theme::ThemeRegistry,
@@ -445,6 +454,8 @@ impl State {
             git: git::GitState::new(),
             git_preview: None,
             gutter_due: None,
+            lsp: lsp::Manager::default(),
+            lsp_prompt: None,
             app_theme,
             themes,
             highlighter: code_editor::Highlighter::new(),
@@ -487,9 +498,11 @@ impl State {
                 let mut content = code_editor::Buffer::new(&recovery.text, code_editor::metrics_for_zoom(state.zoom));
                 let extension = recovery.path.as_ref().and_then(|path| path.extension()).and_then(|ext| ext.to_str()).unwrap_or("txt");
                 content.highlight(&state.highlighter, extension, &state.app_theme.syntax);
+                if let Some(path) = &recovery.path { state.lsp.open(path, recovery.text.clone()); }
                 let tab = Tab {
                     path: recovery.path.clone(), content, dirty: true,
                     search: Default::default(), line_ending: LineEnding::detect(&recovery.text), diff: Default::default(),
+                    diagnostics: Vec::new(),
                 };
                 if let Some(index) = state.tabs.iter().position(|tab| tab.path == recovery.path) {
                     state.tabs[index] = tab;
@@ -619,6 +632,7 @@ impl State {
                     tab.content =
                         code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
                     tab.content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
+                    self.lsp.changed(&path);
                     tasks.push(load_diff_task(repo.clone(), self.root.as_deref(), path, text));
                 }
             }
@@ -650,6 +664,8 @@ impl State {
         let mut content = code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
         content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
         recent_files::record(&mut self.recent_files, path.clone());
+        self.lsp.set_root(&self.root_or_cwd());
+        self.lsp.open(&path, text.clone());
         let task = load_diff_task(self.git.repo(), self.root.as_deref(), path.clone(), text);
         self.tabs.push(Tab {
             path: Some(path),
@@ -658,6 +674,7 @@ impl State {
             dirty: false,
             line_ending,
             diff: std::collections::HashMap::new(),
+            diagnostics: Vec::new(),
         });
         self.active_tab = self.tabs.len() - 1;
         task
@@ -690,7 +707,10 @@ impl State {
     }
 
     fn remove_tab(&mut self, index: usize) {
-        if let Some(path) = self.tabs[index].path.clone() { self.closed_tabs.push(path); }
+        if let Some(path) = self.tabs[index].path.clone() {
+            self.lsp.closed(&path);
+            self.closed_tabs.push(path);
+        }
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             self.active_tab = 0;
@@ -709,10 +729,13 @@ impl State {
             None => rfd::FileDialog::new().save_file(),
         };
         if let Some(path) = path {
-            let result = std::fs::write(&path, tab.content.text());
+            let text = tab.content.text();
+            let result = std::fs::write(&path, &text);
             if result.is_ok() {
+                let was_untitled = tab.path.is_none();
                 tab.path = Some(path.clone());
                 tab.dirty = false;
+                if was_untitled { self.lsp.open(&path, text); } else { self.lsp.saved(&path, text); }
                 // Saving changes neither the buffer nor the index, so the markers stay valid.
                 self.notify(format!("Saved {}", path.file_name().unwrap_or_default().to_string_lossy()));
                 return Task::none();
@@ -747,7 +770,29 @@ impl State {
         tab.dirty = true;
         let extension = tab.extension();
         tab.content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
+        if let Some(path) = &tab.path { self.lsp.changed(path); }
         self.gutter_due = Some(std::time::Instant::now() + GUTTER_DEBOUNCE);
+    }
+
+    /// Sends debounced edits to language servers and applies what they sent back.
+    fn poll_lsp(&mut self) {
+        for path in self.lsp.take_due() {
+            if let Some(tab) = self.tabs.iter().find(|tab| tab.path.as_deref() == Some(path.as_path())) {
+                let text = tab.content.text();
+                self.lsp.change(&path, text);
+            }
+        }
+        for event in self.lsp.poll() {
+            match event {
+                lsp::Event::Diagnostics(path, diagnostics) => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.path.as_deref() == Some(path.as_path())) {
+                        tab.diagnostics = diagnostics;
+                    }
+                }
+                lsp::Event::Notice(text) => self.notify(text),
+                lsp::Event::Prompt(server) => self.lsp_prompt = Some(server),
+            }
+        }
     }
 
     /// Reacts to repository changes and pending edits: markers follow the index and the
@@ -1091,7 +1136,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 return Task::none();
             }
             state.terminal.shutdown();
+            state.lsp.shutdown_all();
             return iced::exit();
+        }
+        Message::LspInstall(id) => {
+            state.lsp_prompt = None;
+            if let Some(server) = lsp::registry::by_id(id) { state.lsp.install(server); }
+        }
+        Message::LspDismiss(id) => {
+            state.lsp_prompt = None;
+            if let Some(server) = lsp::registry::by_id(id) { state.lsp.dismiss(server); }
         }
         Message::ReopenClosedTab => {
             if let Some(path) = state.closed_tabs.pop() { task = state.open_path(path); }
@@ -1723,6 +1777,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.terminal.poll();
             if state.notice.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(8)) { state.notice = None; }
             let cwd = state.root_or_cwd();
+            state.lsp.set_root(&cwd);
+            state.poll_lsp();
             state.chat.set_project(&cwd);
             state.acp.ensure_loaded(&cwd);
             state.codex.ensure_loaded(&cwd);
@@ -1852,6 +1908,26 @@ fn view(state: &State) -> Element<'_, Message> {
             });
         base = iced::widget::stack![base, container(toast).padding(16)
             .align_right(Length::Fill).align_bottom(Length::Fill)].into();
+    }
+    if let Some(server) = state.lsp_prompt {
+        let prompt = container(column![
+            text(format!("{} provides diagnostics for this file type but isn't installed.", server.name)).size(13),
+            row![
+                button(text("Install").size(12)).padding([6, 12]).on_press(Message::LspInstall(server.id)),
+                button(text("Not now").size(12)).padding([6, 12]).style(flat_button_style).on_press(Message::LspDismiss(server.id)),
+                text(format!("From github.com/{}", server.repo)).size(11).style(iced::widget::text::secondary),
+            ].spacing(8).align_y(iced::Alignment::Center),
+        ].spacing(10)).padding(12).max_width(440).style(|theme: &iced::Theme| {
+            let palette = theme.extended_palette();
+            iced::widget::container::Style {
+                background: Some(palette.background.weak.color.into()),
+                border: iced::Border { color: palette.primary.weak.color, width: 1.0, radius: 6.0.into() },
+                shadow: iced::Shadow { color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.25), offset: iced::Vector::new(0.0, 3.0), blur_radius: 12.0 },
+                ..Default::default()
+            }
+        });
+        base = iced::widget::stack![base, container(prompt).padding(16)
+            .align_left(Length::Fill).align_bottom(Length::Fill)].into();
     }
 
     if state.theme_install.visible {
@@ -2226,6 +2302,23 @@ fn view_status_bar(state: &State) -> Element<'_, Message> {
         bar = bar.push(text(format!("Ln {line}, Col {col}")).size(12));
         bar = bar.push(text(tab.line_ending.to_string()).size(12).style(iced::widget::text::secondary));
         bar = bar.push(text(language.to_string()).size(12).style(iced::widget::text::secondary));
+        // The most severe diagnostic under the cursor, plus the file's error/warning totals.
+        let errors = tab.diagnostics.iter().filter(|d| d.severity == lsp::Severity::Error).count();
+        let warnings = tab.diagnostics.iter().filter(|d| d.severity == lsp::Severity::Warning).count();
+        if errors + warnings > 0 {
+            bar = bar.push(text(format!("✕ {errors}  ⚠ {warnings}")).size(12).style(move |theme: &iced::Theme| {
+                let palette = theme.extended_palette();
+                iced::widget::text::Style { color: Some(if errors > 0 { palette.danger.base.color } else { palette.background.base.text }) }
+            }));
+        }
+        if let Some(diagnostic) = tab.diagnostics.iter().find(|d| d.line + 1 == line) {
+            let message: String = diagnostic.message.lines().next().unwrap_or_default().chars().take(120).collect();
+            let is_error = diagnostic.severity == lsp::Severity::Error;
+            bar = bar.push(text(message).size(12).style(move |theme: &iced::Theme| {
+                let palette = theme.extended_palette();
+                iced::widget::text::Style { color: Some(if is_error { palette.danger.base.color } else { palette.background.base.text }) }
+            }));
+        }
     }
 
     let bar = bar.push(icon_control(lucide_icons::Icon::Terminal, "Toggle terminal (Ctrl+`)", Some(Message::TerminalToggle), state.terminal_visible))
@@ -2429,6 +2522,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         let editor = code_editor::code_editor(
             &tab.content,
             &tab.diff,
+            &tab.diagnostics,
             &state.app_theme.editor,
             state.zoom,
             Message::EditorAction,

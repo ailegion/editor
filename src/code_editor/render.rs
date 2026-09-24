@@ -19,6 +19,7 @@ use crate::git_diff::LineStatus;
 pub fn draw(
     buffer: &Buffer,
     diff: &HashMap<usize, LineStatus>,
+    diagnostics: &[crate::lsp::Diagnostic],
     frame: &mut Frame,
     style: &Style,
     scroll: f32,
@@ -108,6 +109,37 @@ pub fn draw(
         }
     }
 
+    // Wavy underline beneath each diagnostic's range. Columns arrive as UTF-16 units and are
+    // mapped onto the shaped glyphs, so they land correctly on non-ASCII lines too.
+    for diagnostic in diagnostics {
+        let Some(row) = buffer.visual_row(diagnostic.line) else { continue; };
+        let y = row as f32 * line_height - scroll;
+        if !is_visible(y) { continue; }
+        let Some(line) = buffer.inner.lines.get(diagnostic.line) else { continue; };
+        let Some(layout) = line.layout_opt().and_then(|lines| lines.first()) else { continue; };
+        let text = line.text();
+        let start = crate::lsp::utf16_to_byte(text, diagnostic.start);
+        let end = if diagnostic.end_line > diagnostic.line { text.len() } else { crate::lsp::utf16_to_byte(text, diagnostic.end) };
+        let x0 = x_at(layout, start);
+        let x1 = x_at(layout, end).max(x0 + style.font_size * 0.6);
+        if x1 < scroll_x { continue; }
+        let color = diagnostic_color(diagnostic.severity, style);
+        let baseline = y + line_height - 2.5;
+        let step = 3.0;
+        let mut x = (text_x + x0).max(gutter_width);
+        let right = text_x + x1;
+        let wave = Path::new(|path| {
+            path.move_to(Point::new(x, baseline));
+            let mut up = true;
+            while x < right {
+                x = (x + step).min(right);
+                path.line_to(Point::new(x, if up { baseline - 2.0 } else { baseline }));
+                up = !up;
+            }
+        });
+        frame.stroke(&wave, Stroke::default().with_color(color).with_width(1.0));
+    }
+
     for &(line_i, x0, x1) in buffer.matched_brackets() {
         let Some(row) = buffer.visual_row(line_i) else { continue; };
         let y = row as f32 * line_height - scroll;
@@ -164,6 +196,19 @@ pub fn draw(
         }
     }
 
+    // Gutter dot per diagnostic line, beside the diff bar; the most severe one wins.
+    let mut marked = std::collections::HashSet::new();
+    for diagnostic in diagnostics {
+        if !marked.insert(diagnostic.line) { continue; }
+        let Some(row) = buffer.visual_row(diagnostic.line) else { continue; };
+        let y = row as f32 * line_height - scroll;
+        if !is_visible(y) { continue; }
+        frame.fill_rectangle(
+            Point::new(5.0, y + line_height / 2.0 - 2.0), Size::new(4.0, 4.0),
+            diagnostic_color(diagnostic.severity, style),
+        );
+    }
+
     for i in 0..buffer.line_count() {
         let Some(row) = buffer.visual_row(i) else { continue; };
         let y = row as f32 * line_height - scroll;
@@ -192,6 +237,26 @@ pub fn draw_thumb(frame: &mut Frame, thumb: iced::Rectangle, style: &Style, acti
         ((super::BAR - inset * 2.0) / 2.0).into(),
     );
     frame.fill(&path, iced::Color { a: if active { 0.5 } else { 0.25 }, ..style.text_color });
+}
+
+/// Pixel x of byte offset `byte` on a laid-out line (its end when past the last glyph).
+fn x_at(layout: &LayoutLine, byte: usize) -> f32 {
+    for glyph in &layout.glyphs {
+        if byte < glyph.end {
+            return if byte <= glyph.start { glyph.x } else { glyph.x + glyph.w };
+        }
+    }
+    layout.w
+}
+
+fn diagnostic_color(severity: crate::lsp::Severity, style: &Style) -> Color {
+    use crate::lsp::Severity;
+    match severity {
+        Severity::Error => Color::from_rgb(0.93, 0.33, 0.31),
+        Severity::Warning => Color::from_rgb(0.88, 0.68, 0.20),
+        Severity::Information => Color::from_rgb(0.36, 0.60, 0.90),
+        Severity::Hint => Color { a: 0.5, ..style.text_color },
+    }
 }
 
 fn draw_line_number(frame: &mut Frame, number: usize, y: f32, gutter_width: f32, style: &Style) {

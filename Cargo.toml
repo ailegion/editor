@@ -11,6 +11,8 @@ base64 = "0.22"
 # already in the tree via iced's "image" feature; here it PNG-encodes the clipboard's RGBA.
 arboard = "3.6"
 image = { version = "0.25.9", default-features = false, features = ["png"] }
+# `file://` URIs for language servers. Already in the tree.
+percent-encoding = "2"
 agent-client-protocol = "2.0.0"
 cosmic-text = "0.15.0"
 fuzzy-matcher = "0.3.7"

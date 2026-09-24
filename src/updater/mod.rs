@@ -200,7 +200,7 @@ impl Updater {
     }
 }
 
-fn hide_console(command: &mut Command) {
+pub(crate) fn hide_console(command: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -210,7 +210,7 @@ fn hide_console(command: &mut Command) {
     let _ = command;
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(300)))
         .build()
@@ -347,7 +347,7 @@ fn verify_archive(path: &Path, manifest: &protocol::Manifest) -> Result<(), Stri
     Ok(())
 }
 
-fn safe_relative(path: &Path) -> Result<(), String> {
+pub(crate) fn safe_relative(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty()
         || path
             .components()
@@ -424,7 +424,7 @@ fn extract(archive: &Path, destination: &Path, platform: &str) -> Result<(), Str
     Ok(())
 }
 
-fn executable(path: &Path) -> Result<(), String> {
+pub(crate) fn executable(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
