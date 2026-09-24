@@ -85,7 +85,7 @@ pub fn draw(
             }
         }
         match line.layout_opt().and_then(|lines| lines.first()) {
-            Some(layout_line) => draw_glyph_runs(frame, layout_line, text, y, text_x, style),
+            Some(layout_line) => draw_glyph_runs(frame, layout_line, text, y, text_x, gutter_width, style),
             None => fill_run(
                 frame,
                 text,
@@ -239,44 +239,8 @@ pub fn draw_thumb(frame: &mut Frame, thumb: iced::Rectangle, style: &Style, acti
     frame.fill(&path, iced::Color { a: if active { 0.5 } else { 0.25 }, ..style.text_color });
 }
 
-/// Draws hover text in a box just below its anchor (or above it near the bottom edge),
-/// kept inside the frame. Call it on its own frame; see `CodeEditor::draw` for why.
-pub fn draw_hover(frame: &mut Frame, buffer: &Buffer, hover: &super::Hover, style: &Style, scroll: f32, scroll_x: f32) {
-    let Some(row) = buffer.visual_row(hover.line) else { return };
-    let gutter_width = style.gutter_width(buffer.line_count());
-    let line_height = style.line_height;
-    let anchor_x = buffer.inner.lines.get(hover.line)
-        .and_then(|line| line.layout_opt().and_then(|lines| lines.first()).map(|layout| x_at(layout, hover.index)))
-        .unwrap_or(0.0);
-    let line_y = row as f32 * line_height - scroll;
-    let font = style.font_size * 0.9;
-    let row_height = font * 1.45;
-    let pad = 8.0;
-    let columns = hover.lines.iter().map(|line| line.chars().count()).max().unwrap_or(0).max(1) as f32;
-    let width = (columns * font * 0.62 + pad * 2.0).min(frame.size().width - 8.0).max(40.0);
-    let height = hover.lines.len() as f32 * row_height + pad * 2.0;
-    let x = (gutter_width - scroll_x + anchor_x).max(gutter_width).min(frame.size().width - width - 4.0).max(0.0);
-    let mut y = line_y + line_height + 2.0;
-    if y + height > frame.size().height { y = (line_y - height - 2.0).max(0.0); }
-    frame.fill_rectangle(Point::new(x, y), Size::new(width, height), style.gutter_background);
-    frame.stroke_rectangle(
-        Point::new(x, y), Size::new(width, height),
-        Stroke::default().with_color(Color { a: 0.35, ..style.text_color }).with_width(1.0),
-    );
-    for (i, line) in hover.lines.iter().enumerate() {
-        frame.fill_text(Text {
-            content: line.clone(),
-            position: Point::new(x + pad, y + pad + i as f32 * row_height),
-            color: style.text_color,
-            size: iced::Pixels(font),
-            font: iced::Font::MONOSPACE,
-            ..Text::default()
-        });
-    }
-}
-
 /// Pixel x of byte offset `byte` on a laid-out line (its end when past the last glyph).
-fn x_at(layout: &LayoutLine, byte: usize) -> f32 {
+pub(super) fn x_at(layout: &LayoutLine, byte: usize) -> f32 {
     for glyph in &layout.glyphs {
         if byte < glyph.end {
             return if byte <= glyph.start { glyph.x } else { glyph.x + glyph.w };
@@ -323,10 +287,16 @@ fn draw_glyph_runs(
     text: &str,
     y: f32,
     x_offset: f32,
+    clip_left: f32,
     style: &Style,
 ) {
     for glyph in &layout_line.glyphs {
         if glyph.end <= glyph.start {
+            continue;
+        }
+        // Canvas text paints above every canvas shape, gutter included, so glyphs scrolled
+        // under the gutter must be skipped rather than covered.
+        if x_offset + glyph.x < clip_left {
             continue;
         }
         let piece = &text[glyph.start..glyph.end];

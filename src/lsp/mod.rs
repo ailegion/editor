@@ -342,12 +342,17 @@ impl Manager {
                     Incoming::Response { id: request_id, result, error } => {
                         let Some(inflight) = self.pending.remove(&(id, request_id)) else { continue };
                         if let Some(error) = error {
-                            if error.get("code").and_then(Value::as_i64) == Some(CONTENT_MODIFIED) && inflight.attempts < MAX_ATTEMPTS {
+                            let content_modified = error.get("code").and_then(Value::as_i64) == Some(CONTENT_MODIFIED);
+                            if content_modified && inflight.attempts < MAX_ATTEMPTS {
                                 self.retries.push((id, inflight, Instant::now() + RETRY_DELAY));
                                 continue;
                             }
-                            let message = error.get("message").and_then(Value::as_str).unwrap_or("request failed");
-                            self.events.push(Event::Notice(format!("{}: {message}", server.name)));
+                            // Only a failed jump is worth telling the user about; a hover that
+                            // never came just doesn't appear, and ContentModified is routine.
+                            if matches!(inflight.kind, Pending::Definition) && !content_modified {
+                                let message = error.get("message").and_then(Value::as_str).unwrap_or("request failed");
+                                self.events.push(Event::Notice(format!("{}: {message}", server.name)));
+                            }
                             continue;
                         }
                         match inflight.kind {

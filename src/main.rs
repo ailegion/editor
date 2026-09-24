@@ -359,9 +359,9 @@ struct State {
     lsp: lsp::Manager,
     /// A language server the open file needs but which isn't installed; shown as a toast.
     lsp_prompt: Option<&'static lsp::registry::Server>,
-    /// The (line, byte index) the mouse is resting on, awaiting hover text. A late answer for
-    /// any other position is ignored.
-    hover_request: Option<(usize, usize)>,
+    /// The (line, byte index) the mouse is resting on, awaiting hover text, and the canvas
+    /// pixel to anchor the popup at. A late answer for any other position is ignored.
+    hover_request: Option<(usize, usize, iced::Point)>,
 
     app_theme: theme::EditorTheme,
     themes: theme::ThemeRegistry,
@@ -808,8 +808,8 @@ impl State {
                     if lines.is_empty() { continue; }
                     if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.path.as_deref() == Some(path.as_path())) {
                         let index = tab.content.inner.lines.get(line).map_or(0, |l| lsp::utf16_to_byte(l.text(), column));
-                        if self.hover_request == Some((line, index)) {
-                            tab.hover = Some(code_editor::Hover { line, index, lines });
+                        if let Some((_, _, anchor)) = self.hover_request.filter(|(l, i, _)| (*l, *i) == (line, index)) {
+                            tab.hover = Some(code_editor::Hover { line, index, anchor, lines });
                         }
                     }
                 }
@@ -1192,8 +1192,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.hover_request = None;
                 if let Some(tab) = state.tabs.get_mut(state.active_tab) { tab.hover = None; }
             }
-            code_editor::Probe::Hover(line, index) => {
-                state.hover_request = Some((line, index));
+            code_editor::Probe::Hover { line, index, anchor } => {
+                state.hover_request = Some((line, index, anchor));
                 if let Some((path, column)) = state.lsp_position(line, index) { state.lsp.hover(&path, line, column); }
             }
             code_editor::Probe::Definition(line, index) => {
@@ -2587,13 +2587,35 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             &tab.content,
             &tab.diff,
             &tab.diagnostics,
-            tab.hover.as_ref(),
             &state.app_theme.editor,
             state.zoom,
             Message::EditorAction,
             Message::ToggleFold,
             Message::EditorProbe,
         );
+        // Hover text as a real widget over the canvas; see `code_editor::Hover` for why.
+        // The stack is always present: wrapping the canvas only while a popup shows would
+        // change the widget tree's shape and reset the canvas state, scroll included.
+        let mut layers = iced::widget::stack![editor];
+        if let Some(hover) = &tab.hover {
+                let mut lines = column![].spacing(2);
+                for line in &hover.lines {
+                    lines = lines.push(text(line.clone()).size(12).font(iced::Font::MONOSPACE)
+                        .wrapping(iced::widget::text::Wrapping::None));
+                }
+                let popup = container(lines).padding([6, 10]).max_width(640).style(|theme: &iced::Theme| {
+                    let palette = theme.extended_palette();
+                    iced::widget::container::Style {
+                        background: Some(palette.background.weak.color.into()),
+                        border: iced::Border { color: palette.background.strong.color, width: 1.0, radius: 6.0.into() },
+                        shadow: iced::Shadow { color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.3), offset: iced::Vector::new(0.0, 2.0), blur_radius: 8.0 },
+                        ..Default::default()
+                    }
+                });
+                let offset = iced::Padding { top: hover.anchor.y.max(0.0) + 2.0, left: hover.anchor.x.max(0.0), right: 0.0, bottom: 0.0 };
+                layers = layers.push(container(popup).padding(offset));
+        }
+        let editor: Element<'_, Message> = layers.into();
         let can_undo = tab.content.can_undo();
         let can_redo = tab.content.can_redo();
         let has_selection = tab.content.has_selection();

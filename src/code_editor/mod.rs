@@ -38,7 +38,6 @@ pub struct CodeEditor<'a, Message> {
     content: &'a Buffer,
     diff: &'a HashMap<usize, LineStatus>,
     diagnostics: &'a [crate::lsp::Diagnostic],
-    hover: Option<&'a Hover>,
     style: Style,
     on_fold: Option<Box<dyn Fn(usize) -> Message + 'a>>,
     on_action: Option<Box<dyn Fn(cosmic_text::Action) -> Message + 'a>>,
@@ -47,21 +46,25 @@ pub struct CodeEditor<'a, Message> {
 
 /// Mouse gestures that ask the language server something about a buffer position
 /// (`line`, byte `index`), published through `code_editor`'s `on_probe`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Probe {
-    /// The mouse rested on this position long enough to want hover information.
-    Hover(usize, usize),
-    /// The mouse moved off the hovered position; hide any hover popup.
+    /// The mouse rested on this position long enough to want hover information. `anchor` is
+    /// the canvas pixel just below the word, where a popup should go.
+    Hover { line: usize, index: usize, anchor: iced::Point },
+    /// The mouse moved off the hovered position (or scrolled); hide any hover popup.
     Leave,
     /// Ctrl/Cmd+click: go to the definition of what's here.
     Definition(usize, usize),
 }
 
-/// Hover text to show beneath (`line`, byte `index`), already wrapped into short lines.
+/// Hover text for (`line`, byte `index`), shown by the app as a widget stacked over the
+/// editor at `anchor`. It can't be drawn inside the canvas: canvas text always paints above
+/// every canvas shape, so a box drawn there would have the code showing through it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hover {
     pub line: usize,
     pub index: usize,
+    pub anchor: iced::Point,
     pub lines: Vec<String>,
 }
 
@@ -80,7 +83,6 @@ impl<'a, Message> CodeEditor<'a, Message> {
             content,
             diff,
             diagnostics,
-            hover: None,
             style: Style::new(colors, zoom),
             on_action: None,
             on_fold: None,
@@ -103,6 +105,16 @@ impl<'a, Message> CodeEditor<'a, Message> {
         let hit = self.content.inner.hit(x, line as f32 * self.style.line_height + y.rem_euclid(self.style.line_height))?;
         let length = self.content.inner.lines.get(hit.line)?.text().len();
         (hit.line == line && hit.index < length).then_some((hit.line, hit.index))
+    }
+
+    /// Canvas pixel just below (`line`, byte `index`), for anchoring a popup.
+    fn anchor_of(&self, state: &State, line: usize, index: usize) -> iced::Point {
+        let gutter_width = self.style.gutter_width(self.content.line_count());
+        let x = self.content.inner.lines.get(line)
+            .and_then(|l| l.layout_opt().and_then(|lines| lines.first()).map(|layout| render::x_at(layout, index)))
+            .unwrap_or(0.0);
+        let row = self.content.visual_row(line).unwrap_or(0) as f32;
+        iced::Point::new(gutter_width - state.scroll_x + x, (row + 1.0) * self.style.line_height - state.scroll)
     }
 
     pub fn on_action(mut self, f: impl Fn(cosmic_text::Action) -> Message + 'a) -> Self {
@@ -249,15 +261,7 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
             let active = over_track || state.thumb_drag.is_some_and(|(a, _)| a == axis);
             render::draw_thumb(&mut frame, thumb, &self.style, active);
         }
-        let mut layers = vec![frame.into_geometry()];
-        // Canvas text always paints above its own layer's shapes, so the popup gets a layer
-        // of its own; otherwise the code underneath would show through its background.
-        if let Some(hover) = self.hover {
-            let mut overlay = canvas::Frame::new(renderer, bounds.size());
-            render::draw_hover(&mut overlay, self.content, hover, &self.style, state.scroll, state.scroll_x);
-            layers.push(overlay.into_geometry());
-        }
-        layers
+        vec![frame.into_geometry()]
     }
 
     fn update(
@@ -280,7 +284,8 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
             if !state.hover_sent && state.hover_since.is_some_and(|since| since.elapsed() >= HOVER_DELAY) {
                 if let (Some((line, index)), Some(on_probe)) = (state.hover_cell, self.on_probe.as_ref()) {
                     state.hover_sent = true;
-                    return Some(canvas::Action::publish(on_probe(Probe::Hover(line, index))));
+                    let anchor = self.anchor_of(state, line, index);
+                    return Some(canvas::Action::publish(on_probe(Probe::Hover { line, index, anchor })));
                 }
             }
             return self.scroll_correction(state, bounds.size()).then(canvas::Action::request_redraw);
@@ -408,6 +413,14 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
                     .max(0.0);
                 state.scroll = (state.scroll - dy).clamp(0.0, max_scroll);
                 state.scroll_x = (state.scroll_x - dx).clamp(0.0, self.max_scroll_x(bounds));
+                // The text moved under a stationary mouse: whatever was hovered is gone.
+                if std::mem::take(&mut state.hover_sent) {
+                    state.hover_cell = None;
+                    state.hover_since = None;
+                    if let Some(on_probe) = self.on_probe.as_ref() {
+                        return Some(canvas::Action::publish(on_probe(Probe::Leave)).and_capture());
+                    }
+                }
                 Some(canvas::Action::request_redraw().and_capture())
             }
             _ => None,
@@ -448,7 +461,6 @@ pub fn code_editor<'a, Message>(
     content: &'a Buffer,
     diff: &'a HashMap<usize, LineStatus>,
     diagnostics: &'a [crate::lsp::Diagnostic],
-    hover: Option<&'a Hover>,
     colors: &EditorColors,
     zoom: f32,
     on_action: impl Fn(cosmic_text::Action) -> Message + 'a,
@@ -459,7 +471,6 @@ where
     Message: 'a,
 {
     let mut editor = CodeEditor::new(content, diff, diagnostics, colors, zoom).on_action(on_action);
-    editor.hover = hover;
     editor.on_fold = Some(Box::new(on_fold));
     editor.on_probe = Some(Box::new(on_probe));
     Canvas::new(editor)
