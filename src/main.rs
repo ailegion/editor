@@ -84,9 +84,28 @@ struct Tab {
     blame: Vec<String>,
     /// Hover popup currently shown in the editor, if any.
     hover: Option<code_editor::Hover>,
+    /// Rendered Markdown shown instead of the editor, while the preview is on.
+    preview: Option<ai_markdown::Cache>,
 }
 
 impl Tab {
+    fn is_markdown(&self) -> bool {
+        self.path.as_ref().and_then(|p| p.extension()).and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+    }
+
+    /// Re-parses the preview if the buffer changed since it was last rendered.
+    fn sync_preview(&mut self) {
+        if let Some(preview) = &mut self.preview {
+            let text = self.content.text();
+            preview.sync(std::iter::once(text.as_str()));
+        }
+    }
+
+    fn preview_content(&self) -> Option<&iced::widget::markdown::Content> {
+        self.preview.as_ref().and_then(|preview| preview.get(0))
+    }
+
     fn refresh_dirty(&mut self) {
         self.dirty = self.saved_text.as_deref() != Some(self.content.text().as_str());
     }
@@ -275,6 +294,9 @@ enum Message {
     ReopenClosedTab,
     RevealPath(PathBuf),
     RevealStep(u64, DirectoryTreeEvent),
+    /// Switch the active Markdown tab between source and rendered preview.
+    MarkdownPreviewToggle,
+    MarkdownPreview(ai_markdown::Action),
     DismissNotice,
     Exit,
 
@@ -561,7 +583,7 @@ impl State {
                     saved_text: recovery.path.as_ref().and_then(|path| std::fs::read_to_string(path).ok())
                         .map(|text| text.replace("\r\n", "\n").replace('\r', "\n")),
                     search: Default::default(), line_ending: LineEnding::detect(&recovery.text), diff: Default::default(),
-                    diagnostics: Vec::new(), blame: Vec::new(), hover: None,
+                    diagnostics: Vec::new(), blame: Vec::new(), hover: None, preview: None,
                 };
                 tab.refresh_dirty();
                 if let Some(index) = state.tabs.iter().position(|tab| tab.path == recovery.path) {
@@ -739,6 +761,7 @@ impl State {
             diff: std::collections::HashMap::new(),
             diagnostics: Vec::new(), blame: Vec::new(),
             hover: None,
+            preview: None,
         });
         self.active_tab = self.tabs.len() - 1;
         task
@@ -1192,6 +1215,16 @@ impl State {
     }
 }
 
+/// `update`, then brings the visible Markdown preview up to date with whatever the message
+/// changed (a reload from disk, an AI edit, switching tabs).
+fn update_and_sync_preview(state: &mut State, message: Message) -> Task<Message> {
+    let task = update(state, message);
+    if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+        tab.sync_preview();
+    }
+    task
+}
+
 fn update(state: &mut State, message: Message) -> Task<Message> {
     if matches!(&message, Message::TabClosed(_) | Message::CloseTabs(_, _) | Message::CloseTabConfirmed(_) | Message::CloseTabsConfirmed(_, _) | Message::TabSelected(_) | Message::FileAction(_) | Message::ReopenClosedTab)
         || matches!(&message, Message::KeyPressed(_, modifiers) if modifiers.command()) {
@@ -1203,7 +1236,22 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         | Message::FileAction(FileAction::Save)) {
         return Task::none();
     }
+    // The previewed buffer is hidden; edits to it would go unseen.
+    if state.tabs.get(state.active_tab).is_some_and(|tab| tab.preview.is_some()) && matches!(&message,
+        Message::EditorAction(_) | Message::EditAction(_) | Message::EditorPasted(_) | Message::Search(_)
+        | Message::InlineEditStart) {
+        return Task::none();
+    }
     match message {
+        Message::MarkdownPreviewToggle => {
+            if let Some(tab) = state.tabs.get_mut(state.active_tab).filter(|tab| tab.is_markdown()) {
+                tab.preview = if tab.preview.is_some() { None } else { Some(Default::default()) };
+                tab.hover = None;
+            }
+        }
+        Message::MarkdownPreview(ai_markdown::Action::Copy(text)) => task = iced::clipboard::write(text),
+        Message::MarkdownPreview(ai_markdown::Action::Link(url)) => ai_markdown::open_link(&url),
+        Message::MarkdownPreview(ai_markdown::Action::Insert(_)) => {}
         Message::CheckUpdate => state.updater.check(),
         Message::About(msg) => task = about::update(&mut state.about, msg).map(Message::About),
         Message::RestartUpdate => {
@@ -2995,9 +3043,21 @@ fn view_editor(state: &State) -> Element<'_, Message> {
                 crumbs = crumbs.push(button(text(part.as_os_str().to_string_lossy().to_string()).size(12))
                     .style(flat_button_style).on_press(Message::RevealPath(current.clone())));
             }
-            crumbs = crumbs.push(Space::new().width(Length::Fill)).push(icon_control(lucide_icons::Icon::Folder, "Reveal in files", Some(Message::RevealPath(path.clone())), false));
+            crumbs = crumbs.push(Space::new().width(Length::Fill));
+            if tab.is_markdown() {
+                let previewing = tab.preview.is_some();
+                crumbs = crumbs.push(icon_control(lucide_icons::Icon::Eye, if previewing { "Show source" } else { "Open preview" },
+                    Some(Message::MarkdownPreviewToggle), previewing));
+            }
+            crumbs = crumbs.push(icon_control(lucide_icons::Icon::Folder, "Reveal in files", Some(Message::RevealPath(path.clone())), false));
             editor_column = editor_column.push(scrollable(crumbs.padding([0, 8]))
                 .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())));
+        }
+        if let Some(content) = tab.preview_content() {
+            let document = ai_markdown::view_document(content, &state.app_theme.iced, Message::MarkdownPreview);
+            editor_column = editor_column.push(scrollable(container(container(document).max_width(860))
+                .center_x(Length::Fill).padding([16, 24])).height(Length::Fill));
+            return editor_frame(tab_row, editor_column);
         }
         if tab.search.visible {
             editor_column = editor_column.push(code_editor::search::view(&tab.search).map(Message::Search));
@@ -3101,6 +3161,10 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             .center_x(Length::Fill).center_y(Length::Fill));
     }
 
+    editor_frame(tab_row, editor_column)
+}
+
+fn editor_frame<'a>(tab_row: iced::widget::Row<'a, Message>, editor_column: iced::widget::Column<'a, Message>) -> Element<'a, Message> {
     let tab_strip = scrollable(tab_row)
         .direction(scrollable::Direction::Horizontal(
             scrollable::Scrollbar::default(),
@@ -3566,7 +3630,7 @@ pub fn main() -> iced::Result {
     if updater::run_helper() { return Ok(()); }
     let _update_guard = updater::running_guard();
     let icon = iced::window::icon::from_file_data(include_bytes!("../icon.png"), None).ok();
-    iced::application(State::boot, update, view)
+    iced::application(State::boot, update_and_sync_preview, view)
         .title("editor")
         .theme(|state: &State| state.app_theme.iced.clone())
         .subscription(subscription)
@@ -3688,6 +3752,39 @@ mod saved_state_tests {
     use super::*;
 
     #[test]
+    fn markdown_preview_follows_the_buffer() {
+        use iced::widget::markdown::Item;
+        let tab_for = |path: Option<&str>, text: &str| Tab {
+            path: path.map(PathBuf::from),
+            content: code_editor::Buffer::new(text, code_editor::metrics_for_zoom(1.0)),
+            saved_text: Some(text.into()),
+            dirty: false,
+            search: Default::default(),
+            line_ending: LineEnding::Lf,
+            diff: Default::default(),
+            diagnostics: Vec::new(), blame: Vec::new(), hover: None, preview: None,
+        };
+        assert!(tab_for(Some("docs/README.md"), "").is_markdown());
+        assert!(tab_for(Some("NOTES.Markdown"), "").is_markdown());
+        assert!(!tab_for(Some("main.rs"), "").is_markdown());
+        assert!(!tab_for(Some("md"), "").is_markdown());
+        assert!(!tab_for(None, "").is_markdown());
+
+        let mut tab = tab_for(Some("README.md"), "# Title");
+        tab.sync_preview();
+        assert!(tab.preview_content().is_none());
+        tab.preview = Some(Default::default());
+        tab.sync_preview();
+        assert!(matches!(tab.preview_content().unwrap().items(), [Item::Heading(..)]));
+        tab.content.goto(0, 0);
+        tab.content.perform(cosmic_text::Action::Delete);
+        tab.content.perform(cosmic_text::Action::Delete);
+        tab.sync_preview();
+        assert_eq!(tab.content.text(), "Title");
+        assert!(matches!(tab.preview_content().unwrap().items(), [Item::Paragraph(..)]));
+    }
+
+    #[test]
     fn undo_and_redo_compare_text_with_the_latest_save() {
         let mut tab = Tab {
             path: None,
@@ -3697,7 +3794,7 @@ mod saved_state_tests {
             search: Default::default(),
             line_ending: LineEnding::Lf,
             diff: Default::default(),
-            diagnostics: Vec::new(), blame: Vec::new(), hover: None,
+            diagnostics: Vec::new(), blame: Vec::new(), hover: None, preview: None,
         };
         tab.content.goto(0, 2);
         tab.content.perform(cosmic_text::Action::Backspace);
