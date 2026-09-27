@@ -36,8 +36,8 @@ use iced::widget::{
 };
 use iced::{Element, Length, Subscription, Task};
 use iced_aw::context_menu::ContextMenu;
-use iced_aw::menu::{Item, Menu};
-use iced_aw::{menu_bar, menu_items};
+use iced_aw::menu::{Item, Menu, MenuBar};
+use iced_aw::menu_items;
 use iced_swdir_tree::{DirectoryFilter, DirectoryTree, DirectoryTreeEvent};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -275,6 +275,8 @@ enum Message {
     GotoLine(goto_line::Message),
     ToggleGotoLine,
     About(about::Message),
+    /// Open a new GitHub issue in the browser.
+    FileBugReport,
     Git(git::Message),
     DiscardGitConfirmed(PathBuf, Vec<git::ChangedFile>),
     DiscardGitFinished(Vec<(PathBuf, String)>, git::Message),
@@ -1254,6 +1256,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::MarkdownPreview(ai_markdown::Action::Insert(_)) => {}
         Message::CheckUpdate => state.updater.check(),
         Message::About(msg) => task = about::update(&mut state.about, msg).map(Message::About),
+        Message::FileBugReport => open_url("https://github.com/ailegion/editor/issues/new"),
         Message::RestartUpdate => {
             state.last_session_write = std::time::Instant::now() - Duration::from_secs(1);
             state.persist_session();
@@ -2782,12 +2785,20 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
             .map(|name| Item::new(menu_button(name.to_string(), Message::AppThemeSelected(name.to_string())))),
     );
 
-    let mb = menu_bar!(
+    let mut menus = menu_items!(
         (file_menu_button, menu_tpl(file_items)),
         (edit_menu_button, menu_tpl(edit_items)),
         (view_menu_button, menu_tpl(view_items)),
         (theme_menu_button, menu_tpl(theme_items))
-    )
+    );
+    let help_menu_button = menu_button("Help".to_string(), Message::Noop).width(Length::Shrink);
+    let mut help_items = menu_items!((menu_button("File Bug Report".into(), Message::FileBugReport)));
+    // macOS already has About in the native app menu.
+    if !cfg!(target_os = "macos") {
+        help_items.push(Item::new(menu_button("About".into(), Message::About(about::Message::Open))));
+    }
+    menus.push(Item::with_menu(help_menu_button, menu_tpl(help_items)));
+    let mb = MenuBar::new(menus)
     .close_on_item_click_global(true)
     .close_on_background_click(true)
     .close_on_background_click_global(true);
