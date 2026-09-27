@@ -10,7 +10,7 @@ pub mod repo;
 pub mod status;
 mod watch;
 
-use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_input, Space};
+use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_editor, Space};
 use iced::{Element, Length, Task};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -23,7 +23,8 @@ pub use watch::Changes;
 #[derive(Default)]
 pub struct GitState {
     status: status::Status,
-    commit_message: String,
+    /// Multiline: subject, blank line, body. Cmd/Ctrl+Enter commits.
+    commit_message: text_editor::Content,
     committing: bool,
     error: Option<String>,
     refreshing: bool,
@@ -49,7 +50,7 @@ pub enum Message {
     Stage(Vec<ChangedFile>, bool),
     Staged(Result<(), String>),
     Refreshed(Result<status::Status, String>),
-    CommitMessageChanged(String),
+    CommitMessageEdited(text_editor::Action),
     Commit,
     Committed(Result<(), String>),
     ToggleTreeView,
@@ -141,13 +142,13 @@ pub fn update(state: &mut GitState, message: Message, cwd: PathBuf) -> Task<Mess
             }
             if std::mem::take(&mut state.refresh_again) { return refresh(state, cwd); }
         }
-        Message::CommitMessageChanged(text) => state.commit_message = text,
+        Message::CommitMessageEdited(action) => state.commit_message.perform(action),
         Message::Commit => {
-            if state.commit_message.trim().is_empty() || state.committing || !state.status.files.iter().any(ChangedFile::staged) {
+            if !can_commit(state) {
                 return Task::none();
             }
             state.committing = true;
-            let message = state.commit_message.clone();
+            let message = state.commit_message.text();
             return Task::perform(async move {
                 tokio::task::spawn_blocking(move || commit(&cwd, &message))
                     .await.map_err(|err| err.to_string())?
@@ -157,7 +158,7 @@ pub fn update(state: &mut GitState, message: Message, cwd: PathBuf) -> Task<Mess
             state.committing = false;
             match result {
                 Ok(()) => {
-                    state.commit_message.clear();
+                    state.commit_message = text_editor::Content::new();
                     return refresh(state, cwd);
                 }
                 Err(err) => state.error = Some(err),
@@ -165,6 +166,10 @@ pub fn update(state: &mut GitState, message: Message, cwd: PathBuf) -> Task<Mess
         }
     }
     Task::none()
+}
+
+fn can_commit(state: &GitState) -> bool {
+    !state.committing && !state.commit_message.text().trim().is_empty() && state.status.files.iter().any(ChangedFile::staged)
 }
 
 /// Loads status unless a load is already running, in which case one more follows it.
@@ -284,17 +289,28 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
     if let Some(err) = &state.error {
         bottom = bottom.push(scrollable(text(err.clone()).size(12).font(iced::Font::MONOSPACE).style(iced::widget::text::danger)).height(Length::Shrink));
     }
-    let can_commit = !state.committing && !state.commit_message.trim().is_empty() && state.status.files.iter().any(ChangedFile::staged);
     bottom = bottom.push(
-        text_input("Describe your changes", &state.commit_message)
-            .on_input(Message::CommitMessageChanged)
-            .on_submit(Message::Commit),
+        text_editor(&state.commit_message)
+            .placeholder("Describe your changes (Cmd/Ctrl+Enter to commit)")
+            .on_action(Message::CommitMessageEdited)
+            .size(13)
+            .min_height(60.0)
+            .max_height(200.0)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+            .key_binding(|key_press| {
+                use iced::keyboard::{key::Named, Key};
+                if key_press.modifiers.command() && key_press.key == Key::Named(Named::Enter) {
+                    Some(text_editor::Binding::Custom(Message::Commit))
+                } else {
+                    text_editor::Binding::from_key_press(key_press)
+                }
+            }),
     );
     bottom = bottom.push(
         button(text(if state.committing { "Working..." } else { "Commit Staged" }).size(13))
             .width(Length::Fill)
             .padding([8, 12])
-            .on_press_maybe(can_commit.then_some(Message::Commit)),
+            .on_press_maybe(can_commit(state).then_some(Message::Commit)),
     );
     let to_stage: Vec<ChangedFile> = state.status.files.iter().filter(|file| file.unstaged() || !file.staged()).cloned().collect();
     let to_unstage: Vec<ChangedFile> = state.status.files.iter().filter(|file| file.staged()).cloned().collect();
@@ -506,6 +522,25 @@ mod tests {
         stage_files(&root, &many, true, false).unwrap();
         assert_eq!(git(&root, &["diff", "--cached", "--name-only"]).lines().count(), 2);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn commit_message_accepts_multiple_lines() {
+        use text_editor::{Action, Edit};
+        let mut state = GitState::default();
+        let cwd = PathBuf::from(".");
+        for action in "Subject".chars().map(Edit::Insert).chain([Edit::Enter, Edit::Enter]).chain("Body".chars().map(Edit::Insert)) {
+            let _ = update(&mut state, Message::CommitMessageEdited(Action::Edit(action)), cwd.clone());
+        }
+        assert_eq!(state.commit_message.text().trim_end(), "Subject\n\nBody");
+        // Nothing staged: committing is refused without starting git.
+        assert!(!can_commit(&state));
+        let _ = update(&mut state, Message::Commit, cwd);
+        assert!(!state.committing);
+        state.status.files.push(file("a.txt", "M "));
+        assert!(can_commit(&state));
+        state.commit_message = text_editor::Content::with_text(" \n \n");
+        assert!(!can_commit(&state));
     }
 
     #[test]
