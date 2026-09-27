@@ -65,6 +65,9 @@ struct Thread {
     entries: Vec<Entry>,
 }
 
+/// How many of the newest threads the history menu lists.
+const RECENT_THREADS: usize = 10;
+
 #[derive(Default, Serialize, Deserialize)]
 struct ThreadStore {
     threads: Vec<Thread>,
@@ -234,6 +237,7 @@ pub enum Message {
     SelectModel(String),
     NewThread,
     SwitchThread(usize),
+    DeleteThread(usize),
     ThreadMenuToggle,
     ToggleThinking(usize),
     UsePrompt(String),
@@ -791,6 +795,33 @@ impl AcpState {
         self.reset_connection();
         self.persist(cwd);
     }
+
+    /// Newest threads first, with their indices into `threads`.
+    fn recent_threads(&self) -> impl Iterator<Item = (usize, &Thread)> {
+        self.threads.iter().enumerate().rev().take(RECENT_THREADS)
+    }
+
+    /// Removes a thread; deleting the open one opens the newest remaining (or a fresh) thread.
+    fn delete_thread(&mut self, index: usize) {
+        if self.streaming || index >= self.threads.len() {
+            return;
+        }
+        self.save_current_thread();
+        self.threads.remove(index);
+        if index == self.active_thread {
+            if self.threads.is_empty() {
+                self.threads.push(Thread::default());
+            }
+            self.active_thread = self.threads.len() - 1;
+            self.entries = self.threads[self.active_thread].entries.clone();
+            self.attachments.clear();
+            self.input = text_editor::Content::new();
+            self.usage = None;
+            self.reset_connection();
+        } else if index < self.active_thread {
+            self.active_thread -= 1;
+        }
+    }
 }
 
 pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Message> {
@@ -813,6 +844,10 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
         Message::SwitchThread(i) => {
             state.switch_thread(i, &cwd);
             state.thread_menu_open = false;
+        }
+        Message::DeleteThread(i) => {
+            state.delete_thread(i);
+            state.persist(&cwd);
         }
         Message::UsePrompt(prompt) => state.input = text_editor::Content::with_text(&prompt),
         Message::ToggleThinking(index) => {
@@ -858,18 +893,24 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
     let mut header = column![].spacing(4);
     if state.thread_menu_open {
         let mut menu = column![].spacing(2);
-        for (i, thread) in state.threads.iter().enumerate() {
+        for (i, thread) in state.recent_threads() {
             let title = if thread.title.is_empty() {
                 "New thread".to_string()
             } else {
                 thread.title.clone()
             };
+            let label = if i == state.active_thread { format!("✓ {title}") } else { title };
             menu = menu.push(
-                button(text(title))
-                    .width(Length::Fill)
-                    .padding([4, 8])
-                    .style(crate::flat_button_style)
-                    .on_press_maybe((!state.streaming).then_some(Message::SwitchThread(i))),
+                row![
+                    button(text(label))
+                        .width(Length::Fill)
+                        .padding([4, 8])
+                        .style(crate::flat_button_style)
+                        .on_press_maybe((!state.streaming).then_some(Message::SwitchThread(i))),
+                    crate::icon_control(lucide_icons::Icon::Trash2, "Delete conversation", (!state.streaming).then_some(Message::DeleteThread(i)), false),
+                ]
+                .spacing(4)
+                .align_y(iced::Alignment::Center),
             );
         }
         header = header.push(
@@ -1383,6 +1424,53 @@ mod tests {
         assert!(matches!(waiting.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
         state.reset_connection();
         assert!(state.session_grants.is_empty());
+    }
+
+    fn titled(title: &str) -> Thread {
+        Thread { title: title.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn history_lists_the_newest_threads_first() {
+        let mut state = AcpState::default();
+        state.threads = (0..15).map(|i| titled(&i.to_string())).collect();
+        let recent: Vec<_> = state.recent_threads().map(|(i, t)| (i, t.title.clone())).collect();
+        assert_eq!(recent.len(), RECENT_THREADS);
+        assert_eq!(recent[0], (14, "14".to_string()));
+        assert_eq!(recent[9], (5, "5".to_string()));
+    }
+
+    #[test]
+    fn deleting_threads_keeps_the_open_conversation_consistent() {
+        let mut state = AcpState::default();
+        state.threads = vec![titled("a"), titled("b"), titled("c")];
+        state.active_thread = 2;
+        state.entries = vec![Entry::User { content: "in c".into() }];
+
+        // Deleting an earlier thread keeps the same conversation open.
+        state.delete_thread(0);
+        assert_eq!(state.threads.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), ["b", "c"]);
+        assert_eq!(state.active_thread, 1);
+        assert!(matches!(&state.entries[..], [Entry::User { content }] if content == "in c"));
+
+        // Deleting the open thread opens the newest remaining one.
+        state.threads[0].entries = vec![Entry::User { content: "in b".into() }];
+        state.delete_thread(1);
+        assert_eq!(state.active_thread, 0);
+        assert!(matches!(&state.entries[..], [Entry::User { content }] if content == "in b"));
+
+        // Deleting the last thread leaves a fresh empty one.
+        state.delete_thread(0);
+        assert_eq!(state.threads.len(), 1);
+        assert!(state.threads[0].title.is_empty());
+        assert!(state.entries.is_empty());
+
+        // Out of range and mid-response deletes are ignored.
+        state.delete_thread(5);
+        state.threads.push(titled("d"));
+        state.streaming = true;
+        state.delete_thread(1);
+        assert_eq!(state.threads.len(), 2);
     }
 
     #[test]
