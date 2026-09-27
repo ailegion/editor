@@ -664,9 +664,12 @@ impl AcpState {
                         if let Some(preferred) = &preferred_model {
                             let _ = loop_tx.send(Event::Models(models.clone()));
                             let options = models.as_ref().ok_or_else(|| agent_client_protocol::Error::internal_error().data("Agent did not report a model; saved selection cannot be confirmed"))?;
-                            if &options.current != preferred {
-                                models = Some(change_model(&connection, &session_id, &options.config_id, preferred).await
-                                    .map_err(|err| agent_client_protocol::Error::internal_error().data(err))?);
+                            if !is_same_model(preferred, &options.current) {
+                                // A saved model that cannot be applied must not block chatting with the agent's current model.
+                                match change_model(&connection, &session_id, &options.config_id, preferred).await {
+                                    Ok(changed) => models = Some(changed),
+                                    Err(err) => { let _ = loop_tx.send(Event::ModelChanged(Err(err))); }
+                                }
                             }
                         }
                         let _ = loop_tx.send(Event::Models(models));
@@ -1109,8 +1112,13 @@ async fn change_model(connection: &ConnectionTo<Agent>, session: &SessionId, con
         session.clone(), config_id.to_owned(), SessionConfigValueId::new(value),
     )).block_task().await.map_err(|err| err.to_string())?;
     let models = model_from_options(&response.config_options).ok_or("Agent did not confirm a model")?;
-    if models.current != value { return Err(format!("Requested {value}, but agent reported {}", models.current)); }
+    if !is_same_model(value, &models.current) { return Err(format!("Requested {value}, but agent reported {}", models.current)); }
     Ok(models)
+}
+
+/// Agents may resolve a model to a variant of it, e.g. `claude-fable-5-1` to `claude-fable-5-1[1m]`.
+fn is_same_model(requested: &str, reported: &str) -> bool {
+    reported.strip_prefix(requested).is_some_and(|suffix| suffix.is_empty() || (suffix.starts_with('[') && suffix.ends_with(']')))
 }
 
 fn model_from_options(options: &[agent_client_protocol::schema::v1::SessionConfigOption]) -> Option<ModelOptions> {
@@ -1149,6 +1157,16 @@ mod tests {
         assert_eq!(models.current_name(), "Fast model");
         assert_eq!(models.choices, vec![("fast".into(), "Fast model".into()), ("deep".into(), "Deep model".into())]);
         assert_eq!(model_from_options(&[]), None);
+    }
+
+    #[test]
+    fn model_variants_reported_by_the_agent_confirm_the_request() {
+        assert!(is_same_model("claude-fable-5-1", "claude-fable-5-1"));
+        assert!(is_same_model("claude-fable-5-1", "claude-fable-5-1[1m]"));
+        assert!(!is_same_model("claude-fable-5-1", "claude-opus-5-5[1m]"));
+        assert!(!is_same_model("claude-fable-5-1", "claude-fable-5-10"));
+        assert!(!is_same_model("claude-fable-5-1[1m]", "claude-fable-5-1"));
+        assert!(!is_same_model("claude-fable-5-1", "claude-fable-5-1[1m"));
     }
 
     #[test]
