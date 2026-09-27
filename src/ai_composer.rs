@@ -12,6 +12,8 @@ pub enum Action {
     Drop(Vec<PathBuf>),
     /// Cmd/Ctrl+V in the input: attach a clipboard image, else paste text as usual.
     Paste,
+    /// Complete the `@` mention being typed with this project-relative path.
+    Mention(String),
 }
 
 /// Key bindings shared by the AI panels' inputs: Cmd/Ctrl+Enter sends, and Cmd/Ctrl+V is
@@ -38,6 +40,10 @@ pub fn key_binding<M: Clone>(
 pub struct Context<'a> {
     pub sources: &'a [PathBuf],
     pub can_reference: bool,
+    /// For rendering replies as Markdown in the panel's colors.
+    pub theme: &'a iced::Theme,
+    /// Files matching the `@` mention being typed.
+    pub mentions: &'a [String],
 }
 
 pub fn view<'a, M: Clone + 'a>(
@@ -61,6 +67,15 @@ pub fn view<'a, M: Clone + 'a>(
     let mut content = column![].spacing(6);
     if !attachments.is_empty() {
         content = content.push(container(scrollable(chips)).max_height(110));
+    }
+    if !context.mentions.is_empty() {
+        let mut suggestions = column![text("Attach file").size(11).style(iced::widget::text::secondary)].spacing(1);
+        for path in context.mentions {
+            suggestions = suggestions.push(iced::widget::button(text(format!("@{path}")).size(12))
+                .width(Length::Fill).padding([2, 6]).style(crate::flat_button_style)
+                .on_press(on_action(Action::Mention(path.clone()))));
+        }
+        content = content.push(container(suggestions).padding(4).width(Length::Fill).style(container::rounded_box));
     }
     content = content.push(input).push(row![
         crate::icon_control(lucide_icons::Icon::Paperclip, "Attach image or file", Some(on_action(Action::Attach)), false),

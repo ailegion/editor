@@ -26,6 +26,8 @@ pub struct GitState {
     /// Multiline: subject, blank line, body. Cmd/Ctrl+Enter commits.
     commit_message: text_editor::Content,
     committing: bool,
+    /// An AI-written commit message is on its way.
+    generating: bool,
     error: Option<String>,
     refreshing: bool,
     refresh_again: bool,
@@ -51,6 +53,10 @@ pub enum Message {
     Staged(Result<(), String>),
     Refreshed(Result<status::Status, String>),
     CommitMessageEdited(text_editor::Action),
+    /// Ask the AI assistant to write the message from the staged changes (handled by the app,
+    /// which answers with `MessageGenerated`).
+    GenerateMessage,
+    MessageGenerated(Result<String, String>),
     Commit,
     Committed(Result<(), String>),
     ToggleTreeView,
@@ -143,6 +149,13 @@ pub fn update(state: &mut GitState, message: Message, cwd: PathBuf) -> Task<Mess
             if std::mem::take(&mut state.refresh_again) { return refresh(state, cwd); }
         }
         Message::CommitMessageEdited(action) => state.commit_message.perform(action),
+        Message::GenerateMessage => state.generating = true,
+        Message::MessageGenerated(result) => {
+            state.generating = false;
+            if let Ok(message) = result {
+                state.commit_message = text_editor::Content::with_text(&message);
+            }
+        }
         Message::Commit => {
             if !can_commit(state) {
                 return Task::none();
@@ -289,6 +302,14 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
     if let Some(err) = &state.error {
         bottom = bottom.push(scrollable(text(err.clone()).size(12).font(iced::Font::MONOSPACE).style(iced::widget::text::danger)).height(Length::Shrink));
     }
+    let has_staged = state.status.files.iter().any(ChangedFile::staged);
+    bottom = bottom.push(row![
+        text("Message").size(12).style(iced::widget::text::secondary),
+        Space::new().width(Length::Fill),
+        text(if state.generating { "Writing…" } else { "" }).size(12).style(iced::widget::text::secondary),
+        crate::icon_control(lucide_icons::Icon::Sparkles, "Write message with AI from staged changes",
+            (has_staged && !state.generating && !state.committing).then_some(Message::GenerateMessage), false),
+    ].spacing(6).align_y(iced::Alignment::Center));
     bottom = bottom.push(
         text_editor(&state.commit_message)
             .placeholder("Describe your changes (Cmd/Ctrl+Enter to commit)")
@@ -422,6 +443,46 @@ fn stage_state(files: &[&ChangedFile]) -> (bool, bool) {
     (any_staged, any_staged && !all_staged)
 }
 
+/// Longest staged diff sent to the AI; bigger ones are cut, with a note saying so.
+const MAX_PROMPT_DIFF: usize = 60_000;
+
+/// A prompt asking for a commit message for the staged changes, in the style of recent ones.
+pub fn commit_message_prompt(cwd: &Path) -> Result<String, String> {
+    let diff = cli::run(cwd, &["diff", "--cached", "--no-color", "--no-ext-diff"], None, Access::Read)?;
+    let diff = String::from_utf8_lossy(&diff);
+    if diff.trim().is_empty() { return Err("Stage some changes first".into()); }
+    // An unborn branch has no history to match; that's fine.
+    let recent = cli::run(cwd, &["log", "-8", "--format=%s"], None, Access::Read).unwrap_or_default();
+    Ok(commit_prompt(&diff, &String::from_utf8_lossy(&recent)))
+}
+
+fn commit_prompt(diff: &str, recent_subjects: &str) -> String {
+    let mut prompt = String::from(
+        "Write a git commit message for the staged changes below.\n\
+         Reply with only the message: a concise imperative subject line under 72 characters, \
+         then, only if the change needs explaining, a blank line and a short body. \
+         No quotes, no code fences, no commentary.\n",
+    );
+    let subjects: Vec<&str> = recent_subjects.lines().filter(|line| !line.trim().is_empty()).collect();
+    if !subjects.is_empty() {
+        prompt.push_str("\nMatch the style of this repository's recent subjects:\n");
+        for subject in subjects { prompt.push_str(&format!("- {subject}\n")); }
+    }
+    let cut = diff.char_indices().nth(MAX_PROMPT_DIFF).map(|(index, _)| index);
+    prompt.push_str("\nStaged diff:\n");
+    prompt.push_str(&diff[..cut.unwrap_or(diff.len())]);
+    if cut.is_some() { prompt.push_str("\n[diff truncated]\n"); }
+    prompt
+}
+
+/// The message from an AI reply, without fences or wrapping quotes.
+pub fn clean_commit_message(reply: &str) -> String {
+    let message = crate::ai_oneshot::unfence(reply);
+    let message = message.trim();
+    let message = message.strip_prefix('"').and_then(|m| m.strip_suffix('"')).unwrap_or(message);
+    message.trim().to_string()
+}
+
 /// Commits the index with `git commit`, so commit hooks and signing run as configured.
 fn commit(cwd: &Path, message: &str) -> Result<(), String> {
     cli::run(cwd, &["commit", "-F", "-"], Some(message.as_bytes()), Access::Write).map(|_| ())
@@ -541,6 +602,30 @@ mod tests {
         assert!(can_commit(&state));
         state.commit_message = text_editor::Content::with_text(" \n \n");
         assert!(!can_commit(&state));
+    }
+
+    #[test]
+    fn commit_prompts_include_style_and_bounded_diffs_and_replies_are_cleaned() {
+        let prompt = commit_prompt("+fn login() {}\n", "Fix crash on save\n\nAdd blame view\n");
+        assert!(prompt.contains("- Fix crash on save\n- Add blame view\n"));
+        assert!(prompt.ends_with("Staged diff:\n+fn login() {}\n"));
+        assert!(!commit_prompt("+x\n", "").contains("recent subjects"));
+        let huge = "é".repeat(MAX_PROMPT_DIFF + 10);
+        let prompt = commit_prompt(&huge, "");
+        assert!(prompt.ends_with("[diff truncated]\n"));
+        assert_eq!(prompt.matches('é').count(), MAX_PROMPT_DIFF);
+
+        assert_eq!(clean_commit_message("```\nAdd login\n\nChecks the token.\n```"), "Add login\n\nChecks the token.");
+        assert_eq!(clean_commit_message("\"Add login\"\n"), "Add login");
+
+        let mut state = GitState::default();
+        let _ = update(&mut state, Message::GenerateMessage, PathBuf::from("."));
+        assert!(state.generating);
+        let _ = update(&mut state, Message::MessageGenerated(Err("offline".into())), PathBuf::from("."));
+        assert!(!state.generating);
+        assert!(state.commit_message.text().trim().is_empty(), "a failure keeps the draft");
+        let _ = update(&mut state, Message::MessageGenerated(Ok("Add login\n\nBody".into())), PathBuf::from("."));
+        assert_eq!(state.commit_message.text().trim_end(), "Add login\n\nBody");
     }
 
     #[test]

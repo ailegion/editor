@@ -6,7 +6,8 @@ A minimal, no-bloat code editor in Rust, built on `iced`.
 
 - Single-pane text editor with syntax highlighting (`syntect`)
 - Left sidebar: project file tree, create/rename/delete, keyboard navigation (arrows to move/open/expand/collapse)
-- Right sidebar: AI chat against any OpenAI-compatible endpoint (configurable base URL/key/model), with streaming and a stop button
+- Right sidebar: AI chat with Claude or Codex (ACP) or any OpenAI-compatible endpoint, with Markdown replies, saved conversations, and file edits reviewed as diffs
+- AI inline edits (Cmd/Ctrl+K), explain/refactor/fix actions, and AI-written commit messages
 - Integrated PTY terminal with ANSI colors, 5,000 lines of scrollback, and a resizable bottom panel
 - Status bar with AI and terminal visibility toggles
 - Reopens the last project with only the root expanded; restores tabs and the active file
@@ -20,8 +21,9 @@ A minimal, no-bloat code editor in Rust, built on `iced`.
 ## AI assistant
 
 The AI sidebar has one provider picker: **Local / Ollama / API**, **Claude ACP**, and
-**Codex ACP**. Each provider keeps its own conversation and draft. Claude and Codex
-history is stored separately for each project.
+**Codex ACP**. Each provider keeps its own conversations and draft, saved separately for
+each project. The history button lists the 10 most recently active conversations, with
+search, rename, delete, and **Show all** for older ones.
 
 For Ollama, open model settings, choose **Use local Ollama**, and select a discovered
 model. Other OpenAI-compatible servers use the same base URL, key, and model settings.
@@ -39,12 +41,30 @@ The first launch may download the adapter. Connection errors appear in the conve
   8 MiB each. Review or remove attachments before sending.
 - The composer's code icon attaches the current selection, or the active editor buffer
   including unsaved changes. Attachments are snapshots, not live links.
+- Type `@` and part of a file name to pick a project file; files `@mentioned` in a message
+  are attached when it is sent (`@"path with spaces"` for names with spaces).
 - **Cmd/Ctrl+Enter** sends the prompt, including attachment-only prompts.
+- Replies render as Markdown. Code blocks have **Copy** and **Insert at cursor**; the
+  text-cursor icon switches a reply to plain selectable text.
+- **Cmd/Ctrl+K** in the editor asks the selected assistant to rewrite the selection (or the
+  caret's line, or insert code on an empty line). The proposal opens as a diff to
+  **Accept** (one undo step) or **Reject**.
+- The editor's context menu and the command palette can **Explain** or **Refactor** the
+  selection or file with AI; the status bar's wand asks the AI to fix the problem on the
+  caret's line.
+- The source control panel's sparkles button writes a commit message from the staged diff,
+  matching the style of recent commits. With Claude or Codex this starts a short separate
+  agent session that is not allowed to change files.
+- File edits made by the AI show **View diff**, which opens them in the diff viewer.
+- The Local / API assistant can read, search, create and edit files (`edit_file` replaces
+  exact text), and run commands (PowerShell on Windows, `sh` elsewhere; no input, stopped
+  after 2 minutes unless the model asks for up to 10). Every tool call needs approval, and
+  file writes are reviewed as a diff.
 - The ACP composer's context ring fills with used context. Hover for the percentage;
   click for model, token usage, context limit, remaining space, and reported cost.
   Unknown values are shown as not reported. Escape or clicking outside closes the overlay.
 - Tool requests show approval controls and details. ACP tool cards expand to show
-  supplied output and before/after edits. Approval applies to the entire tool request.
+  supplied output and edits as diffs. Approval applies to the entire tool request.
 - Approval cards show decoded request details and separate **Reject** / **Allow once**
   actions. **Remember for this session** remembers only the same tool input after allowing;
   **Reset session approvals** revokes these grants. New conversations, project changes,

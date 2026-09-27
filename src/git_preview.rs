@@ -15,6 +15,15 @@ pub struct Preview {
     pub root: PathBuf,
     pub path: String,
     pub result: Option<Result<String, String>>,
+    /// Reloaded from the repository when it changes. AI edits and proposals are snapshots.
+    pub live: bool,
+}
+
+/// Unified hunks from `old` to `new`, in the format [`view`] renders.
+pub fn text_patch(old: &str, new: &str) -> String {
+    let mut patch = String::new();
+    push_diff(&mut patch, old.as_bytes(), new.as_bytes());
+    patch
 }
 
 pub async fn load(repo: Option<Arc<Repo>>, root: PathBuf, path: String) -> Result<String, String> {

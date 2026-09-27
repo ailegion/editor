@@ -163,7 +163,8 @@ pub fn update(
     }
 }
 
-fn walk(root: &Path) -> Vec<PathBuf> {
+/// Every file under `root`, skipping [`IGNORED_DIRS`].
+pub(crate) fn walk(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     walk_into(root, &mut files);
     files

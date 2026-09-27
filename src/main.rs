@@ -6,7 +6,13 @@ mod updater;
 mod ai_approval;
 mod ai_composer;
 mod ai_context;
+mod ai_diff;
+mod ai_history;
+mod ai_markdown;
+mod ai_mention;
+mod ai_oneshot;
 mod ai_selectable;
+mod inline_edit;
 mod lsp;
 mod acp;
 mod terminal;
@@ -199,6 +205,17 @@ impl std::fmt::Display for AiMode {
     }
 }
 
+/// Editor code sent to the AI panel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AiAct {
+    /// Explain the selection (or the file).
+    Explain,
+    /// Attach the selection (or the file) and start a refactoring request to finish typing.
+    Refactor,
+    /// Fix the diagnostic on the caret's line (or the file's first error).
+    Fix,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PaneKind {
     Terminal,
@@ -302,6 +319,15 @@ enum Message {
     AiPaste,
     /// Clipboard text for the AI input, used when `AiPaste` found no image.
     AiPasteText(Option<String>),
+    /// Ask the AI panel about the code in the editor.
+    AiAct(AiAct),
+    /// Cmd/Ctrl+K: start an inline AI edit of the selection (or the current line).
+    InlineEditStart,
+    InlineEditInput(String),
+    InlineEditSubmit,
+    InlineEditReady(u64, Result<String, String>),
+    InlineEditAccept,
+    InlineEditCancel,
     /// Install the language server with this id, or dismiss its prompt for the session.
     LspInstall(&'static str),
     LspDismiss(&'static str),
@@ -397,6 +423,13 @@ struct State {
 
     ai_visible: bool,
     ai_mode: AiMode,
+    /// Project files for `@` mention suggestions, listed when a mention starts: (root, paths).
+    mention_files: Option<(PathBuf, Vec<String>)>,
+    /// Files matching the mention being typed in the AI input.
+    mentions: Vec<String>,
+    inline_edit: Option<inline_edit::InlineEdit>,
+    /// Id of the latest inline edit request; answers to earlier ones are ignored.
+    inline_generation: u64,
     chat: chat::ChatState,
     acp: acp::AcpState,
     codex: acp::AcpState,
@@ -492,8 +525,12 @@ impl State {
             started_at: std::time::Instant::now(),
             ai_visible,
             ai_mode: AiMode::default(),
-            chat: chat::ChatState::default(),
-            acp: acp::AcpState::default(),
+            mention_files: None,
+            mentions: Vec::new(),
+            inline_edit: None,
+            inline_generation: 0,
+            chat: chat::ChatState::new(),
+            acp: acp::AcpState::claude(),
             codex: acp::AcpState::codex(),
             terminal: terminal::panel::Panel::default(),
             terminal_visible: false,
@@ -865,7 +902,7 @@ impl State {
         if let Some(changes) = self.git.take_changes() {
             if changes.repository {
                 tasks.push(self.reload_git_views());
-            } else if let Some(preview) = &mut self.git_preview {
+            } else if let Some(preview) = self.git_preview.as_mut().filter(|preview| preview.live) {
                 // Working-tree edits only change the unstaged half of an open preview.
                 tasks.push(load_preview_task(self.git.repo(), preview.root.clone(), preview.path.clone()));
             }
@@ -888,7 +925,7 @@ impl State {
     /// Reloads the open diff preview and every tab's markers from current repository state.
     fn reload_git_views(&mut self) -> Task<Message> {
         let mut tasks = vec![self.reload_all_diffs()];
-        if let Some(preview) = &mut self.git_preview {
+        if let Some(preview) = self.git_preview.as_mut().filter(|preview| preview.live) {
             preview.result = None;
             tasks.push(load_preview_task(self.git.repo(), preview.root.clone(), preview.path.clone()));
         }
@@ -917,6 +954,217 @@ impl State {
             tab.content.set_metrics(metrics);
         }
         save_zoom(self.zoom);
+    }
+
+    fn ai_input(&self) -> String {
+        match self.ai_mode {
+            AiMode::Http => self.chat.input_text(),
+            AiMode::Acp => self.acp.input_text(),
+            AiMode::Codex => self.codex.input_text(),
+        }
+    }
+
+    fn set_ai_input(&mut self, text: &str) {
+        match self.ai_mode {
+            AiMode::Http => self.chat.set_input(text),
+            AiMode::Acp => self.acp.set_input(text),
+            AiMode::Codex => self.codex.set_input(text),
+        }
+        self.refresh_mentions();
+    }
+
+    fn ai_attachments(&mut self) -> &mut Vec<ai_context::Attachment> {
+        match self.ai_mode {
+            AiMode::Http => &mut self.chat.attachments,
+            AiMode::Acp => &mut self.acp.attachments,
+            AiMode::Codex => &mut self.codex.attachments,
+        }
+    }
+
+    /// Where one-off AI requests (commit messages, inline edits) go: the assistant selected
+    /// in the AI panel.
+    fn ai_backend(&self) -> Result<ai_oneshot::Backend, String> {
+        match self.ai_mode {
+            AiMode::Http => self.chat.connection()
+                .map(|(base_url, api_key, model)| ai_oneshot::Backend::Http { base_url, api_key, model })
+                .ok_or_else(|| "Choose a model in the AI panel's settings first".to_string()),
+            AiMode::Acp => Ok(ai_oneshot::Backend::Agent { provider: self.acp.provider(), model: self.acp.preferred_model() }),
+            AiMode::Codex => Ok(ai_oneshot::Backend::Agent { provider: self.codex.provider(), model: self.codex.preferred_model() }),
+        }
+    }
+
+    /// Updates the `@` file suggestions for the AI input. The project is listed once per mention.
+    fn refresh_mentions(&mut self) {
+        let text = self.ai_input();
+        let Some(query) = ai_mention::typing(&text) else {
+            self.mentions.clear();
+            self.mention_files = None;
+            return;
+        };
+        let root = self.root_or_cwd();
+        if self.mention_files.as_ref().is_none_or(|(listed, _)| *listed != root) {
+            let files = self.root.as_deref().map(quick_open::walk).unwrap_or_default();
+            self.mention_files = Some((root.clone(), ai_mention::relative_paths(&root, &files)));
+        }
+        self.mentions = self.mention_files.as_ref().map(|(_, files)| ai_mention::suggest(files, query)).unwrap_or_default();
+    }
+
+    /// Attaches the project files `@`-mentioned in the AI input that aren't attached yet.
+    /// Mentions that aren't files in the project are left as plain text.
+    fn attach_mentions(&mut self) {
+        let Some(root) = self.root.clone() else { return };
+        let Ok(canonical_root) = root.canonicalize() else { return };
+        for mention in ai_mention::mentioned(&self.ai_input()) {
+            if self.ai_attachments().iter().any(|attachment| attachment.name == mention) { continue; }
+            let Some(path) = root.join(&mention).canonicalize().ok()
+                .filter(|path| path.starts_with(&canonical_root) && path.is_file()) else { continue };
+            if self.ai_attachments().len() >= 16 {
+                self.notify("Maximum 16 attachments per message.");
+                break;
+            }
+            match ai_context::Attachment::read(&path) {
+                Ok(mut attachment) => {
+                    attachment.name = mention;
+                    self.ai_attachments().push(attachment);
+                }
+                Err(err) => self.notify(format!("Could not attach {mention}: {err}")),
+            }
+        }
+        self.mentions.clear();
+    }
+
+    /// Puts AI-suggested code into the active tab at the caret, replacing any selection.
+    fn insert_code(&mut self, code: &str) {
+        if self.git_preview.is_some() || self.tabs.get(self.active_tab).is_none() {
+            self.notify("Open a file tab to insert code");
+            return;
+        }
+        let before = self.tabs[self.active_tab].content.undo_count();
+        self.tabs[self.active_tab].content.replace_selection(&code.replace("\r\n", "\n"));
+        self.focus = Focus::Editor;
+        self.mark_edited_if_changed(before);
+    }
+
+    fn open_ai_diff(&mut self, diff: Option<ai_diff::FileDiff>) {
+        match diff {
+            Some(diff) => {
+                self.git_preview = Some(diff.preview(&self.root_or_cwd()));
+                self.focus = Focus::Editor;
+            }
+            None => self.notify("That change is no longer available"),
+        }
+    }
+
+    /// Puts `prompt` in the AI panel with `attachment`, showing the panel, and sends it unless
+    /// the user is meant to finish typing it.
+    fn ask_ai(&mut self, prompt: &str, attachment: ai_context::Attachment, send: bool) -> Task<Message> {
+        let mut task = Task::none();
+        if !self.ai_visible { task = update(self, Message::AiToggle); }
+        if self.ai_attachments().len() < 16 { self.ai_attachments().push(attachment); }
+        else { self.notify("Maximum 16 attachments per message."); }
+        self.set_ai_input(prompt);
+        if send {
+            let send = match self.ai_mode {
+                AiMode::Http => Message::Chat(chat::Message::Send),
+                AiMode::Acp => Message::Acp(acp::Message::Send),
+                AiMode::Codex => Message::Codex(acp::Message::Send),
+            };
+            task = Task::batch([task, update(self, send)]);
+        }
+        task
+    }
+
+    /// The active tab's path relative to the project, for prompts.
+    fn tab_label(&self, tab: &Tab) -> String {
+        let root = self.root_or_cwd();
+        tab.path.as_deref().map(|path| path.strip_prefix(&root).unwrap_or(path).display().to_string().replace('\\', "/"))
+            .unwrap_or_else(|| "Untitled".into())
+    }
+
+    fn ai_act(&mut self, act: AiAct) -> Task<Message> {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            self.notify("Open a file first");
+            return Task::none();
+        };
+        let bounds = tab.content.selection_bounds();
+        let code = match bounds {
+            Some((start, end)) => tab.content.text_between(start, end).unwrap_or_default(),
+            None => tab.content.text(),
+        };
+        let tab = &self.tabs[self.active_tab];
+        let name = self.tab_label(tab);
+        let label = match bounds {
+            Some((start, end)) => format!("{name} (lines {}-{})", start.line + 1, end.line + 1),
+            None => name.clone(),
+        };
+        let snippet = ai_context::Attachment { name: label.clone(), content: code, mime: None };
+        match act {
+            AiAct::Explain => self.ask_ai(&format!("Explain what the code in {label} does and how it works."), snippet, true),
+            AiAct::Refactor => self.ask_ai(&format!("Refactor the code in {label} to "), snippet, false),
+            AiAct::Fix => {
+                let line = tab.content.cursor.line;
+                let diagnostic = tab.diagnostics.iter().find(|d| d.line == line)
+                    .or_else(|| tab.diagnostics.iter().find(|d| d.severity == lsp::Severity::Error));
+                let Some(diagnostic) = diagnostic else {
+                    self.notify("No problem reported on this line");
+                    return Task::none();
+                };
+                let (problem, message) = (diagnostic.line, diagnostic.message.clone());
+                let kind = if diagnostic.severity == lsp::Severity::Error { "error" } else { "warning" };
+                let text = tab.content.text();
+                let lines: Vec<&str> = text.lines().collect();
+                let first = problem.saturating_sub(15);
+                let last = (diagnostic.end_line + 15).min(lines.len().saturating_sub(1));
+                let numbered = (first..=last).filter_map(|n| lines.get(n).map(|code| format!("{:>5} | {code}", n + 1)))
+                    .collect::<Vec<_>>().join("\n");
+                let nearby = ai_context::Attachment { name: format!("{name} (lines {}-{})", first + 1, last + 1), content: numbered, mime: None };
+                self.ask_ai(&format!("Fix this {kind} in {name} at line {}: {message}", problem + 1), nearby, true)
+            }
+        }
+    }
+
+    /// Cmd/Ctrl+K: asks for an instruction to rewrite the selection, or the caret's line.
+    fn start_inline_edit(&mut self) -> Task<Message> {
+        if self.git_preview.is_some() { return Task::none(); }
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            self.notify("Open a file first");
+            return Task::none();
+        };
+        let (start, end) = tab.content.selection_bounds().unwrap_or_else(|| {
+            let line = tab.content.cursor.line;
+            let length = tab.content.inner.lines.get(line).map_or(0, |text| text.text().len());
+            (cosmic_text::Cursor::new(line, 0), cosmic_text::Cursor::new(line, length))
+        });
+        let original = tab.content.text_between(start, end).unwrap_or_default();
+        self.inline_edit = Some(inline_edit::InlineEdit {
+            path: tab.path.clone(), start, end, original, instruction: String::new(), stage: inline_edit::Stage::Prompt,
+        });
+        iced::widget::operation::focus(inline_edit::INPUT_ID)
+    }
+
+    fn submit_inline_edit(&mut self) -> Task<Message> {
+        let backend = match self.ai_backend() {
+            Ok(backend) => backend,
+            Err(err) => { self.notify(err); return Task::none(); }
+        };
+        let root = self.root_or_cwd();
+        let Some(edit) = self.inline_edit.as_ref().filter(|edit| matches!(edit.stage, inline_edit::Stage::Prompt) && !edit.instruction.trim().is_empty()) else {
+            return Task::none();
+        };
+        let Some(tab) = self.tabs.iter().find(|tab| tab.path == edit.path) else {
+            self.inline_edit = None;
+            return Task::none();
+        };
+        let last = tab.content.line_count().saturating_sub(1);
+        let end_of_file = cosmic_text::Cursor::new(last, tab.content.inner.lines.get(last).map_or(0, |line| line.text().len()));
+        let before = tab.content.text_between(cosmic_text::Cursor::new(0, 0), edit.start).unwrap_or_default();
+        let after = tab.content.text_between(edit.end, end_of_file).unwrap_or_default();
+        let language = self.highlighter.language_name(&tab.extension()).to_string();
+        let prompt = inline_edit::prompt(&self.tab_label(tab), &language, &before, &edit.original, &after, &edit.instruction);
+        self.inline_generation += 1;
+        let id = self.inline_generation;
+        if let Some(edit) = &mut self.inline_edit { edit.stage = inline_edit::Stage::Working(id); }
+        Task::perform(ai_oneshot::ask(backend, root, prompt), move |result| Message::InlineEditReady(id, result))
     }
 
     fn delete_path(&self, path: PathBuf) -> Task<Message> {
@@ -1132,10 +1380,24 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             let root = state.root_or_cwd();
             state.focus = Focus::Editor;
             state.git_preview = Some(git_preview::Preview {
-                root: root.clone(), path: path.clone(), result: None,
+                root: root.clone(), path: path.clone(), result: None, live: true,
             });
             task = load_preview_task(state.git.repo(), root, path);
         }
+        Message::Git(git::Message::GenerateMessage) => match state.ai_backend() {
+            Err(err) => state.notify(err),
+            Ok(backend) => {
+                let cwd = state.root_or_cwd();
+                let _ = git::update(&mut state.git, git::Message::GenerateMessage, cwd.clone());
+                task = Task::perform(async move {
+                    let prompt = tokio::task::spawn_blocking({
+                        let cwd = cwd.clone();
+                        move || git::commit_message_prompt(&cwd)
+                    }).await.map_err(|err| err.to_string())??;
+                    ai_oneshot::ask(backend, cwd, prompt).await.map(|reply| git::clean_commit_message(&reply))
+                }, |result| Message::Git(git::Message::MessageGenerated(result)));
+            }
+        },
         Message::GitPreviewLoaded(root, path, result) => {
             if let Some(preview) = &mut state.git_preview {
                 if preview.root == root && preview.path == path {
@@ -1183,6 +1445,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 git::Message::Committed(Ok(())) => state.notify("Commit created"),
                 git::Message::Staged(Ok(())) => state.notify("Staging updated"),
                 git::Message::Committed(Err(err)) | git::Message::Staged(Err(err)) | git::Message::Refreshed(Err(err)) => state.notify(format!("Git: {err}")),
+                git::Message::MessageGenerated(Err(err)) => state.notify(format!("Could not write a commit message: {err}")),
                 _ => {},
             }
             let cwd = state.root_or_cwd();
@@ -1548,6 +1811,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if modifiers.control() && key.as_ref() == keyboard::Key::Character("`") {
                 return update(state, Message::TerminalToggle);
             }
+            if key == keyboard::Key::Named(keyboard::key::Named::Escape) && state.inline_edit.is_some()
+                && !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible && !state.theme_install.visible {
+                return update(state, Message::InlineEditCancel);
+            }
             if state.terminal_visible && state.terminal.focused()
                 && !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible
                 && !state.theme_install.visible
@@ -1577,6 +1844,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         if index < state.tabs.len() { state.active_tab = index; state.git_preview = None; }
                     }
                     keyboard::Key::Character("s") => task = state.save(),
+                    keyboard::Key::Character("k") if state.git_preview.is_none() => task = update(state, Message::InlineEditStart),
                     keyboard::Key::Character("o") => {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
                             task = state.open_path(path);
@@ -1781,7 +2049,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.ai_split = None;
             }
         }
-        Message::AiModeSelected(mode) => state.ai_mode = mode,
+        Message::AiModeSelected(mode) => {
+            state.ai_mode = mode;
+            state.refresh_mentions();
+        }
         Message::Chat(chat::Message::Composer(action))
         | Message::Acp(acp::Message::Composer(action))
         | Message::Codex(acp::Message::Composer(action)) => {
@@ -1790,6 +2061,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 ai_composer::Action::Reference => Message::AiReference,
                 ai_composer::Action::Remove(index) => Message::AiRemoveAttachment(index),
                 ai_composer::Action::Paste => Message::AiPaste,
+                ai_composer::Action::Mention(path) => {
+                    let text = ai_mention::complete(&state.ai_input(), &path);
+                    state.set_ai_input(&text);
+                    return Task::none();
+                }
                 ai_composer::Action::Drop(paths) => {
                     if let Some(tree) = &mut state.tree {
                         let _ = tree.update(DirectoryTreeEvent::Drag(iced_swdir_tree::DragMsg::Cancelled));
@@ -1871,17 +2147,91 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 else { state.notice = Some(("Attachment limit reached (16 files, 8 MiB each).".into(), std::time::Instant::now())); }
             }
         }
+        Message::AiAct(act) => task = state.ai_act(act),
+        Message::InlineEditStart => task = state.start_inline_edit(),
+        Message::InlineEditInput(text) => {
+            if let Some(edit) = state.inline_edit.as_mut().filter(|edit| matches!(edit.stage, inline_edit::Stage::Prompt)) {
+                edit.instruction = text;
+            }
+        }
+        Message::InlineEditSubmit => task = state.submit_inline_edit(),
+        Message::InlineEditReady(id, result) => {
+            let root = state.root_or_cwd();
+            let Some(edit) = state.inline_edit.as_mut().filter(|edit| matches!(edit.stage, inline_edit::Stage::Working(current) if current == id)) else {
+                return Task::none();
+            };
+            match result {
+                Ok(reply) => {
+                    let replacement = inline_edit::replacement(&reply, &edit.original);
+                    let name = edit.path.as_deref().and_then(Path::file_name).map_or_else(|| "Untitled".into(), |name| name.to_string_lossy().into_owned());
+                    state.git_preview = Some(git_preview::Preview {
+                        root, path: format!("{}{name}", inline_edit::PREVIEW_PREFIX),
+                        result: Some(Ok(git_preview::text_patch(&edit.original, &replacement))), live: false,
+                    });
+                    edit.stage = inline_edit::Stage::Review(replacement);
+                    state.focus = Focus::Editor;
+                }
+                Err(err) => {
+                    edit.stage = inline_edit::Stage::Prompt;
+                    state.notify(format!("AI edit failed: {err}"));
+                }
+            }
+        }
+        Message::InlineEditAccept => {
+            if let Some(inline_edit::InlineEdit { path, start, end, original, stage: inline_edit::Stage::Review(replacement), .. }) = state.inline_edit.take() {
+                state.git_preview = None;
+                match state.tabs.iter().position(|tab| tab.path == path) {
+                    Some(index) if state.tabs[index].content.text_between(start, end).as_deref() == Some(original.as_str()) => {
+                        state.active_tab = index;
+                        let before = state.tabs[index].content.undo_count();
+                        state.tabs[index].content.replace_range(start, end, &replacement);
+                        state.focus = Focus::Editor;
+                        state.mark_edited_if_changed(before);
+                    }
+                    _ => state.notify("The code changed while the edit was being written; try again"),
+                }
+            }
+        }
+        Message::InlineEditCancel => {
+            if state.inline_edit.take().is_some_and(|edit| matches!(edit.stage, inline_edit::Stage::Review(_))) {
+                state.git_preview = None;
+            }
+        }
+        Message::Acp(acp::Message::ViewDiff(entry, index)) => {
+            let diff = state.acp.diff(entry, index).cloned();
+            state.open_ai_diff(diff);
+        }
+        Message::Codex(acp::Message::ViewDiff(entry, index)) => {
+            let diff = state.codex.diff(entry, index).cloned();
+            state.open_ai_diff(diff);
+        }
+        Message::Chat(chat::Message::ViewDiff(index)) => {
+            let diff = state.chat.diff(index).cloned();
+            state.open_ai_diff(diff);
+        }
+        Message::Chat(chat::Message::Markdown(ai_markdown::Action::Insert(code)))
+        | Message::Acp(acp::Message::Markdown(ai_markdown::Action::Insert(code)))
+        | Message::Codex(acp::Message::Markdown(ai_markdown::Action::Insert(code))) => state.insert_code(&code),
         Message::Codex(msg) => {
             let cwd = state.root_or_cwd();
+            let input = matches!(msg, acp::Message::InputChanged(_) | acp::Message::UsePrompt(_));
+            if matches!(msg, acp::Message::Send) { state.attach_mentions(); }
             task = acp::update(&mut state.codex, msg, cwd).map(Message::Codex);
+            if input { state.refresh_mentions(); }
         }
         Message::Chat(msg) => {
             let cwd = state.root_or_cwd();
+            let input = matches!(msg, chat::Message::InputChanged(_) | chat::Message::UsePrompt(_));
+            if matches!(msg, chat::Message::Send) { state.attach_mentions(); }
             task = chat::update(&mut state.chat, msg, cwd).map(Message::Chat);
+            if input { state.refresh_mentions(); }
         }
         Message::Acp(msg) => {
             let cwd = state.root_or_cwd();
+            let input = matches!(msg, acp::Message::InputChanged(_) | acp::Message::UsePrompt(_));
+            if matches!(msg, acp::Message::Send) { state.attach_mentions(); }
             task = acp::update(&mut state.acp, msg, cwd).map(Message::Acp);
+            if input { state.refresh_mentions(); }
         }
         Message::Tick => {
             if about::native_menu_requested() {
@@ -1964,6 +2314,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 save_window_size(state.last_known_size);
             }
         }
+    }
+    // Closing or replacing the proposed edit's preview rejects it.
+    let reviewing = state.git_preview.as_ref().is_some_and(|preview| !preview.live && preview.path.starts_with(inline_edit::PREVIEW_PREFIX));
+    if !reviewing && state.inline_edit.as_ref().is_some_and(|edit| matches!(edit.stage, inline_edit::Stage::Review(_))) {
+        state.inline_edit = None;
     }
     state.persist_session();
     task
@@ -2087,6 +2442,8 @@ fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
     let composer = ai_composer::Context {
         sources: state.tree.as_ref().map(|tree| tree.drag_sources()).unwrap_or_default(),
         can_reference: state.tabs.get(state.active_tab).is_some(),
+        theme: &state.app_theme.iced,
+        mentions: &state.mentions,
     };
     let panel: Element<'_, Message> = match state.ai_mode {
         AiMode::Http => chat::view(&state.chat, composer).map(Message::Chat),
@@ -2255,7 +2612,12 @@ fn command_list(state: &State) -> Vec<command_palette::Command> {
         });
         commands.push(Command { label: "Go to Line (Cmd+G)".to_string(), message: Message::ToggleGotoLine });
         commands.push(Command { label: "Go to Definition (F12)".to_string(), message: Message::GoToDefinition });
+        commands.push(Command { label: "AI: Edit Selection Inline (Cmd+K)".into(), message: Message::InlineEditStart });
+        commands.push(Command { label: "AI: Explain Selection or File".into(), message: Message::AiAct(AiAct::Explain) });
+        commands.push(Command { label: "AI: Refactor Selection or File".into(), message: Message::AiAct(AiAct::Refactor) });
+        commands.push(Command { label: "AI: Fix Problem on This Line".into(), message: Message::AiAct(AiAct::Fix) });
     }
+    commands.push(Command { label: "AI: Write Commit Message from Staged Changes".into(), message: Message::Git(git::Message::GenerateMessage) });
 
     for (label, mode) in [("Install Theme...", theme_install::Mode::Install), ("Uninstall Theme...", theme_install::Mode::Uninstall)] {
         commands.push(Command { label: label.to_string(), message: Message::ThemeInstall(theme_install::Message::Open(mode)) });
@@ -2433,6 +2795,7 @@ fn view_status_bar(state: &State) -> Element<'_, Message> {
                 let palette = theme.extended_palette();
                 iced::widget::text::Style { color: Some(if is_error { palette.danger.base.color } else { palette.background.base.text }) }
             }));
+            bar = bar.push(icon_control(lucide_icons::Icon::Wand, "Fix with AI", Some(Message::AiAct(AiAct::Fix)), false));
         }
     }
 
@@ -2597,13 +2960,18 @@ fn view_editor(state: &State) -> Element<'_, Message> {
     }
 
     if let Some(preview) = &state.git_preview {
-        let header = row![
+        let mut header = row![
             text(preview.path.clone()).size(14),
             text(git_preview::summary(preview)).size(12).style(iced::widget::text::secondary),
             button("×").style(flat_button_style).on_press(Message::CloseGitPreview),
             Space::new().width(Length::Fill),
-            button(if state.ai_visible { "Hide AI panel" } else { "Show AI panel" }).style(flat_button_style).on_press(Message::AiToggle),
         ].spacing(12).padding(8).align_y(iced::Alignment::Center);
+        if state.inline_edit.as_ref().is_some_and(|edit| matches!(edit.stage, inline_edit::Stage::Review(_))) {
+            header = header
+                .push(button(text("Accept").size(13)).padding([6, 14]).style(iced::widget::button::success).on_press(Message::InlineEditAccept))
+                .push(button(text("Reject").size(13)).padding([6, 14]).style(flat_button_style).on_press(Message::InlineEditCancel));
+        }
+        let header = header.push(button(if state.ai_visible { "Hide AI panel" } else { "Show AI panel" }).style(flat_button_style).on_press(Message::AiToggle));
         return column![
             scrollable(tab_row).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())),
             header,
@@ -2633,6 +3001,24 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         }
         if tab.search.visible {
             editor_column = editor_column.push(code_editor::search::view(&tab.search).map(Message::Search));
+        }
+        if let Some(edit) = state.inline_edit.as_ref().filter(|edit| edit.path == tab.path) {
+            let working = matches!(edit.stage, inline_edit::Stage::Working(_));
+            let sparkles: char = lucide_icons::Icon::Sparkles.into();
+            let placeholder = if edit.original.is_empty() { "Describe the code to insert here…" } else { "Describe how to change the selected code…" };
+            let action: Element<'_, Message> = if working {
+                text("Writing…").size(12).style(iced::widget::text::secondary).into()
+            } else {
+                button(text("Generate").size(12)).padding([4, 10])
+                    .on_press_maybe((!edit.instruction.trim().is_empty()).then_some(Message::InlineEditSubmit)).into()
+            };
+            editor_column = editor_column.push(container(row![
+                text(sparkles).font(iced::Font::with_name("lucide")).size(14),
+                text_input(placeholder, &edit.instruction).id(inline_edit::INPUT_ID).size(13).padding([4, 8])
+                    .on_input_maybe((!working).then_some(Message::InlineEditInput)).on_submit(Message::InlineEditSubmit),
+                action,
+                icon_control(lucide_icons::Icon::X, "Cancel (Esc)", Some(Message::InlineEditCancel), false),
+            ].spacing(8).align_y(iced::Alignment::Center)).padding([4, 8]).style(chrome_style));
         }
         let editor = code_editor::code_editor(
             &tab.content,
@@ -2684,6 +3070,10 @@ fn view_editor(state: &State) -> Element<'_, Message> {
                 item(EditAction::Paste, true),
                 iced::widget::rule::horizontal(1),
                 item(EditAction::SelectAll, true),
+                iced::widget::rule::horizontal(1),
+                menu_button("Edit with AI… (Cmd+K)".into(), Message::InlineEditStart),
+                menu_button(if has_selection { "Explain Selection with AI" } else { "Explain File with AI" }.into(), Message::AiAct(AiAct::Explain)),
+                menu_button(if has_selection { "Refactor Selection with AI…" } else { "Refactor File with AI…" }.into(), Message::AiAct(AiAct::Refactor)),
             ].spacing(2).width(220))
             .padding(6).style(iced::widget::container::rounded_box).into()
         }));

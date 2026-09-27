@@ -314,6 +314,31 @@ impl Buffer {
         editor.copy_selection().filter(|text| !text.is_empty())
     }
 
+    /// Start and end of a non-empty selection, in document order.
+    pub fn selection_bounds(&mut self) -> Option<(Cursor, Cursor)> {
+        let mut editor = Editor::new(&mut self.inner);
+        editor.set_cursor(self.cursor);
+        editor.set_selection(self.selection);
+        editor.selection_bounds().filter(|(start, end)| (start.line, start.index) != (end.line, end.index))
+    }
+
+    /// The text from `start` to `end` (byte positions within lines), or `None` if either is
+    /// outside the document, e.g. because it changed since they were taken.
+    pub fn text_between(&self, start: Cursor, end: Cursor) -> Option<String> {
+        let lines = &self.inner.lines;
+        if (start.line, start.index) > (end.line, end.index) { return None; }
+        let (first, last) = (lines.get(start.line)?.text(), lines.get(end.line)?.text());
+        if start.line == end.line { return first.get(start.index..end.index).map(str::to_string); }
+        let mut text = first.get(start.index..)?.to_string();
+        for line in &lines[start.line + 1..end.line] {
+            text.push('\n');
+            text.push_str(line.text());
+        }
+        text.push('\n');
+        text.push_str(last.get(..end.index)?);
+        Some(text)
+    }
+
     /// Copies the selection and deletes it as a single undo step.
     pub fn cut_selection(&mut self) -> Option<String> {
         let text = self.copy_selection()?;
@@ -449,6 +474,24 @@ mod clipboard_tests {
         assert_eq!(buffer.text(), " world");
         buffer.undo();
         assert_eq!(buffer.text(), "hello world");
+    }
+
+    #[test]
+    fn ranges_read_back_what_a_replacement_will_cover() {
+        let mut buffer = Buffer::new("fn a() {\n    one();\n}\ntail", Metrics::new(14.0, 20.0));
+        assert_eq!(buffer.selection_bounds(), None);
+        // Selected backwards: bounds still come out in document order.
+        buffer.select_range(Cursor::new(2, 1), Cursor::new(0, 3));
+        let (start, end) = buffer.selection_bounds().unwrap();
+        assert_eq!(((start.line, start.index), (end.line, end.index)), ((0, 3), (2, 1)));
+        assert_eq!(buffer.text_between(start, end).as_deref(), Some("a() {\n    one();\n}"));
+        assert_eq!(buffer.text_between(Cursor::new(3, 0), Cursor::new(3, 4)).as_deref(), Some("tail"));
+        assert_eq!(buffer.text_between(Cursor::new(3, 0), Cursor::new(3, 9)), None);
+        assert_eq!(buffer.text_between(Cursor::new(9, 0), Cursor::new(9, 0)), None);
+        assert_eq!(buffer.text_between(end, start), None);
+        buffer.replace_range(start, end, "b() {}");
+        assert_eq!(buffer.text(), "fn b() {}\ntail");
+        assert_eq!(buffer.undo_count(), 1);
     }
 }
 

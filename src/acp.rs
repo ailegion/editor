@@ -55,6 +55,9 @@ enum Entry {
         status: ToolStatus,
         #[serde(default)]
         details: String,
+        /// File edits the tool made, for "View diff".
+        #[serde(default)]
+        diffs: Vec<crate::ai_diff::FileDiff>,
     },
 }
 
@@ -63,10 +66,10 @@ struct Thread {
     title: String,
     session_id: Option<String>,
     entries: Vec<Entry>,
+    /// Unix seconds of the last prompt, for ordering the history menu.
+    #[serde(default)]
+    updated: u64,
 }
-
-/// How many of the newest threads the history menu lists.
-const RECENT_THREADS: usize = 10;
 
 #[derive(Default, Serialize, Deserialize)]
 struct ThreadStore {
@@ -79,9 +82,9 @@ struct ThreadStore {
 
 /// The agent's model selector as reported through session config options.
 #[derive(Debug, Clone, PartialEq)]
-struct ModelOptions {
-    config_id: String,
-    current: String,
+pub(crate) struct ModelOptions {
+    pub(crate) config_id: String,
+    pub(crate) current: String,
     choices: Vec<(String, String)>,
 }
 
@@ -154,7 +157,7 @@ enum Event {
         title: Option<String>,
         status: Option<ToolStatus>,
     },
-    ToolDetails(String, String),
+    ToolDetails(String, String, Vec<crate::ai_diff::FileDiff>),
     Done,
     Error(String),
 }
@@ -162,6 +165,8 @@ enum Event {
 pub struct AcpState {
     pub attachments: Vec<crate::ai_context::Attachment>,
     provider: &'static str,
+    /// Where conversations are saved; `None` keeps them in memory only (tests).
+    store_dir: Option<PathBuf>,
     session_grants: std::collections::HashSet<String>,
     loaded: bool,
     cwd: Option<PathBuf>,
@@ -185,11 +190,15 @@ pub struct AcpState {
     pending_permission: Option<PendingPermission>,
     permission_queue: std::collections::VecDeque<PendingPermission>,
     just_finished: bool,
-    thread_menu_open: bool,
+    history: crate::ai_history::Menu,
     stopping: bool,
     expanded_thinking: Vec<usize>,
     /// Selectable copies of `entries`' message text, kept in step by `sync_selectable`.
     selectable: crate::ai_selectable::Cache,
+    /// Replies rendered as Markdown, kept in step with `selectable`.
+    markdown: crate::ai_markdown::Cache,
+    /// Replies the user switched to plain selectable text.
+    plain_text: std::collections::HashSet<usize>,
 }
 
 impl Default for AcpState {
@@ -197,6 +206,7 @@ impl Default for AcpState {
         Self {
             attachments: Vec::new(),
             provider: "Claude",
+            store_dir: None,
             session_grants: Default::default(),
             loaded: false,
             cwd: None,
@@ -220,10 +230,12 @@ impl Default for AcpState {
             pending_permission: None,
             permission_queue: Default::default(),
             just_finished: false,
-            thread_menu_open: false,
+            history: Default::default(),
             stopping: false,
             expanded_thinking: Vec::new(),
             selectable: Default::default(),
+            markdown: Default::default(),
+            plain_text: Default::default(),
         }
     }
 }
@@ -236,10 +248,13 @@ pub enum Message {
     ToggleModelMenu,
     SelectModel(String),
     NewThread,
-    SwitchThread(usize),
-    DeleteThread(usize),
-    ThreadMenuToggle,
+    History(crate::ai_history::Message),
     ToggleThinking(usize),
+    /// Show reply `usize` as plain selectable text instead of Markdown, or back.
+    TogglePlainText(usize),
+    Markdown(crate::ai_markdown::Action),
+    /// Open diff `.1` of tool call entry `.0` in the preview pane (handled by the app).
+    ViewDiff(usize, usize),
     UsePrompt(String),
     InputChanged(text_editor::Action),
     Send,
@@ -253,12 +268,38 @@ pub enum Message {
 }
 
 impl AcpState {
-    pub fn codex() -> Self { Self { provider: "Codex", ..Self::default() } }
+    pub fn claude() -> Self { Self { store_dir: crate::config_path("acp_threads"), ..Self::default() } }
+    pub fn codex() -> Self { Self { provider: "Codex", ..Self::claude() } }
 
-    /// Keeps the selectable text in step with `entries`; called after every change.
+    pub fn provider(&self) -> &'static str { self.provider }
+
+    /// The model the user last picked, applied to new sessions.
+    pub fn preferred_model(&self) -> Option<String> { self.preferred_model.clone() }
+
+    pub fn input_text(&self) -> String { self.input.text() }
+
+    /// Replaces the draft, leaving the caret at the end.
+    pub fn set_input(&mut self, text: &str) {
+        self.input = text_editor::Content::with_text(text);
+        self.input.perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+    }
+
+    /// Diff `index` of the tool call at entry `entry`.
+    pub fn diff(&self, entry: usize, index: usize) -> Option<&crate::ai_diff::FileDiff> {
+        match self.entries.get(entry)? {
+            Entry::ToolCall { diffs, .. } => diffs.get(index),
+            _ => None,
+        }
+    }
+
+    /// Keeps the selectable and Markdown text in step with `entries`; called after every change.
     fn sync_selectable(&mut self) {
         self.selectable.sync(self.entries.iter().map(|entry| match entry {
             Entry::User { content } | Entry::Assistant { content } => content.as_str(),
+            _ => "",
+        }));
+        self.markdown.sync(self.entries.iter().map(|entry| match entry {
+            Entry::Assistant { content } => content.as_str(),
             _ => "",
         }));
     }
@@ -280,7 +321,7 @@ impl AcpState {
         let mut new_session_id = None;
         let mut transcript_changed = false;
         while let Ok(event) = rx.try_recv() {
-            transcript_changed |= matches!(&event, Event::Delta(_) | Event::ThoughtDelta(_) | Event::ToolCall { .. } | Event::ToolCallUpdate { .. } | Event::ToolDetails(_, _) | Event::Error(_));
+            transcript_changed |= matches!(&event, Event::Delta(_) | Event::ThoughtDelta(_) | Event::ToolCall { .. } | Event::ToolCallUpdate { .. } | Event::ToolDetails(..) | Event::Error(_));
             match event {
                 Event::Delta(text) => Self::append_chunk(&mut self.entries, text, false),
                 Event::ThoughtDelta(text) => Self::append_chunk(&mut self.entries, text, true),
@@ -315,9 +356,10 @@ impl AcpState {
                 Event::ToolCallUpdate { id, title, status } => {
                     Self::upsert_tool_call(&mut self.entries, id, title, status);
                 }
-                Event::ToolDetails(id, details) => {
-                    if let Some(Entry::ToolCall { details: current, .. }) = self.entries.iter_mut().find(|entry| matches!(entry, Entry::ToolCall { id: existing, .. } if existing == &id)) {
+                Event::ToolDetails(id, details, diffs) => {
+                    if let Some(Entry::ToolCall { details: current, diffs: current_diffs, .. }) = self.entries.iter_mut().find(|entry| matches!(entry, Entry::ToolCall { id: existing, .. } if existing == &id)) {
                         if !details.is_empty() { *current = details; }
+                        if !diffs.is_empty() { *current_diffs = diffs; }
                     }
                 }
                 Event::Done => finished = true,
@@ -403,6 +445,7 @@ impl AcpState {
             title: title.unwrap_or_else(|| "Tool call".to_string()),
             status: status.unwrap_or(ToolStatus::Pending),
             details: String::new(),
+            diffs: Vec::new(),
         });
     }
 
@@ -424,7 +467,7 @@ impl AcpState {
         }
         self.loaded = true;
 
-        if let Some(path) = threads_path(cwd, self.provider) {
+        if let Some(path) = self.threads_path(cwd) {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 if let Ok(store) = serde_json::from_str::<ThreadStore>(&text) {
                     self.preferred_model = store.model;
@@ -456,8 +499,12 @@ impl AcpState {
         }
     }
 
+    fn threads_path(&self, cwd: &Path) -> Option<PathBuf> {
+        Some(self.store_dir.as_ref()?.join(threads_file(cwd, self.provider)))
+    }
+
     fn persist(&self, cwd: &Path) {
-        let Some(path) = threads_path(cwd, self.provider) else { return };
+        let Some(path) = self.threads_path(cwd) else { return };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -481,6 +528,7 @@ impl AcpState {
         self.usage_open = false;
         self.stopping = false;
         self.expanded_thinking.clear();
+        self.plain_text.clear();
         self.started = false;
         self.rx = None;
         self.prompt_tx = None;
@@ -562,23 +610,26 @@ impl AcpState {
                                 }
                                 SessionUpdate::ToolCall(tool_call) => {
                                     let details = tool_details(&tool_call.content, tool_call.raw_output.as_ref().or(tool_call.raw_input.as_ref()));
+                                    let diffs = tool_diffs(&tool_call.content);
                                     let id = tool_call.tool_call_id.0.to_string();
                                     let _ = notify_tx.send(Event::ToolCall {
                                         id: tool_call.tool_call_id.0.to_string(),
                                         title: tool_call.title,
                                         status: convert_status(tool_call.status),
                                     });
-                                    let _ = notify_tx.send(Event::ToolDetails(id, details));
+                                    let _ = notify_tx.send(Event::ToolDetails(id, details, diffs));
                                 }
                                 SessionUpdate::ToolCallUpdate(update) => {
-                                    let details = tool_details(update.fields.content.as_deref().unwrap_or_default(), update.fields.raw_output.as_ref().or(update.fields.raw_input.as_ref()));
+                                    let content = update.fields.content.as_deref().unwrap_or_default();
+                                    let details = tool_details(content, update.fields.raw_output.as_ref().or(update.fields.raw_input.as_ref()));
+                                    let diffs = tool_diffs(content);
                                     let id = update.tool_call_id.0.to_string();
                                     let _ = notify_tx.send(Event::ToolCallUpdate {
                                         id: update.tool_call_id.0.to_string(),
                                         title: update.fields.title,
                                         status: update.fields.status.map(convert_status),
                                     });
-                                    let _ = notify_tx.send(Event::ToolDetails(id, details));
+                                    let _ = notify_tx.send(Event::ToolDetails(id, details, diffs));
                                 }
                                 _ => {}
                             }
@@ -731,6 +782,7 @@ impl AcpState {
             prompt.push(attachment.acp());
         }
         self.entries.push(Entry::User { content: display });
+        if let Some(thread) = self.threads.get_mut(self.active_thread) { thread.updated = crate::ai_history::now(); }
         self.streaming = true;
         if let Some(tx) = &self.prompt_tx {
             let (cancel_tx, cancel) = tokio::sync::oneshot::channel();
@@ -771,7 +823,7 @@ impl AcpState {
         if self.streaming { return; }
         self.save_current_thread();
         self.persist(cwd);
-        self.threads.push(Thread::default());
+        self.threads.push(Thread { updated: crate::ai_history::now(), ..Thread::default() });
         self.active_thread = self.threads.len() - 1;
         self.entries.clear();
         self.input = text_editor::Content::new();
@@ -796,9 +848,23 @@ impl AcpState {
         self.persist(cwd);
     }
 
-    /// Newest threads first, with their indices into `threads`.
-    fn recent_threads(&self) -> impl Iterator<Item = (usize, &Thread)> {
-        self.threads.iter().enumerate().rev().take(RECENT_THREADS)
+    /// The history menu's view of the threads; message text is included only while searching.
+    fn history_items(&self) -> Vec<crate::ai_history::Item> {
+        let searching = self.history.open;
+        self.threads.iter().enumerate().map(|(index, thread)| {
+            let entries = if index == self.active_thread { &self.entries } else { &thread.entries };
+            let text = if searching {
+                entries.iter().filter_map(|entry| match entry {
+                    Entry::User { content } | Entry::Assistant { content } => Some(content.as_str()),
+                    _ => None,
+                }).collect::<Vec<_>>().join("\n")
+            } else { String::new() };
+            crate::ai_history::Item { index, title: thread.title.clone(), updated: thread.updated, text }
+        }).collect()
+    }
+
+    fn rename_thread(&mut self, index: usize, title: String) {
+        if let Some(thread) = self.threads.get_mut(index) { thread.title = title; }
     }
 
     /// Removes a thread; deleting the open one opens the newest remaining (or a fresh) thread.
@@ -841,15 +907,26 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
             state.persist(&cwd);
         }
         Message::NewThread => state.new_thread(&cwd),
-        Message::SwitchThread(i) => {
-            state.switch_thread(i, &cwd);
-            state.thread_menu_open = false;
+        Message::History(message) => match state.history.update(message) {
+            Some(crate::ai_history::Action::Switch(i)) => state.switch_thread(i, &cwd),
+            Some(crate::ai_history::Action::Delete(i)) => {
+                state.delete_thread(i);
+                state.persist(&cwd);
+            }
+            Some(crate::ai_history::Action::Rename(i, title)) => {
+                state.rename_thread(i, title);
+                state.persist(&cwd);
+            }
+            None => {}
+        },
+        Message::TogglePlainText(index) => {
+            if !state.plain_text.remove(&index) { state.plain_text.insert(index); }
         }
-        Message::DeleteThread(i) => {
-            state.delete_thread(i);
-            state.persist(&cwd);
-        }
-        Message::UsePrompt(prompt) => state.input = text_editor::Content::with_text(&prompt),
+        Message::Markdown(crate::ai_markdown::Action::Copy(text)) => return iced::clipboard::write(text),
+        Message::Markdown(crate::ai_markdown::Action::Link(url)) => crate::ai_markdown::open_link(&url),
+        // Inserting into the editor and opening diffs are the app's to handle.
+        Message::Markdown(crate::ai_markdown::Action::Insert(_)) | Message::ViewDiff(..) => {}
+        Message::UsePrompt(prompt) => state.set_input(&prompt),
         Message::ToggleThinking(index) => {
             if state.expanded_thinking.contains(&index) {
                 state.expanded_thinking.retain(|i| *i != index);
@@ -857,7 +934,6 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
                 state.expanded_thinking.push(index);
             }
         }
-        Message::ThreadMenuToggle => state.thread_menu_open = !state.thread_menu_open,
         Message::InputChanged(action) => state.input.perform(action),
         Message::Send => state.send(cwd),
         Message::Stop => state.stop(),
@@ -883,7 +959,7 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
 pub fn conversation_controls(state: &AcpState) -> Element<'_, Message> {
     row![
         crate::icon_control(lucide_icons::Icon::Plus, "New conversation", (!state.streaming).then_some(Message::NewThread), false),
-        crate::icon_control(lucide_icons::Icon::History, "Conversation history", Some(Message::ThreadMenuToggle), state.thread_menu_open),
+        crate::icon_control(lucide_icons::Icon::History, "Conversation history", Some(Message::History(crate::ai_history::Message::Toggle)), state.history.open),
     ]
     .spacing(4)
     .into()
@@ -891,58 +967,30 @@ pub fn conversation_controls(state: &AcpState) -> Element<'_, Message> {
 
 pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer::Context<'a>) -> Element<'a, Message> {
     let mut header = column![].spacing(4);
-    if state.thread_menu_open {
-        let mut menu = column![].spacing(2);
-        for (i, thread) in state.recent_threads() {
-            let title = if thread.title.is_empty() {
-                "New thread".to_string()
-            } else {
-                thread.title.clone()
-            };
-            let label = if i == state.active_thread { format!("✓ {title}") } else { title };
-            menu = menu.push(
-                row![
-                    button(text(label))
-                        .width(Length::Fill)
-                        .padding([4, 8])
-                        .style(crate::flat_button_style)
-                        .on_press_maybe((!state.streaming).then_some(Message::SwitchThread(i))),
-                    crate::icon_control(lucide_icons::Icon::Trash2, "Delete conversation", (!state.streaming).then_some(Message::DeleteThread(i)), false),
-                ]
-                .spacing(4)
-                .align_y(iced::Alignment::Center),
-            );
-        }
-        header = header.push(
-            container(menu).padding(4).style(|theme: &iced::Theme| {
-                let palette = theme.extended_palette();
-                iced::widget::container::Style {
-                    background: Some(palette.background.weak.color.into()),
-                    border: iced::Border::default().rounded(6.0),
-                    ..iced::widget::container::Style::default()
-                }
-            }),
-        );
+    if state.history.open {
+        header = header.push(crate::ai_history::view(&state.history, state.history_items(), state.active_thread, !state.streaming).map(Message::History));
     }
     let project = cwd.file_name().unwrap_or(cwd.as_os_str()).to_string_lossy().into_owned();
     header = header.push(text(format!("Project · {project}")).size(12).style(iced::widget::text::secondary));
 
-    let labeled_copyable = |label: &'static str, index: usize, content: &str| -> Element<'_, Message> {
-        // Selectable text when the cache has caught up with this entry; plain text otherwise.
-        let body: Element<'_, Message> = match state.selectable.get(index) {
-            Some(selectable) => crate::ai_selectable::view(selectable, 13.0, move |action| Message::Selectable(index, action)),
-            None => text(content.to_string()).size(13).into(),
+    let labeled_copyable = |label: &'static str, index: usize, content: &str, markdown: bool| -> Element<'_, Message> {
+        let plain = state.plain_text.contains(&index);
+        // Replies render as Markdown unless switched to selectable text. Selectable text needs
+        // the cache to have caught up with this entry; plain text is the fallback.
+        let body: Element<'_, Message> = match (state.markdown.get(index), state.selectable.get(index)) {
+            (Some(parsed), _) if markdown && !plain => crate::ai_markdown::view(parsed, composer.theme, Message::Markdown),
+            (_, Some(selectable)) => crate::ai_selectable::view(selectable, 13.0, move |action| Message::Selectable(index, action)),
+            _ => text(content.to_string()).size(13).into(),
         };
+        let mut heading = row![text(label).size(12), Space::new().width(Length::Fill)].spacing(6).align_y(iced::Alignment::Center);
+        if markdown {
+            heading = heading.push(crate::icon_control(lucide_icons::Icon::TextCursor, if plain { "Show formatted" } else { "Select text" }, Some(Message::TogglePlainText(index)), plain));
+        }
         column![
-            row![
-                text(label).size(12),
-                Space::new().width(Length::Fill),
-                crate::icon_control(lucide_icons::Icon::Copy, "Copy message", Some(Message::Copy(content.to_string())), false),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center),
+            heading.push(crate::icon_control(lucide_icons::Icon::Copy, "Copy message", Some(Message::Copy(content.to_string())), false)),
             body,
         ]
+        .spacing(4)
         .into()
     };
 
@@ -967,7 +1015,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
             }
         }
         let card: Element<'_, Message> = match entry {
-            Entry::ToolCall { title, status, details, .. } => {
+            Entry::ToolCall { title, status, details, diffs, .. } => {
                 let expanded = state.expanded_thinking.contains(&i);
                 let status = *status;
                 let badge = container(text(status.icon()).size(10))
@@ -994,6 +1042,15 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
                 let mut card = column![button(summary).padding(0).width(Length::Fill)
                     .style(crate::flat_button_style)
                     .on_press_maybe((!details.is_empty()).then_some(Message::ToggleThinking(i)))].spacing(10);
+                for (index, diff) in diffs.iter().enumerate() {
+                    let (added, removed) = diff.stats();
+                    card = card.push(button(row![
+                        text(char::from(lucide_icons::Icon::FileDiff)).font(iced::Font::with_name("lucide")).size(13),
+                        text(format!("View diff · {}", diff.file_name())).size(12),
+                        text(format!("+{added} −{removed}")).size(11).style(iced::widget::text::secondary),
+                    ].spacing(6).align_y(iced::Alignment::Center)).padding([3, 6]).style(crate::flat_button_style)
+                        .on_press(Message::ViewDiff(i, index)));
+                }
                 if expanded && !details.is_empty() {
                     card = card.push(container(text(details.clone()).size(12).font(iced::Font::MONOSPACE)).padding(8).width(Length::Fill).style(container::dark));
                 }
@@ -1006,7 +1063,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
                     }
                 }).into()
             }
-            Entry::User { content } => labeled_copyable("You", i, content),
+            Entry::User { content } => labeled_copyable("You", i, content, false),
             Entry::Thinking { content } => {
                 let expanded = state.expanded_thinking.contains(&i);
                 let mut section = column![button(if expanded { "Hide thinking" } else { "Show thinking" })
@@ -1015,7 +1072,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
                 section.into()
             },
             Entry::Assistant { content } => {
-                container(labeled_copyable(state.provider, i, content)).padding(12).width(Length::Fill)
+                container(labeled_copyable(state.provider, i, content, true)).padding(12).width(Length::Fill)
                     .style(|theme: &iced::Theme| {
                         let palette = theme.extended_palette();
                         iced::widget::container::Style {
@@ -1120,35 +1177,38 @@ fn tool_details(content: &[agent_client_protocol::schema::v1::ToolCallContent], 
     use agent_client_protocol::schema::v1::ToolCallContent;
     let mut details = String::new();
     for block in content {
-        match block {
-            ToolCallContent::Diff(diff) => {
-                details.push_str(&format!("{}\n--- Before\n{}\n+++ After\n{}\n", diff.path.display(), diff.old_text.as_deref().unwrap_or("(new file)"), diff.new_text));
-            }
-            ToolCallContent::Content(content) => {
-                if let ContentBlock::Text(text) = &content.content { details.push_str(&text.text); details.push('\n'); }
-            }
-            _ => {}
+        if let ToolCallContent::Content(content) = block {
+            if let ContentBlock::Text(text) = &content.content { details.push_str(&text.text); details.push('\n'); }
         }
+    }
+    // Edits read as hunks rather than two full copies of the file.
+    for diff in tool_diffs(content) {
+        details.push_str(&diff.review_text());
     }
     if let Some(input) = input { details.push_str(&serde_json::to_string_pretty(input).unwrap_or_default()); }
     details
 }
 
-fn threads_path(cwd: &Path, provider: &str) -> Option<PathBuf> {
+fn tool_diffs(content: &[agent_client_protocol::schema::v1::ToolCallContent]) -> Vec<crate::ai_diff::FileDiff> {
+    use agent_client_protocol::schema::v1::ToolCallContent;
+    content.iter().filter_map(|block| match block {
+        ToolCallContent::Diff(diff) => Some(crate::ai_diff::FileDiff {
+            path: diff.path.display().to_string(), old: diff.old_text.clone(), new: diff.new_text.clone(),
+        }),
+        _ => None,
+    }).collect()
+}
+
+/// The per-project conversations file name inside the store directory.
+fn threads_file(cwd: &Path, provider: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     cwd.hash(&mut hasher);
     let hash = hasher.finish();
-    Some(
-        crate::home_dir()?
-            .join(".config")
-            .join("editor")
-            .join("acp_threads")
-            .join(if provider == "Claude" { format!("{hash:x}.json") } else { format!("{hash:x}-codex.json") }),
-    )
+    if provider == "Claude" { format!("{hash:x}.json") } else { format!("{hash:x}-codex.json") }
 }
 
-async fn change_model(connection: &ConnectionTo<Agent>, session: &SessionId, config_id: &str, value: &str) -> Result<ModelOptions, String> {
+pub(crate) async fn change_model(connection: &ConnectionTo<Agent>, session: &SessionId, config_id: &str, value: &str) -> Result<ModelOptions, String> {
     let response = connection.send_request(SetSessionConfigOptionRequest::new(
         session.clone(), config_id.to_owned(), SessionConfigValueId::new(value),
     )).block_task().await.map_err(|err| err.to_string())?;
@@ -1158,11 +1218,11 @@ async fn change_model(connection: &ConnectionTo<Agent>, session: &SessionId, con
 }
 
 /// Agents may resolve a model to a variant of it, e.g. `claude-fable-5-1` to `claude-fable-5-1[1m]`.
-fn is_same_model(requested: &str, reported: &str) -> bool {
+pub(crate) fn is_same_model(requested: &str, reported: &str) -> bool {
     reported.strip_prefix(requested).is_some_and(|suffix| suffix.is_empty() || (suffix.starts_with('[') && suffix.ends_with(']')))
 }
 
-fn model_from_options(options: &[agent_client_protocol::schema::v1::SessionConfigOption]) -> Option<ModelOptions> {
+pub(crate) fn model_from_options(options: &[agent_client_protocol::schema::v1::SessionConfigOption]) -> Option<ModelOptions> {
     use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigOptionCategory, SessionConfigSelectOptions};
     options.iter().find_map(|option| {
         if option.category != Some(SessionConfigOptionCategory::Model) && option.id.0.as_ref() != "model" { return None; }
@@ -1330,7 +1390,7 @@ mod tests {
 
     #[test]
     fn stop_rejects_late_permissions_but_keeps_session_grants() {
-        let mut state = AcpState::codex();
+        let mut state = AcpState { provider: "Codex", ..AcpState::default() };
         let (tx, rx) = mpsc::channel();
         state.rx = Some(rx);
         state.streaming = true;
@@ -1431,13 +1491,56 @@ mod tests {
     }
 
     #[test]
-    fn history_lists_the_newest_threads_first() {
+    fn history_actions_rename_and_persist_per_project() {
+        let store = tempfile::tempdir().unwrap();
+        let project = store.path().join("project");
+        let mut state = AcpState { store_dir: Some(store.path().to_path_buf()), ..Default::default() };
+        state.ensure_loaded(&project);
+        state.entries.push(Entry::User { content: "first question".into() });
+        state.new_thread(&project);
+        assert_eq!(state.threads.len(), 2);
+        assert_eq!(state.threads[0].title, "first question");
+        assert!(state.threads[1].updated > 0);
+        use crate::ai_history::Message as History;
+        let _ = update(&mut state, Message::History(History::Rename(0, "first question".into())), project.clone());
+        let _ = update(&mut state, Message::History(History::RenameInput("Login bug".into())), project.clone());
+        let _ = update(&mut state, Message::History(History::RenameDone), project.clone());
+        let _ = update(&mut state, Message::History(History::Switch(0)), project.clone());
+        assert_eq!(state.active_thread, 0);
+        assert!(matches!(&state.entries[..], [Entry::User { content }] if content == "first question"));
+
+        let mut reloaded = AcpState { store_dir: Some(store.path().to_path_buf()), ..Default::default() };
+        reloaded.ensure_loaded(&project);
+        assert_eq!(reloaded.threads.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), ["Login bug", ""]);
+        assert_eq!(reloaded.active_thread, 0);
+        let _ = update(&mut reloaded, Message::History(History::Delete(1)), project.clone());
+        let mut again = AcpState { store_dir: Some(store.path().to_path_buf()), ..Default::default() };
+        again.ensure_loaded(&project);
+        assert_eq!(again.threads.len(), 1);
+        // Other projects and providers keep separate histories.
+        let mut codex = AcpState { provider: "Codex", store_dir: Some(store.path().to_path_buf()), ..Default::default() };
+        codex.ensure_loaded(&project);
+        assert!(codex.threads[0].entries.is_empty());
+    }
+
+    #[test]
+    fn tool_edits_keep_their_diffs_for_review() {
+        use agent_client_protocol::schema::v1::{Diff, ToolCallContent};
+        let content = vec![ToolCallContent::Diff(Diff::new("src/lib.rs", "new\n").old_text("old\n".to_string()))];
+        let diffs = tool_diffs(&content);
+        assert_eq!(diffs, [crate::ai_diff::FileDiff { path: "src/lib.rs".into(), old: Some("old\n".into()), new: "new\n".into() }]);
+        assert!(tool_details(&content, None).contains("-old\n+new\n"));
+
         let mut state = AcpState::default();
-        state.threads = (0..15).map(|i| titled(&i.to_string())).collect();
-        let recent: Vec<_> = state.recent_threads().map(|(i, t)| (i, t.title.clone())).collect();
-        assert_eq!(recent.len(), RECENT_THREADS);
-        assert_eq!(recent[0], (14, "14".to_string()));
-        assert_eq!(recent[9], (5, "5".to_string()));
+        let (tx, rx) = mpsc::channel();
+        state.rx = Some(rx);
+        tx.send(Event::ToolCall { id: "edit".into(), title: "Edit lib.rs".into(), status: ToolStatus::Completed }).unwrap();
+        tx.send(Event::ToolDetails("edit".into(), "details".into(), diffs.clone())).unwrap();
+        // A later update without content keeps the diff.
+        tx.send(Event::ToolDetails("edit".into(), String::new(), Vec::new())).unwrap();
+        state.poll();
+        assert_eq!(state.diff(0, 0), diffs.first());
+        assert_eq!(state.diff(0, 1), None);
     }
 
     #[test]
@@ -1476,7 +1579,9 @@ mod tests {
     #[test]
     fn provider_histories_are_isolated() {
         let cwd = Path::new("project");
-        assert_ne!(threads_path(cwd, "Claude"), threads_path(cwd, "Codex"));
+        assert_ne!(threads_file(cwd, "Claude"), threads_file(cwd, "Codex"));
+        assert_ne!(threads_file(cwd, "Claude"), threads_file(Path::new("other"), "Claude"));
+        assert!(AcpState::default().threads_path(cwd).is_none(), "tests never write to the user's config");
     }
 
     #[test]
