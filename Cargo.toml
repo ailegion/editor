@@ -1,6 +1,6 @@
 [package]
 name = "editor"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 license-file = "LICENSE.md"
 publish = false
@@ -44,10 +44,11 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2
 gix = { version = "0.87.1", default-features = false, features = ["blob-diff", "index", "excludes", "attributes", "sha1", "parallel"] }
 notify = "8.2.0"
 
-# Routes the native "About editor" app-menu item to the in-app About panel. Already in the tree via winit.
+# Native app menu (About, Check for Updates) and Dock icon on macOS. Already in the tree via winit.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
 
 [package.metadata.bundle]
 name = "editor"

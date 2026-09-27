@@ -259,6 +259,8 @@ fn tabs_to_close(count: usize, anchor: usize, scope: TabCloseScope) -> Vec<usize
 #[derive(Debug, Clone)]
 enum Message {
     CheckUpdate,
+    /// Help / app menu "Check for Updates…": like `CheckUpdate`, but reports the outcome.
+    CheckUpdateFromMenu,
     RestartUpdate,
     TerminalToggle,
     Terminal(terminal::panel::Message),
@@ -389,6 +391,8 @@ struct EditorSession {
 
 struct State {
     updater: updater::Updater,
+    /// A menu-requested update check is running; its outcome is shown as a notice.
+    announce_update_check: bool,
     root: Option<PathBuf>,
     saved_session: EditorSession,
     last_session_write: std::time::Instant,
@@ -505,6 +509,7 @@ impl State {
 
         Self {
             updater: updater::Updater::default(),
+            announce_update_check: false,
             root,
             saved_session: EditorSession::default(),
             last_session_write: std::time::Instant::now() - Duration::from_secs(1),
@@ -1255,6 +1260,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::MarkdownPreview(ai_markdown::Action::Link(url)) => ai_markdown::open_link(&url),
         Message::MarkdownPreview(ai_markdown::Action::Insert(_)) => {}
         Message::CheckUpdate => state.updater.check(),
+        Message::CheckUpdateFromMenu => {
+            if !state.updater.enabled {
+                state.notify("Updates are only available in downloaded release builds");
+            } else if state.updater.ready() {
+                return update(state, Message::RestartUpdate);
+            } else {
+                state.updater.check();
+                // The status bar shows progress; the outcome also gets a notice.
+                state.announce_update_check = true;
+            }
+        }
         Message::About(msg) => task = about::update(&mut state.about, msg).map(Message::About),
         Message::FileBugReport => open_url("https://github.com/ailegion/editor/issues/new"),
         Message::RestartUpdate => {
@@ -2285,10 +2301,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if input { state.refresh_mentions(); }
         }
         Message::Tick => {
-            if about::native_menu_requested() {
-                task = about::update(&mut state.about, about::Message::Open).map(Message::About);
+            match about::native_menu_requested() {
+                Some(about::NativeMenu::About) => task = about::update(&mut state.about, about::Message::Open).map(Message::About),
+                Some(about::NativeMenu::CheckForUpdates) => task = update(state, Message::CheckUpdateFromMenu),
+                None => {}
             }
             state.updater.poll();
+            if state.announce_update_check && !state.updater.busy() {
+                state.announce_update_check = false;
+                let detail = state.updater.detail.clone();
+                state.notify(detail);
+            }
             state.terminal.poll();
             if state.notice.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(8)) { state.notice = None; }
             let cwd = state.root_or_cwd();
@@ -2792,7 +2815,11 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
         (theme_menu_button, menu_tpl(theme_items))
     );
     let help_menu_button = menu_button("Help".to_string(), Message::Noop).width(Length::Shrink);
-    let mut help_items = menu_items!((menu_button("File Bug Report".into(), Message::FileBugReport)));
+    let update_label = if state.updater.ready() { "Restart to Update" } else { "Check for Updates…" };
+    let mut help_items = menu_items!(
+        (menu_button_maybe(update_label.into(), (!state.updater.busy()).then_some(Message::CheckUpdateFromMenu))),
+        (menu_button("File Bug Report".into(), Message::FileBugReport))
+    );
     // macOS already has About in the native app menu.
     if !cfg!(target_os = "macos") {
         help_items.push(Item::new(menu_button("About".into(), Message::About(about::Message::Open))));

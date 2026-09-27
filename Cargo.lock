@@ -1192,7 +1192,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "editor"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "agent-client-protocol",
  "arboard",
@@ -1213,6 +1213,7 @@ dependencies = [
  "notify",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "percent-encoding",
  "portable-pty",
  "regex",

@@ -110,27 +110,39 @@ pub fn view<'a>(state: &'a AboutState, theme: &iced::Theme) -> Element<'a, Messa
     .into()
 }
 
-/// True once after the user picks the native macOS "About editor" menu item. Called every tick;
-/// the first calls also redirect that item, which winit adds after launch, to this panel.
-pub fn native_menu_requested() -> bool {
+/// An item picked in the native macOS app menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub enum NativeMenu {
+    About,
+    CheckForUpdates,
+}
+
+/// The native macOS app-menu item picked since the last call, if any. Called every tick; the
+/// first calls also redirect "About editor", which winit adds after launch, to this panel and
+/// add "Check for Updates…" below it.
+pub fn native_menu_requested() -> Option<NativeMenu> {
     #[cfg(target_os = "macos")]
     {
         native::poll()
     }
     #[cfg(not(target_os = "macos"))]
-    false
+    None
 }
 
 #[cfg(target_os = "macos")]
 mod native {
+    use super::NativeMenu;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, NSObject};
-    use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
-    use objc2_app_kit::NSApplication;
+    use objc2::{define_class, msg_send, sel, AnyThread, MainThreadMarker, MainThreadOnly};
+    use objc2_app_kit::{NSApplication, NSImage, NSMenuItem};
+    use objc2_foundation::{NSData, NSString};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     static HOOKED: AtomicBool = AtomicBool::new(false);
     static REQUESTED: AtomicBool = AtomicBool::new(false);
+    static UPDATE_REQUESTED: AtomicBool = AtomicBool::new(false);
 
     define_class!(
         #[unsafe(super(NSObject))]
@@ -143,16 +155,27 @@ mod native {
             fn show_about(&self, _sender: Option<&AnyObject>) {
                 REQUESTED.store(true, Ordering::Relaxed);
             }
+
+            #[unsafe(method(checkForUpdates:))]
+            fn check_for_updates(&self, _sender: Option<&AnyObject>) {
+                UPDATE_REQUESTED.store(true, Ordering::Relaxed);
+            }
         }
     );
 
-    pub fn poll() -> bool {
+    pub fn poll() -> Option<NativeMenu> {
         if !HOOKED.load(Ordering::Relaxed) {
             if let Some(mtm) = MainThreadMarker::new() {
                 HOOKED.store(hook(mtm), Ordering::Relaxed);
             }
         }
-        REQUESTED.swap(false, Ordering::Relaxed)
+        if REQUESTED.swap(false, Ordering::Relaxed) {
+            Some(NativeMenu::About)
+        } else if UPDATE_REQUESTED.swap(false, Ordering::Relaxed) {
+            Some(NativeMenu::CheckForUpdates)
+        } else {
+            None
+        }
     }
 
     fn hook(mtm: MainThreadMarker) -> bool {
@@ -161,17 +184,34 @@ mod native {
         else {
             return false;
         };
-        let Some(item) = submenu.itemArray().iter().find(|item| item.action() == Some(sel!(orderFrontStandardAboutPanel:)))
+        let Some(index) = submenu.itemArray().iter().position(|item| item.action() == Some(sel!(orderFrontStandardAboutPanel:)))
         else {
             return false;
         };
+        let Some(item) = submenu.itemAtIndex(index as isize) else { return false };
         let target: Retained<Target> = unsafe { msg_send![Target::alloc(mtm), init] };
+        let updates = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("Check for Updates…"),
+                Some(sel!(checkForUpdates:)),
+                &NSString::from_str(""),
+            )
+        };
         unsafe {
             item.setTarget(Some(&target));
             item.setAction(Some(sel!(showAbout:)));
+            updates.setTarget(Some(&target));
         }
+        submenu.insertItem_atIndex(&updates, index as isize + 1);
         // Menu item targets are weak references; the target lives for the whole app.
         std::mem::forget(target);
+        // The Dock icon; also covers runs outside an `.app` bundle (e.g. `cargo run`), where
+        // macOS would otherwise show a generic placeholder.
+        let data = NSData::with_bytes(include_bytes!("../icon.png"));
+        if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
+            unsafe { app.setApplicationIconImage(Some(&image)) };
+        }
         true
     }
 }
