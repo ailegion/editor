@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use crate::directory_tree::DirectoryTree;
 use crate::directory_tree::message::LoadPayload;
-use crate::directory_tree::node::{LoadedEntry, TreeNode};
+use crate::directory_tree::node::{LoadedEntry, TreeNode, basename_in_skip_list};
 
 impl DirectoryTree {
     /// Merge the result of a completed scan into the tree and return
@@ -60,7 +60,7 @@ impl DirectoryTree {
             Ok(entries) => {
                 let mut previous: std::collections::HashMap<_, _> = node.children.drain(..)
                     .map(|child| (child.path.clone(), child)).collect();
-                node.children = build_children(entries, self.config.filter).into_iter().map(|child| {
+                node.children = build_children(entries, &self.config).into_iter().map(|child| {
                     previous.remove(&child.path).filter(|old| old.is_dir == child.is_dir).unwrap_or(child)
                 }).collect();
                 node.error = None;
@@ -177,19 +177,12 @@ fn find_ref<'a>(node: &'a TreeNode, target: &std::path::Path) -> Option<&'a Tree
 /// A `path` with no basename (weird edge case for root-only paths
 /// like `/` that shouldn't appear as prefetch candidates anyway)
 /// returns `false`.
-fn basename_in_skip_list(path: &std::path::Path, skip: &[String]) -> bool {
-    let Some(basename) = path.file_name().and_then(|s| s.to_str()) else {
-        return false;
-    };
-    skip.iter().any(|s| s.eq_ignore_ascii_case(basename))
-}
-
 /// Build a child node list from a flat vec of loaded entries, applying
-/// the display filter in the process.
-fn build_children(entries: &[LoadedEntry], filter: crate::DirectoryFilter) -> Vec<TreeNode> {
+/// the display filter and exclude list in the process.
+fn build_children(entries: &[LoadedEntry], config: &crate::TreeConfig) -> Vec<TreeNode> {
     entries
         .iter()
-        .filter(|e| e.passes(filter))
+        .filter(|e| e.is_visible(config))
         .map(TreeNode::from_entry)
         .collect()
 }

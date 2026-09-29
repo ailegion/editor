@@ -471,7 +471,7 @@ impl State {
         let root = load_last_project();
         let tree = root
             .clone()
-            .map(|p| DirectoryTree::new(p).with_filter(DirectoryFilter::FilesAndFolders).with_icon_theme(std::sync::Arc::new(file_icons::FileIcons)));
+            .map(file_tree);
         let sidebar_visible = load_sidebar_visible();
         let ai_visible = load_ai_visible();
         let themes = theme::ThemeRegistry::load();
@@ -1604,7 +1604,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.reveal_target = Some(path);
                 state.reveal_generation += 1;
                 let generation = state.reveal_generation;
-                let mut tree = DirectoryTree::new(root).with_filter(DirectoryFilter::FilesAndFolders).with_icon_theme(std::sync::Arc::new(file_icons::FileIcons));
+                let mut tree = file_tree(root);
                 if let Some(dir) = state.reveal_queue.pop_front() {
                     task = tree.update(DirectoryTreeEvent::Toggled(dir)).map(move |event| Message::RevealStep(generation, event));
                 }
@@ -1637,9 +1637,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             FileAction::OpenFolder => {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     save_last_project(&path);
-                    state.tree = Some(
-                        DirectoryTree::new(path.clone()).with_filter(DirectoryFilter::FilesAndFolders).with_icon_theme(std::sync::Arc::new(file_icons::FileIcons)),
-                    );
+                    state.tree = Some(file_tree(path.clone()));
                     state.git_preview = None;
                     if let Some(tree) = &mut state.tree {
                         task = tree.update(DirectoryTreeEvent::Toggled(path.clone())).map(Message::Tree);
@@ -3346,6 +3344,44 @@ fn load_app_theme(themes: &theme::ThemeRegistry) -> theme::EditorTheme {
     if light { theme::EditorTheme::default_light() } else { theme::EditorTheme::default_dark() }
 }
 
+/// The file tree for a project root: hidden entries shown, the user's exclude list applied.
+fn file_tree(root: PathBuf) -> DirectoryTree {
+    DirectoryTree::new(root)
+        .with_filter(DirectoryFilter::AllIncludingHidden)
+        .with_exclude(load_tree_exclude())
+        .with_icon_theme(std::sync::Arc::new(file_icons::FileIcons))
+}
+
+const DEFAULT_TREE_EXCLUDE: &str = ".git\n.DS_Store\nThumbs.db\n";
+
+/// Names the file tree never shows, one per line in `file_tree_exclude`.
+fn load_tree_exclude() -> Vec<String> {
+    match config_path("file_tree_exclude") {
+        Some(path) => tree_exclude_at(&path),
+        None => parse_tree_exclude(DEFAULT_TREE_EXCLUDE),
+    }
+}
+
+/// Reads the exclude list at `path`, writing the defaults there first when the file does not
+/// exist yet so users can find and edit it. A file that exists but can't be read is left alone.
+fn tree_exclude_at(path: &Path) -> Vec<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_tree_exclude(&text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(path, DEFAULT_TREE_EXCLUDE);
+            parse_tree_exclude(DEFAULT_TREE_EXCLUDE)
+        }
+        Err(_) => parse_tree_exclude(DEFAULT_TREE_EXCLUDE),
+    }
+}
+
+fn parse_tree_exclude(text: &str) -> Vec<String> {
+    text.lines().map(str::trim).filter(|name| !name.is_empty()).map(str::to_string).collect()
+}
+
 fn save_zoom(zoom: f32) {
     let Some(path) = config_path("zoom") else { return };
     if let Some(parent) = path.parent() {
@@ -3791,6 +3827,27 @@ mod tab_close_tests {
 #[cfg(test)]
 mod saved_state_tests {
     use super::*;
+
+    #[test]
+    fn tree_exclude_file_is_created_once_then_read_as_edited() {
+        let dir = std::env::temp_dir().join(format!("editor-tree-exclude-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config").join("file_tree_exclude");
+
+        // First run: the file is written with the defaults, which are used.
+        assert_eq!(tree_exclude_at(&path), [".git", ".DS_Store", "Thumbs.db"]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), DEFAULT_TREE_EXCLUDE);
+
+        // After that the user's edits win; blank lines and surrounding spaces are ignored.
+        std::fs::write(&path, "node_modules\r\n\n  target  \n").unwrap();
+        assert_eq!(tree_exclude_at(&path), ["node_modules", "target"]);
+
+        // An emptied file means nothing is excluded, and is not refilled with the defaults.
+        std::fs::write(&path, "").unwrap();
+        assert!(tree_exclude_at(&path).is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn markdown_preview_follows_the_buffer() {

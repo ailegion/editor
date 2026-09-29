@@ -174,6 +174,7 @@ impl DirectoryTree {
                     .iter()
                     .map(|&s| s.to_string())
                     .collect(),
+                exclude: Vec::new(),
             },
             cache: TreeCache::default(),
             generation: 0,
@@ -400,7 +401,27 @@ impl DirectoryTree {
             return;
         }
         self.config.filter = filter;
-        rebuild_from_cache(&mut self.root, &self.cache, filter);
+        self.rebuild_visible();
+    }
+
+    /// Set basenames the tree never displays, whatever the filter.
+    /// See [`TreeConfig::exclude`] for the matching rules. Like
+    /// [`with_filter`](Self::with_filter), this re-derives already-loaded
+    /// children from the cache, so it is safe to call at any time.
+    pub fn with_exclude<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config.exclude = names.into_iter().map(Into::into).collect();
+        self.rebuild_visible();
+        self
+    }
+
+    /// Re-derives visible children from the unfiltered cache after the
+    /// filter or exclude list changed, keeping selection and search in step.
+    fn rebuild_visible(&mut self) {
+        rebuild_from_cache(&mut self.root, &self.cache, &self.config);
         // Re-apply selection onto the new node graph. The `selected_paths`
         // Vec is authoritative; the per-node `is_selected` caches
         // need re-syncing after any mutation that drops and recreates
@@ -738,7 +759,7 @@ impl DirectoryTree {
 /// separately in [`DirectoryTree::set_filter`] via
 /// [`DirectoryTree::sync_selection_flag`] because the selection
 /// cursor lives on the widget, not on nodes.
-fn rebuild_from_cache(node: &mut TreeNode, cache: &node::TreeCache, filter: DirectoryFilter) {
+fn rebuild_from_cache(node: &mut TreeNode, cache: &node::TreeCache, config: &TreeConfig) {
     if node.is_dir && node.is_loaded {
         if let Some(cached) = cache.get(&node.path) {
             // Snapshot old children by path so we can carry their
@@ -755,7 +776,7 @@ fn rebuild_from_cache(node: &mut TreeNode, cache: &node::TreeCache, filter: Dire
             node.children = cached
                 .raw
                 .iter()
-                .filter(|e| e.passes(filter))
+                .filter(|e| e.is_visible(config))
                 .map(|e| {
                     // If this child already existed in the old tree,
                     // move it over wholesale — that preserves every
@@ -776,6 +797,6 @@ fn rebuild_from_cache(node: &mut TreeNode, cache: &node::TreeCache, filter: Dire
         }
     }
     for child in &mut node.children {
-        rebuild_from_cache(child, cache, filter);
+        rebuild_from_cache(child, cache, config);
     }
 }

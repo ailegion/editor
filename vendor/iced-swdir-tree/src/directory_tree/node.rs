@@ -180,6 +180,21 @@ impl LoadedEntry {
         }
         true
     }
+
+    /// `true` if this entry should be displayed under `config`: it
+    /// passes the display filter and its name is not excluded.
+    pub(crate) fn is_visible(&self, config: &crate::TreeConfig) -> bool {
+        self.passes(config.filter) && !basename_in_skip_list(&self.path, &config.exclude)
+    }
+}
+
+/// `true` if `path`'s basename is in `skip`: exact match, ASCII
+/// case-insensitive.
+pub(crate) fn basename_in_skip_list(path: &Path, skip: &[String]) -> bool {
+    let Some(basename) = path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    skip.iter().any(|s| s.eq_ignore_ascii_case(basename))
 }
 
 /// A path → children cache so that collapsing and re-expanding a folder

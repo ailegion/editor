@@ -623,6 +623,48 @@ fn toggled_clears_a_pending_prefetch_entry() {
 
 /// Build /r with a `.git/`-alongside-real children tree so the
 /// skip list has something to exclude.
+fn child_names(tree: &DirectoryTree) -> Vec<String> {
+    tree.root
+        .children
+        .iter()
+        .map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn excluded_names_are_never_displayed_even_with_hidden_entries_shown() {
+    let mut tree = DirectoryTree::new(PathBuf::from("/r"))
+        .with_filter(crate::DirectoryFilter::AllIncludingHidden)
+        .with_exclude([".git", "thumbs.db"]);
+    tree.root.is_dir = true;
+    tree.root.is_expanded = true;
+    let entry = |name: &str, is_dir: bool| LoadedEntry {
+        path: PathBuf::from(format!("/r/{name}")),
+        is_dir,
+        is_symlink: false,
+        is_hidden: name.starts_with('.'),
+    };
+    let payload = LoadPayload {
+        path: PathBuf::from("/r"),
+        generation: tree.generation,
+        depth: 0,
+        result: std::sync::Arc::new(Ok(vec![
+            entry(".git", true),
+            entry(".github", true),
+            entry("src", true),
+            entry(".gitignore", false),
+            entry("Thumbs.db", false),
+        ])),
+    };
+    let _ = tree.update(DirectoryTreeEvent::Loaded(payload));
+    // Hidden entries show; excluded ones don't, matched case-insensitively.
+    assert_eq!(child_names(&tree), [".github", "src", ".gitignore"]);
+
+    // Changing the list later re-derives the loaded children from the cache.
+    let tree = tree.with_exclude(["src"]);
+    assert_eq!(child_names(&tree), [".git", ".github", ".gitignore", "Thumbs.db"]);
+}
+
 fn tree_with_git_and_src() -> DirectoryTree {
     let mut tree = DirectoryTree::new(PathBuf::from("/r"));
     tree.root.is_dir = true;

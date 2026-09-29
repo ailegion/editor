@@ -178,6 +178,12 @@ pub struct TreeConfig {
     /// [`DirectoryTree`]: crate::DirectoryTree
     /// [`with_prefetch_skip`]: crate::DirectoryTree::with_prefetch_skip
     pub prefetch_skip: Vec<String>,
+    /// Basenames the tree never displays, whatever the
+    /// [`filter`](Self::filter). Matched like
+    /// [`prefetch_skip`](Self::prefetch_skip): exact basename, ASCII
+    /// case-insensitive. Empty by default; set it with
+    /// [`with_exclude`](crate::DirectoryTree::with_exclude).
+    pub exclude: Vec<String>,
 }
 
 #[cfg(test)]
