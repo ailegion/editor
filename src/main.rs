@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod about;
+mod agent_launch;
 mod ai_usage;
 mod updater;
 mod ai_approval;
@@ -2320,6 +2321,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.chat.set_project(&cwd);
             state.acp.ensure_loaded(&cwd);
             state.codex.ensure_loaded(&cwd);
+            // Only a Claude or Codex chat needs the shell PATH, so look it up once one is open.
+            if state.ai_visible && matches!(state.ai_mode, AiMode::Acp | AiMode::Codex) { agent_launch::warm_up(); }
             state.chat.poll();
             state.acp.poll();
             state.codex.poll();

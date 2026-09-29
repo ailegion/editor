@@ -8,7 +8,7 @@ use agent_client_protocol::schema::v1::{
     ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SessionNotification, SessionUpdate, TextContent,
 };
-use agent_client_protocol::{AcpAgent, Agent, ConnectionTo};
+use agent_client_protocol::{Agent, ConnectionTo};
 
 #[derive(Debug, Clone)]
 pub enum Backend {
@@ -63,10 +63,9 @@ fn http_reply(body: &str) -> Result<String, String> {
 
 async fn ask_agent(provider: &'static str, model: Option<String>, cwd: PathBuf, prompt: String) -> Result<String, String> {
     let package = if provider == "Codex" { "@agentclientprotocol/codex-acp" } else { "@agentclientprotocol/claude-agent-acp" };
-    let agent = AcpAgent::from_args([if cfg!(windows) { "npx.cmd" } else { "npx" }, "--yes", package])
-        .map_err(|err| err.to_string())?;
+    let agent = crate::agent_launch::agent(package)?;
     let reply = Arc::new(Mutex::new(String::new()));
-    connect(agent, reply.clone(), cwd, prompt, model).await.map_err(|err| err.to_string())?;
+    connect(agent, reply.clone(), cwd, prompt, model).await.map_err(|err| crate::agent_launch::describe(&err))?;
     let reply = reply.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
     Ok(reply)
 }

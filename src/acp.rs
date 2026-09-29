@@ -12,7 +12,7 @@ use agent_client_protocol::schema::v1::{
     RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigValueId, SessionId, SessionNotification,
     SessionUpdate, SetSessionConfigOptionRequest, TextContent, ToolCallStatus,
 };
-use agent_client_protocol::{AcpAgent, Agent, ConnectionTo};
+use agent_client_protocol::{Agent, ConnectionTo};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -566,11 +566,11 @@ impl AcpState {
             };
 
             runtime.block_on(async move {
-                let agent = match AcpAgent::from_args([if cfg!(windows) { "npx.cmd" } else { "npx" }, "--yes", if provider == "Codex" { "@agentclientprotocol/codex-acp" } else { "@agentclientprotocol/claude-agent-acp" }])
+                let agent = match crate::agent_launch::agent(if provider == "Codex" { "@agentclientprotocol/codex-acp" } else { "@agentclientprotocol/claude-agent-acp" })
                 {
                     Ok(agent) => agent,
                     Err(err) => {
-                        let _ = tx.send(Event::Error(err.to_string()));
+                        let _ = tx.send(Event::Error(err));
                         return;
                     }
                 };
@@ -752,7 +752,7 @@ impl AcpState {
                                     let _ = loop_tx.send(Event::Done);
                                 }
                                 Err(err) => {
-                                    let _ = loop_tx.send(Event::Error(err.to_string()));
+                                    let _ = loop_tx.send(Event::Error(crate::agent_launch::describe(&err)));
                                 }
                             }
                         }
@@ -761,7 +761,7 @@ impl AcpState {
                     .await;
 
                 if let Err(err) = result {
-                    let _ = tx.send(Event::Error(err.to_string()));
+                    let _ = tx.send(Event::Error(crate::agent_launch::describe(&err)));
                 }
             });
         });
@@ -972,6 +972,9 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
     }
     let project = cwd.file_name().unwrap_or(cwd.as_os_str()).to_string_lossy().into_owned();
     header = header.push(text(format!("Project · {project}")).size(12).style(iced::widget::text::secondary));
+    if crate::agent_launch::node_missing() {
+        header = header.push(container(text(crate::agent_launch::NODE_MISSING).size(12)).padding(8).width(Length::Fill).style(container::danger));
+    }
 
     let labeled_copyable = |label: &'static str, index: usize, content: &str, markdown: bool| -> Element<'_, Message> {
         let plain = state.plain_text.contains(&index);
