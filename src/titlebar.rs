@@ -285,7 +285,8 @@ mod native {
                             let command = if IsZoomed(hwnd) != 0 { SC_RESTORE } else { SC_MAXIMIZE };
                             PostMessageW(hwnd, WM_SYSCOMMAND, command as WPARAM, 0);
                         }
-                        // The app's close handling asks about unsaved changes.
+                        // Same close request as the system button: the app saves unsaved edits to
+                        // its recovery session, then exits.
                         Some(Button::Close) => { PostMessageW(hwnd, WM_CLOSE, 0, 0); }
                         None => {}
                     }

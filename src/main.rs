@@ -343,6 +343,8 @@ enum Message {
     AiModeSelected(AiMode),
     TreeDragReleased,
     TreeDragCancel,
+    /// Move these files and folders into this folder (confirmed by the user).
+    TreeMoveConfirmed(Vec<PathBuf>, PathBuf),
     AiAttach,
     AiFiles(Vec<PathBuf>),
     AiAttachmentsLoaded(AiMode, PathBuf, Vec<Result<ai_context::Attachment, String>>),
@@ -738,6 +740,16 @@ impl State {
             }
         }
         Task::batch(tasks)
+    }
+
+    /// Points open tabs at their new paths after files or folders moved; unsaved edits stay.
+    fn paths_moved(&mut self, moves: &[(PathBuf, PathBuf)]) {
+        for tab in &mut self.tabs {
+            let Some(path) = &tab.path else { continue };
+            if let Some(new_path) = moves.iter().find_map(|(from, to)| moved_path(path, from, to)) {
+                tab.path = Some(new_path);
+            }
+        }
     }
 
     /// A diff or the commit graph covers the editor, so editing keys must not reach the hidden tab.
@@ -1769,6 +1781,27 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 
         Message::ViewAction(action) => state.apply_zoom(action),
 
+        // A drag in the tree ended over a folder; the tree leaves the move to us.
+        Message::Tree(DirectoryTreeEvent::DragCompleted { sources, destination }) => {
+            let name = destination.file_name().map_or_else(|| destination.display().to_string(), |name| name.to_string_lossy().into_owned());
+            let what = match sources.as_slice() {
+                [one] => one.file_name().map_or_else(|| "1 item".to_string(), |name| format!("\"{}\"", name.to_string_lossy())),
+                many => format!("{} items", many.len()),
+            };
+            task = ask(state.window_handle, "Move", format!("Move {what} into \"{name}\"?"), Message::TreeMoveConfirmed(sources, destination));
+        }
+        Message::TreeMoveConfirmed(sources, destination) => {
+            let outcome = move_entries(&sources, &destination);
+            state.paths_moved(&outcome.moved);
+            let mut notice = outcome.problems.clone();
+            if !outcome.moved.is_empty() { notice.insert(0, format!("Moved {} item(s)", outcome.moved.len())); }
+            if !notice.is_empty() { state.notify(notice.join("\n")); }
+            let mut dirs: Vec<PathBuf> = outcome.moved.iter().filter_map(|(from, _)| from.parent().map(Path::to_path_buf)).collect();
+            dirs.push(destination);
+            dirs.sort();
+            dirs.dedup();
+            task = Task::batch(dirs.into_iter().map(refresh_dir_task));
+        }
         Message::Tree(event) => {
             if state.reveal_target.is_some() && matches!(&event, DirectoryTreeEvent::Loaded(_)) { return Task::none(); }
             if !matches!(&event, DirectoryTreeEvent::Loaded(_)) {
@@ -1872,13 +1905,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     if renamed.is_ok() {
                         state.renaming = None;
                         state.notify("Renamed successfully");
-                        if let Some(tab) = state
-                            .tabs
-                            .iter_mut()
-                            .find(|t| t.path.as_deref() == Some(old_path.as_path()))
-                        {
-                            tab.path = Some(new_path);
-                        }
+                        // Also tabs for files inside a renamed folder.
+                        state.paths_moved(&[(old_path.clone(), new_path)]);
                         if let Some(parent) = old_path.parent() {
                             task = refresh_dir_task(parent.to_path_buf());
                         }
@@ -3382,6 +3410,40 @@ fn valid_entry_name(name: &str) -> bool {
         && !name.contains(['/', '\\', '\0'])
 }
 
+/// What moving files into a folder did: `(from, to)` for each move, and why others were skipped.
+#[derive(Debug, Default, PartialEq)]
+struct MoveOutcome {
+    moved: Vec<(PathBuf, PathBuf)>,
+    problems: Vec<String>,
+}
+
+/// Moves `sources` into `destination` by renaming, never overwriting. Items already there are
+/// left alone, and so is anything inside another moved folder (it moves with that folder).
+fn move_entries(sources: &[PathBuf], destination: &Path) -> MoveOutcome {
+    let mut outcome = MoveOutcome::default();
+    for source in sources {
+        if sources.iter().any(|other| other != source && source.starts_with(other)) { continue; }
+        if source.parent() == Some(destination) { continue; }
+        let Some(name) = source.file_name() else { continue };
+        let target = destination.join(name);
+        let label = name.to_string_lossy();
+        if std::fs::symlink_metadata(&target).is_ok() {
+            outcome.problems.push(format!("{label} already exists there"));
+            continue;
+        }
+        match std::fs::rename(source, &target) {
+            Ok(()) => outcome.moved.push((source.clone(), target)),
+            Err(err) => outcome.problems.push(format!("Could not move {label}: {err}")),
+        }
+    }
+    outcome
+}
+
+/// Where `path` is after `from` moved to `to`: itself, or a file inside a moved folder.
+fn moved_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    path.strip_prefix(from).ok().map(|rest| if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) })
+}
+
 fn write_session(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let pending = path.with_extension("pending");
@@ -3848,6 +3910,44 @@ mod session_tests {
         assert!(restored == session);
         assert!(!path.with_extension("pending").exists());
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tree_move_tests {
+    use super::*;
+
+    #[test]
+    fn dragged_items_move_into_the_folder_without_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let dest = root.join("dest");
+        std::fs::create_dir_all(root.join("src/nested")).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        for file in ["a.txt", "clash.txt", "src/lib.rs", "src/nested/x.rs", "dest/clash.txt", "dest/kept.txt"] {
+            std::fs::write(root.join(file), file).unwrap();
+        }
+        let sources = ["a.txt", "src", "src/nested/x.rs", "clash.txt", "dest/kept.txt"].map(|path| root.join(path));
+        let outcome = move_entries(&sources, &dest);
+        assert_eq!(outcome.moved, [(root.join("a.txt"), dest.join("a.txt")), (root.join("src"), dest.join("src"))]);
+        assert_eq!(outcome.problems, ["clash.txt already exists there"]);
+        assert_eq!(std::fs::read_to_string(dest.join("src/nested/x.rs")).unwrap(), "src/nested/x.rs", "moved with its folder");
+        assert_eq!(std::fs::read_to_string(dest.join("clash.txt")).unwrap(), "dest/clash.txt", "never overwritten");
+        assert!(root.join("clash.txt").exists());
+        assert!(dest.join("kept.txt").exists(), "already in the folder: left alone");
+        assert!(!root.join("a.txt").exists() && !root.join("src").exists());
+
+        let gone = move_entries(&[root.join("missing.txt")], &dest);
+        assert!(gone.moved.is_empty() && gone.problems.len() == 1);
+    }
+
+    #[test]
+    fn open_paths_follow_moved_files_and_folders() {
+        let (from, to) = (Path::new("/p/src"), Path::new("/p/lib/src"));
+        assert_eq!(moved_path(Path::new("/p/src"), from, to), Some(PathBuf::from("/p/lib/src")));
+        assert_eq!(moved_path(Path::new("/p/src/a/b.rs"), from, to), Some(PathBuf::from("/p/lib/src/a/b.rs")));
+        assert_eq!(moved_path(Path::new("/p/srcx/b.rs"), from, to), None, "a similar name is not inside");
+        assert_eq!(moved_path(Path::new("/p/other.rs"), from, to), None);
     }
 }
 
