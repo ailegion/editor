@@ -175,9 +175,8 @@ mod tests {
         run(root, &Action::Create("feature/x".into())).unwrap();
         assert_eq!(current(root), "feature/x");
         commit(root, "b.txt", "Feature work");
-        let err = run(root, &Action::Create("first".into())).unwrap_err();
-        assert!(err.contains("already exists"), "{err}");
-        for invalid in ["bad name", "-bad", "a..b"] {
+        // Outcomes only: git words its messages in the user's language.
+        for invalid in ["first", "bad name", "-bad", "a..b"] {
             assert!(run(root, &Action::Create(invalid.into())).is_err(), "{invalid}");
         }
         assert_eq!(current(root), "feature/x");

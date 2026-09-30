@@ -7,6 +7,7 @@
 pub mod cli;
 pub mod blame;
 pub mod branches;
+pub mod remote;
 pub mod repo;
 pub mod status;
 mod watch;
@@ -41,6 +42,8 @@ pub struct GitState {
     /// Directories collapsed in tree view, by repository-relative path.
     collapsed: HashSet<String>,
     picker: BranchPicker,
+    /// The ⋯ menu with fetch, pull and push.
+    sync_menu: bool,
 }
 
 /// The branch picker opened from the branch name, like Zed's.
@@ -85,6 +88,11 @@ pub enum Message {
     Branch(branches::Action),
     /// Checked out a branch; the app reloads open files and diffs.
     BranchDone(Result<(), String>),
+    ToggleSyncMenu,
+    CloseSyncMenu,
+    Sync(remote::Sync),
+    /// A pull may have changed files even when it failed (conflicts); the app reloads them.
+    SyncDone(remote::Sync, Result<(), String>),
 }
 
 fn branch_query_id() -> iced::widget::Id {
@@ -198,6 +206,22 @@ pub fn update(state: &mut GitState, message: Message, cwd: PathBuf) -> Task<Mess
                 Err(err) => state.error = Some(err),
             }
         }
+        Message::ToggleSyncMenu => state.sync_menu = !state.sync_menu,
+        Message::CloseSyncMenu => state.sync_menu = false,
+        Message::Sync(sync) => {
+            state.sync_menu = false;
+            if state.committing { return Task::none(); }
+            state.committing = true;
+            return Task::perform(async move {
+                tokio::task::spawn_blocking(move || remote::run(&cwd, sync)).await.map_err(|err| err.to_string())?
+            }, move |result| Message::SyncDone(sync, result));
+        }
+        Message::SyncDone(_, result) => {
+            state.committing = false;
+            // Refresh either way: ahead/behind moved, or a failed pull left conflicts.
+            if let Err(err) = result { state.error = Some(err); }
+            return refresh(state, cwd);
+        }
         Message::Staged(result) => {
             state.committing = false;
             match result {
@@ -280,14 +304,6 @@ fn refresh(state: &mut GitState, cwd: PathBuf) -> Task<Message> {
 }
 
 pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Message> {
-    let header = row![
-        text("SOURCE CONTROL").size(12),
-        Space::new().width(Length::Fill),
-        crate::icon_control(lucide_icons::Icon::RefreshCw, "Refresh source control", Some(Message::Refresh), false),
-    ]
-    .spacing(6)
-    .align_y(iced::Alignment::Center);
-
     let branch_icon: char = lucide_icons::Icon::GitBranch.into();
     let label = state.status.branch.label();
     let mut branch = row![
@@ -303,6 +319,20 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
         .on_press_maybe((!state.committing).then_some(Message::ToggleBranches));
     let branch = iced_aw::DropDown::new(branch_button, branch_picker(&state.picker, &label), state.picker.open)
         .alignment(iced_aw::drop_down::Alignment::Bottom).on_dismiss(Message::CloseBranches);
+    let sync_items = remote::Sync::ALL.into_iter().fold(column![].spacing(1), |menu, sync| {
+        menu.push(button(text(sync.label()).size(13)).width(Length::Fill).padding([4, 10]).style(crate::flat_button_style)
+            .on_press_maybe((!state.committing).then_some(Message::Sync(sync))))
+    });
+    let sync_menu = iced_aw::DropDown::new(
+        crate::icon_control(lucide_icons::Icon::Ellipsis, "Fetch, pull, push", Some(Message::ToggleSyncMenu), state.sync_menu),
+        container(sync_items).padding(4).style(crate::overlay_style),
+        state.sync_menu,
+    ).width(140).alignment(iced_aw::drop_down::Alignment::Bottom).on_dismiss(Message::CloseSyncMenu);
+    let header = row![
+        branch,
+        crate::icon_control(lucide_icons::Icon::RefreshCw, "Refresh source control", Some(Message::Refresh), false),
+        sync_menu,
+    ].spacing(4).align_y(iced::Alignment::Center);
     let mut files_col = column![].spacing(2);
     if state.status.files.is_empty() && state.error.is_none() {
         files_col = files_col.push(container(text("Working tree clean").size(13)).padding([16, 0]));
@@ -434,7 +464,7 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
         crate::icon_control(lucide_icons::Icon::ListTree, if state.tree_view { "Show as flat list" } else { "Show as tree" }, Some(Message::ToggleTreeView), state.tree_view),
     ].spacing(6).align_y(iced::Alignment::Center);
 
-    container(column![header, branch, bottom, iced::widget::rule::horizontal(1), changes, files_list].spacing(8))
+    container(column![header, bottom, iced::widget::rule::horizontal(1), changes, files_list].spacing(8))
         .padding(8)
         .height(Length::Fill)
         .into()
@@ -823,6 +853,27 @@ mod tests {
         assert!(state.error.as_deref().unwrap().contains("overwritten"));
         let _ = update(&mut state, Message::CloseBranches, cwd);
         assert!(!state.picker.open);
+    }
+
+    #[test]
+    fn sync_menu_runs_one_git_command_at_a_time_and_keeps_errors() {
+        use remote::Sync;
+        let mut state = GitState::default();
+        let cwd = PathBuf::from(".");
+        let _ = update(&mut state, Message::ToggleSyncMenu, cwd.clone());
+        assert!(state.sync_menu);
+        let _ = update(&mut state, Message::Sync(Sync::Pull), cwd.clone());
+        assert!(state.committing && !state.sync_menu);
+        let _ = update(&mut state, Message::ToggleSyncMenu, cwd.clone());
+        let _ = update(&mut state, Message::Sync(Sync::Push), cwd.clone());
+        assert!(state.committing && !state.sync_menu, "a second command waits for the first");
+        let _ = update(&mut state, Message::SyncDone(Sync::Pull, Err("CONFLICT (content): Merge conflict in a.txt".into())), cwd.clone());
+        assert!(!state.committing);
+        assert!(state.error.as_deref().unwrap().contains("CONFLICT"));
+        assert!(state.refreshing, "status reloads even after a failure");
+        let _ = update(&mut state, Message::ToggleSyncMenu, cwd.clone());
+        let _ = update(&mut state, Message::CloseSyncMenu, cwd);
+        assert!(!state.sync_menu);
     }
 
     #[test]
