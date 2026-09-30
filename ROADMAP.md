@@ -53,23 +53,30 @@ for a "minimal, no-bloat" positioning.
 | Quick open / fuzzy file switcher | ✅ Ctrl+P | ✅ Cmd+P (done) |
 | Go to line | ✅ Ctrl+G | ✅ Cmd+G (done) |
 | Multi-cursor / column select | ✅ | ❌ single cursor only |
-| Find in file: regex | ✅ | ❌ plain substring only |
-| LSP (autocomplete, hover, diagnostics, go-to-def) | ✅ | ❌ none |
+| Find in file: regex | ✅ | ✅ `.*` toggle in the find bar (done) |
+| LSP (autocomplete, hover, diagnostics, go-to-def) | ✅ | ⚠️ diagnostics, hover and go-to-definition (F12); no autocomplete |
 | Diff gutter in editor (vs. git HEAD) | ✅ | ✅ (done) |
-| Stage individual files / hunks | ✅ | ❌ stage-all only |
+| Stage individual files / hunks | ✅ | ⚠️ per-file staging done; hunk staging ❌ |
+| Branch switch / create | ✅ | ✅ branch picker with search and local/remote filter (done) |
+| Fetch / pull / push | ✅ | ✅ source control ⋯ menu (done) |
+| Commit graph / history | ✅ (Zed, VS Code, JetBrains; extensions elsewhere) | ✅ Git: Show Graph, with commit files and diffs (done) |
+| Inline blame | ✅ | ✅ (done) |
 | Word wrap toggle | ✅ | ❌ none (code editor doesn't wrap) |
-| Bracket matching / auto-close | ✅ | ❌ none |
-| Code folding | ✅ | ❌ none |
+| Bracket matching / auto-close | ✅ | ✅ (done) |
+| Code folding | ✅ | ✅ (done) |
+| Markdown preview | ✅ | ✅ toggle for `.md` files (done) |
 | Minimap | ✅ (VS Code/Zed/Sublime) | ❌ none (low priority for "no-bloat") |
-| Split editor panes (multiple editors side by side) | ✅ | ❌ pane_grid only splits sidebar/editor/AI |
-| Integrated terminal | ✅ | ❌ none |
+| Split editor panes (multiple editors side by side) | ✅ | ❌ pane_grid only splits sidebar/editor/AI/terminal |
+| Integrated terminal | ✅ | ✅ Ctrl+` (done) |
+| AI chat / agents | ✅ (VS Code, Zed, JetBrains) | ✅ OpenAI-compatible HTTP, Claude and Codex via ACP (done) |
+| Inline AI edit | ✅ (VS Code, Zed, JetBrains) | ✅ Cmd+K (done) |
 | Settings UI / config file | ✅ | ⚠️ many individual flat files under `~/.config/editor/`; no unified settings UI beyond AI connections |
 | Extensions / plugins | ✅ | ❌ intentionally out of scope |
-| Drag-and-drop to open files | ✅ | ❌ none |
-| Recent files list | ✅ | ❌ only last *project* |
+| Drag-and-drop to open files | ✅ | ❌ dropped files only attach to the AI chat input |
+| Recent files list | ✅ | ✅ recently opened files in Quick Open (done) |
 | Auto-save | ✅ (optional) | ❌ manual save only |
-| Diagnostics/problems panel | ✅ | ❌ none (depends on LSP) |
-| Outline / symbols view | ✅ | ❌ none (depends on LSP) |
+| Diagnostics/problems panel | ✅ | ⚠️ no panel; error/warning counts and the current line's message in the status bar |
+| Outline / symbols view | ✅ | ❌ none |
 
 ## Proposed plan
 
