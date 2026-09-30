@@ -50,6 +50,13 @@ objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-foundation = "0.3"
 
+# Themed title bar with the menu on the same line (`titlebar.rs`). Already in the tree via winit.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging",
+] }
+
 [package.metadata.bundle]
 name = "editor"
 identifier = "io.github.ailegion.editor"

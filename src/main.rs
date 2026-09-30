@@ -23,6 +23,7 @@ mod command_palette;
 mod git;
 mod file_icons;
 mod git_diff;
+mod titlebar;
 mod git_graph;
 mod git_preview;
 mod goto_line;
@@ -2425,6 +2426,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::PaintInitialWindow(id, raw) => {
             state.startup_window = Some(raw);
             state.window_handle = Some(raw);
+            // Before the first paint, so the window never shows the system title bar.
+            #[cfg(windows)]
+            if let Err(err) = titlebar::install(raw) { state.notify(err); }
             if !paint_hidden_window(raw, state.startup_maximized) {
                 // Do not leave the app invisible if the native paint request fails.
                 cloak_startup_window(raw, false);
@@ -2904,14 +2908,23 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
 
     let project = state.root.as_ref().and_then(|path| path.file_name())
         .map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Editor".into());
-    container(row![
-        mb,
+    // On Windows this row is the title bar: its empty middle drags the window (see `titlebar`).
+    let custom = titlebar::custom();
+    let caption = titlebar::caption(row![
         Space::new().width(Length::Fill),
         text(project).size(12).style(iced::widget::text::secondary),
+    ].align_y(iced::Alignment::Center).width(Length::Fill).height(if custom { Length::Fill } else { Length::Shrink }));
+    let bar = container(row![
+        mb,
+        caption,
         icon_control(lucide_icons::Icon::Search, "Find a file", Some(Message::ToggleQuickOpen), false),
         icon_control(lucide_icons::Icon::Command, "Command palette", Some(Message::ToggleCommandPalette), false),
-    ].spacing(4).align_y(iced::Alignment::Center))
-        .padding([2, 6]).style(chrome_style).into()
+    ].spacing(4).align_y(iced::Alignment::Center).height(if custom { Length::Fill } else { Length::Shrink }))
+        .padding(if custom { [0, 6] } else { [2, 6] }).width(Length::Fill);
+    let bar = row![bar, titlebar::buttons(titlebar::maximized())]
+        .align_y(iced::Alignment::Center)
+        .height(if custom { Length::Fixed(titlebar::HEIGHT) } else { Length::Shrink });
+    container(bar).style(chrome_style).into()
 }
 
 fn view_status_bar(state: &State) -> Element<'_, Message> {
