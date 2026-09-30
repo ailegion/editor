@@ -420,13 +420,6 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
         bottom = bottom.push(scrollable(text(err.clone()).size(12).font(iced::Font::MONOSPACE).style(iced::widget::text::danger)).height(Length::Shrink));
     }
     let has_staged = state.status.files.iter().any(ChangedFile::staged);
-    bottom = bottom.push(row![
-        text("Message").size(12).style(iced::widget::text::secondary),
-        Space::new().width(Length::Fill),
-        text(if state.generating { "Writing…" } else { "" }).size(12).style(iced::widget::text::secondary),
-        crate::icon_control(lucide_icons::Icon::Sparkles, "Write message with AI from staged changes",
-            (has_staged && !state.generating && !state.committing).then_some(Message::GenerateMessage), false),
-    ].spacing(6).align_y(iced::Alignment::Center));
     bottom = bottom.push(
         text_editor(&state.commit_message)
             .placeholder("Describe your changes (Cmd/Ctrl+Enter to commit)")
@@ -444,12 +437,15 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
                 }
             }),
     );
-    bottom = bottom.push(
-        button(text(if state.committing { "Working..." } else { "Commit Staged" }).size(13))
-            .width(Length::Fill)
+    // The AI button stays disabled while a message is being written; the box fills in when done.
+    bottom = bottom.push(row![
+        Space::new().width(Length::Fill),
+        crate::icon_control(lucide_icons::Icon::Sparkles, "Write message with AI from staged changes",
+            (has_staged && !state.generating && !state.committing).then_some(Message::GenerateMessage), false),
+        button(text(if state.committing { "Working..." } else { "Commit" }).size(13))
             .padding([8, 12])
             .on_press_maybe(can_commit(state).then_some(Message::Commit)),
-    );
+    ].spacing(6).align_y(iced::Alignment::Center));
     let to_stage: Vec<ChangedFile> = state.status.files.iter().filter(|file| file.unstaged() || !file.staged()).cloned().collect();
     let to_unstage: Vec<ChangedFile> = state.status.files.iter().filter(|file| file.staged()).cloned().collect();
     let to_discard: Vec<_> = state.status.files.iter().filter(|file| file.unstaged() && !file.conflicted()).cloned().collect();
