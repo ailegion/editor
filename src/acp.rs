@@ -78,9 +78,12 @@ struct ThreadStore {
     /// Model the user last picked; applied to every new or resumed session.
     #[serde(default)]
     model: Option<String>,
+    /// Effort level the user last picked; applied when the session's model offers it.
+    #[serde(default)]
+    effort: Option<String>,
 }
 
-/// The agent's model selector as reported through session config options.
+/// One of the agent's select-style session config options (model or effort).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ModelOptions {
     pub(crate) config_id: String,
@@ -92,6 +95,25 @@ impl ModelOptions {
     fn current_name(&self) -> String {
         self.choices.iter().find(|(id, _)| id == &self.current).map_or_else(|| self.current.clone(), |(_, name)| name.clone())
     }
+}
+
+/// The model and effort selectors the agent reports; effort levels depend on the model.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct SessionConfig {
+    model: Option<ModelOptions>,
+    effort: Option<ModelOptions>,
+}
+
+impl SessionConfig {
+    fn from_options(options: &[agent_client_protocol::schema::v1::SessionConfigOption]) -> Self {
+        Self { model: model_from_options(options), effort: effort_from_options(options) }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Setting {
+    Model,
+    Effort,
 }
 
 struct Usage {
@@ -143,8 +165,8 @@ enum Event {
     Delta(String),
     ThoughtDelta(String),
     Usage(u64, u64, Option<(f64, String)>),
-    Models(Option<ModelOptions>),
-    ModelChanged(Result<ModelOptions, String>),
+    Config(SessionConfig),
+    SettingChanged(Setting, Result<SessionConfig, String>),
     SessionId(String),
     Permission(PendingPermission),
     ToolCall {
@@ -177,7 +199,7 @@ pub struct AcpState {
     rx: Option<Receiver<Event>>,
     prompt_tx: Option<tokio::sync::mpsc::UnboundedSender<PendingPrompt>>,
     cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    model_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, String)>>,
+    model_tx: Option<tokio::sync::mpsc::UnboundedSender<(Setting, String, String)>>,
     streaming: bool,
     started: bool,
     usage: Option<Usage>,
@@ -186,6 +208,10 @@ pub struct AcpState {
     model_switching: bool,
     preferred_model: Option<String>,
     model_menu_open: bool,
+    effort: Option<ModelOptions>,
+    effort_switching: bool,
+    preferred_effort: Option<String>,
+    effort_menu_open: bool,
     usage_open: bool,
     pending_permission: Option<PendingPermission>,
     permission_queue: std::collections::VecDeque<PendingPermission>,
@@ -226,6 +252,10 @@ impl Default for AcpState {
             model_switching: false,
             preferred_model: None,
             model_menu_open: false,
+            effort: None,
+            effort_switching: false,
+            preferred_effort: None,
+            effort_menu_open: false,
             usage_open: false,
             pending_permission: None,
             permission_queue: Default::default(),
@@ -247,6 +277,8 @@ pub enum Message {
     CloseUsage,
     ToggleModelMenu,
     SelectModel(String),
+    ToggleEffortMenu,
+    SelectEffort(String),
     NewThread,
     History(crate::ai_history::Message),
     ToggleThinking(usize),
@@ -325,19 +357,31 @@ impl AcpState {
             match event {
                 Event::Delta(text) => Self::append_chunk(&mut self.entries, text, false),
                 Event::ThoughtDelta(text) => Self::append_chunk(&mut self.entries, text, true),
-                Event::Models(models) => {
-                    self.models = models;
+                Event::Config(config) => {
+                    self.models = config.model;
+                    self.effort = config.effort;
                     self.models_reported = true;
                 }
-                Event::ModelChanged(result) => {
-                    self.model_switching = false;
+                Event::SettingChanged(setting, result) => {
+                    match setting {
+                        Setting::Model => self.model_switching = false,
+                        Setting::Effort => self.effort_switching = false,
+                    }
                     transcript_changed = true;
                     match result {
-                        Ok(models) => {
-                            self.preferred_model = Some(models.current.clone());
-                            self.models = Some(models);
+                        Ok(config) => {
+                            // Remember only what the user picked, not what the agent derived from it.
+                            match setting {
+                                Setting::Model => if let Some(models) = &config.model { self.preferred_model = Some(models.current.clone()); },
+                                Setting::Effort => if let Some(effort) = &config.effort { self.preferred_effort = Some(effort.current.clone()); },
+                            }
+                            self.models = config.model;
+                            self.effort = config.effort;
                         }
-                        Err(err) => Self::append_chunk(&mut self.entries, format!("\n[error: could not change model: {err}]"), false),
+                        Err(err) => {
+                            let what = match setting { Setting::Model => "model", Setting::Effort => "effort" };
+                            Self::append_chunk(&mut self.entries, format!("\n[error: could not change {what}: {err}]"), false);
+                        }
                     }
                 }
                 Event::Usage(used, size, cost) => {
@@ -373,6 +417,7 @@ impl AcpState {
         let disconnected = self.prompt_tx.as_ref().is_some_and(|tx| tx.is_closed());
         if disconnected {
             self.model_switching = false;
+            self.effort_switching = false;
             self.session_grants.clear();
             self.started = false;
             self.prompt_tx = None;
@@ -471,6 +516,7 @@ impl AcpState {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 if let Ok(store) = serde_json::from_str::<ThreadStore>(&text) {
                     self.preferred_model = store.model;
+                    self.preferred_effort = store.effort;
                     if !store.threads.is_empty() {
                         self.threads = store.threads;
                         self.active_thread = store.active.min(self.threads.len() - 1);
@@ -512,6 +558,7 @@ impl AcpState {
             threads: self.threads.clone(),
             active: self.active_thread,
             model: self.preferred_model.clone(),
+            effort: self.preferred_effort.clone(),
         };
         if let Ok(text) = serde_json::to_string(&store) {
             let _ = std::fs::write(path, text);
@@ -524,6 +571,9 @@ impl AcpState {
         self.models_reported = false;
         self.model_switching = false;
         self.model_menu_open = false;
+        self.effort = None;
+        self.effort_switching = false;
+        self.effort_menu_open = false;
         self.model_tx = None;
         self.usage_open = false;
         self.stopping = false;
@@ -548,11 +598,12 @@ impl AcpState {
         self.rx = Some(rx);
         let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel::<PendingPrompt>();
         self.prompt_tx = Some(prompt_tx);
-        let (model_tx, mut model_rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+        let (model_tx, mut model_rx) = tokio::sync::mpsc::unbounded_channel::<(Setting, String, String)>();
         self.model_tx = Some(model_tx);
 
         let provider = self.provider;
         let preferred_model = self.preferred_model.clone();
+        let preferred_effort = self.preferred_effort.clone();
         std::thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -601,7 +652,7 @@ impl AcpState {
                                     }
                                 }
                                 SessionUpdate::ConfigOptionUpdate(update) => {
-                                    let _ = notify_tx.send(Event::Models(model_from_options(&update.config_options)));
+                                    let _ = notify_tx.send(Event::Config(SessionConfig::from_options(&update.config_options)));
                                 }
                                 SessionUpdate::UsageUpdate(usage) => {
                                     let cost = usage.cost.map(|c| (c.amount, c.currency));
@@ -715,19 +766,30 @@ impl AcpState {
                             }
                         };
                         // Apply the remembered model before the first prompt can be sent.
-                        let mut models = model_from_options(&config_options);
+                        let mut config = SessionConfig::from_options(&config_options);
                         if let Some(preferred) = &preferred_model {
-                            let _ = loop_tx.send(Event::Models(models.clone()));
-                            let options = models.as_ref().ok_or_else(|| agent_client_protocol::Error::internal_error().data("Agent did not report a model; saved selection cannot be confirmed"))?;
+                            let _ = loop_tx.send(Event::Config(config.clone()));
+                            let options = config.model.as_ref().ok_or_else(|| agent_client_protocol::Error::internal_error().data("Agent did not report a model; saved selection cannot be confirmed"))?;
                             if !is_same_model(preferred, &options.current) {
                                 // A saved model that cannot be applied must not block chatting with the agent's current model.
-                                match change_model(&connection, &session_id, &options.config_id, preferred).await {
-                                    Ok(changed) => models = Some(changed),
-                                    Err(err) => { let _ = loop_tx.send(Event::ModelChanged(Err(err))); }
+                                let config_id = options.config_id.clone();
+                                match set_config_option(&connection, &session_id, Setting::Model, &config_id, preferred).await {
+                                    Ok(changed) => config = changed,
+                                    Err(err) => { let _ = loop_tx.send(Event::SettingChanged(Setting::Model, Err(err))); }
                                 }
                             }
                         }
-                        let _ = loop_tx.send(Event::Models(models));
+                        // Effort levels differ per model; a saved level this model lacks keeps the agent's choice.
+                        if let (Some(preferred), Some(effort)) = (&preferred_effort, &config.effort) {
+                            if &effort.current != preferred && effort.choices.iter().any(|(id, _)| id == preferred) {
+                                let config_id = effort.config_id.clone();
+                                match set_config_option(&connection, &session_id, Setting::Effort, &config_id, preferred).await {
+                                    Ok(changed) => config = changed,
+                                    Err(err) => { let _ = loop_tx.send(Event::SettingChanged(Setting::Effort, Err(err))); }
+                                }
+                            }
+                        }
+                        let _ = loop_tx.send(Event::Config(config));
                         let _ = loop_tx.send(Event::SessionId(session_id.0.to_string()));
                         loop_accepting.store(true, Ordering::Relaxed);
 
@@ -735,9 +797,9 @@ impl AcpState {
                         let model_session_id = session_id.clone();
                         let model_event_tx = loop_tx.clone();
                         tokio::spawn(async move {
-                            while let Some((config_id, value)) = model_rx.recv().await {
-                                let result = change_model(&model_connection, &model_session_id, &config_id, &value).await;
-                                let _ = model_event_tx.send(Event::ModelChanged(result));
+                            while let Some((setting, config_id, value)) = model_rx.recv().await {
+                                let result = set_config_option(&model_connection, &model_session_id, setting, &config_id, &value).await;
+                                let _ = model_event_tx.send(Event::SettingChanged(setting, result));
                             }
                         });
 
@@ -769,7 +831,7 @@ impl AcpState {
 
     fn send(&mut self, cwd: PathBuf) {
         let text = self.input.text();
-        if (text.trim().is_empty() && self.attachments.is_empty()) || self.streaming || self.model_switching {
+        if (text.trim().is_empty() && self.attachments.is_empty()) || self.streaming || self.model_switching || self.effort_switching {
             return;
         }
         let text = text.trim_end().to_string();
@@ -801,12 +863,22 @@ impl AcpState {
     }
 
     fn select_model(&mut self, value: String) {
-        if self.streaming || self.model_switching { return; }
+        if self.streaming || self.model_switching || self.effort_switching { return; }
         self.model_menu_open = false;
         let Some(models) = &mut self.models else { return };
         if models.current == value { return; }
         if let Some(tx) = &self.model_tx {
-            if tx.send((models.config_id.clone(), value)).is_ok() { self.model_switching = true; }
+            if tx.send((Setting::Model, models.config_id.clone(), value)).is_ok() { self.model_switching = true; }
+        }
+    }
+
+    fn select_effort(&mut self, value: String) {
+        if self.streaming || self.model_switching || self.effort_switching { return; }
+        self.effort_menu_open = false;
+        let Some(effort) = &self.effort else { return };
+        if effort.current == value { return; }
+        if let Some(tx) = &self.model_tx {
+            if tx.send((Setting::Effort, effort.config_id.clone(), value)).is_ok() { self.effort_switching = true; }
         }
     }
 
@@ -899,11 +971,20 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
         Message::CloseUsage => state.usage_open = false,
         Message::ToggleModelMenu => {
             state.model_menu_open = !state.model_menu_open;
+            state.effort_menu_open = false;
             // Models are only reported once a session exists, so connect early to list them.
             if state.model_menu_open { state.connect(cwd); }
         }
         Message::SelectModel(value) => {
             state.select_model(value);
+            state.persist(&cwd);
+        }
+        Message::ToggleEffortMenu => {
+            state.effort_menu_open = !state.effort_menu_open;
+            state.model_menu_open = false;
+        }
+        Message::SelectEffort(value) => {
+            state.select_effort(value);
             state.persist(&cwd);
         }
         Message::NewThread => state.new_thread(&cwd),
@@ -1116,36 +1197,47 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
     if !state.session_grants.is_empty() {
         bottom = bottom.push(button("Reset session approvals").style(crate::flat_button_style).on_press(Message::ResetPermissions));
     }
+    let can_switch = !state.streaming && !state.model_switching && !state.effort_switching;
+    let choice_buttons = |options: &'a ModelOptions, select: fn(String) -> Message| {
+        options.choices.iter().fold(column![].spacing(2), |menu, (id, name)| {
+            let label = if id == &options.current { format!("✓ {name}") } else { name.clone() };
+            menu.push(button(text(label).size(12)).width(Length::Fill).padding([4, 8])
+                .style(crate::flat_button_style)
+                .on_press_maybe(can_switch.then(|| select(id.clone()))))
+        })
+    };
+    let dropdown = |menu: iced::widget::Column<'a, Message>| container(scrollable(menu)).padding(4).max_height(240).style(|theme: &iced::Theme| {
+        let palette = theme.extended_palette();
+        iced::widget::container::Style {
+            background: Some(palette.background.weak.color.into()),
+            border: iced::Border::default().rounded(6.0),
+            ..iced::widget::container::Style::default()
+        }
+    });
     if state.model_menu_open {
-        let mut menu = column![].spacing(2);
-        match &state.models {
-            Some(models) if !models.choices.is_empty() => {
-                for (id, name) in &models.choices {
-                    let label = if id == &models.current { format!("✓ {name}") } else { name.clone() };
-                    menu = menu.push(button(text(label).size(12)).width(Length::Fill).padding([4, 8])
-                        .style(crate::flat_button_style)
-                        .on_press_maybe((!state.streaming && !state.model_switching).then(|| Message::SelectModel(id.clone()))));
-                }
-            }
+        let menu = match &state.models {
+            Some(models) if !models.choices.is_empty() => choice_buttons(models, Message::SelectModel),
             _ if state.started && !state.models_reported => {
-                menu = menu.push(text("Loading models…").size(12).style(iced::widget::text::secondary));
+                column![text("Loading models…").size(12).style(iced::widget::text::secondary)]
             }
             _ => {
-                menu = menu.push(text(format!("{} did not report any selectable models.", state.provider)).size(12).style(iced::widget::text::secondary));
+                column![text(format!("{} did not report any selectable models.", state.provider)).size(12).style(iced::widget::text::secondary)]
             }
-        }
-        bottom = bottom.push(container(scrollable(menu)).padding(4).max_height(240).style(|theme: &iced::Theme| {
-            let palette = theme.extended_palette();
-            iced::widget::container::Style {
-                background: Some(palette.background.weak.color.into()),
-                border: iced::Border::default().rounded(6.0),
-                ..iced::widget::container::Style::default()
-            }
-        }));
+        };
+        bottom = bottom.push(dropdown(menu));
+    }
+    // Only the levels the agent reports for the current model; nothing when it reports none.
+    let effort = state.effort.as_ref().filter(|effort| !effort.choices.is_empty());
+    if let (true, Some(effort)) = (state.effort_menu_open, effort) {
+        bottom = bottom.push(dropdown(choice_buttons(effort, Message::SelectEffort)));
     }
     let model_name = state.models.as_ref().map(ModelOptions::current_name);
     let model_button = button(text(if state.model_switching { "Switching…".into() } else { format!("{} ▾", model_name.clone().unwrap_or_else(|| "Model".into())) }).size(12))
         .padding([2, 6]).style(crate::flat_button_style).on_press(Message::ToggleModelMenu);
+    let effort_button = effort.map(|effort| {
+        button(text(if state.effort_switching { "Switching…".into() } else { format!("{} ▾", effort.current_name()) }).size(12))
+            .padding([2, 6]).style(crate::flat_button_style).on_press(Message::ToggleEffortMenu)
+    });
     let usage_ring = crate::ai_usage::view(crate::ai_usage::Info {
         provider: format!("{} ACP", state.provider), model: model_name,
         used: state.usage.as_ref().map(|u| u.used), capacity: state.usage.as_ref().map(|u| u.size),
@@ -1157,7 +1249,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
         crate::icon_control(lucide_icons::Icon::CircleStop, "Stop response", (!state.stopping).then_some(Message::Stop), false)
     } else {
         crate::icon_control(lucide_icons::Icon::SendHorizonal, "Send message (Cmd/Ctrl+Enter)",
-            (!state.model_switching && !awaiting_permission && (!state.input.text().trim().is_empty() || !state.attachments.is_empty())).then_some(Message::Send), false)
+            (!state.model_switching && !state.effort_switching && !awaiting_permission && (!state.input.text().trim().is_empty() || !state.attachments.is_empty())).then_some(Message::Send), false)
     };
     bottom = bottom.push(crate::ai_composer::view(
         column![
@@ -1167,7 +1259,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
                 .on_action(Message::InputChanged)
                 .height(Length::Fixed(60.0))
                 .key_binding(|key_press| crate::ai_composer::key_binding(key_press, Message::Send, Message::Composer)),
-            row![text(if state.stopping { "Stopping…" } else if awaiting_permission { "Waiting for approval" } else if state.streaming { "Working…" } else { "Ready" }).size(12).style(iced::widget::text::secondary), Space::new().width(Length::Fill), model_button, usage_ring, send_button].spacing(6).align_y(iced::Alignment::Center),
+            row![text(if state.stopping { "Stopping…" } else if awaiting_permission { "Waiting for approval" } else if state.streaming { "Working…" } else { "Ready" }).size(12).style(iced::widget::text::secondary), Space::new().width(Length::Fill), model_button].push(effort_button).push(usage_ring).push(send_button).spacing(6).align_y(iced::Alignment::Center),
         ]
         .spacing(4).into(),
         &state.attachments, composer, Message::Composer,
@@ -1212,12 +1304,32 @@ fn threads_file(cwd: &Path, provider: &str) -> String {
 }
 
 pub(crate) async fn change_model(connection: &ConnectionTo<Agent>, session: &SessionId, config_id: &str, value: &str) -> Result<ModelOptions, String> {
+    set_config_option(connection, session, Setting::Model, config_id, value).await?.model.ok_or_else(|| "Agent did not confirm a model".into())
+}
+
+/// Sets the model or effort and returns the configuration the agent reports afterwards,
+/// which for a model change includes that model's effort levels.
+async fn set_config_option(connection: &ConnectionTo<Agent>, session: &SessionId, setting: Setting, config_id: &str, value: &str) -> Result<SessionConfig, String> {
     let response = connection.send_request(SetSessionConfigOptionRequest::new(
         session.clone(), config_id.to_owned(), SessionConfigValueId::new(value),
     )).block_task().await.map_err(|err| err.to_string())?;
-    let models = model_from_options(&response.config_options).ok_or("Agent did not confirm a model")?;
-    if !is_same_model(value, &models.current) { return Err(format!("Requested {value}, but agent reported {}", models.current)); }
-    Ok(models)
+    let config = SessionConfig::from_options(&response.config_options);
+    confirm_setting(&config, setting, value)?;
+    Ok(config)
+}
+
+fn confirm_setting(config: &SessionConfig, setting: Setting, value: &str) -> Result<(), String> {
+    let (reported, confirmed) = match setting {
+        Setting::Model => {
+            let models = config.model.as_ref().ok_or("Agent did not confirm a model")?;
+            (&models.current, is_same_model(value, &models.current))
+        }
+        Setting::Effort => {
+            let effort = config.effort.as_ref().ok_or("Agent did not confirm an effort level")?;
+            (&effort.current, effort.current == value)
+        }
+    };
+    if confirmed { Ok(()) } else { Err(format!("Requested {value}, but agent reported {reported}")) }
 }
 
 /// Agents may resolve a model to a variant of it, e.g. `claude-fable-5-1` to `claude-fable-5-1[1m]`.
@@ -1226,20 +1338,34 @@ pub(crate) fn is_same_model(requested: &str, reported: &str) -> bool {
 }
 
 pub(crate) fn model_from_options(options: &[agent_client_protocol::schema::v1::SessionConfigOption]) -> Option<ModelOptions> {
-    use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigOptionCategory, SessionConfigSelectOptions};
+    use agent_client_protocol::schema::v1::SessionConfigOptionCategory;
     options.iter().find_map(|option| {
         if option.category != Some(SessionConfigOptionCategory::Model) && option.id.0.as_ref() != "model" { return None; }
-        let SessionConfigKind::Select(select) = &option.kind else { return None };
-        let choices: Vec<_> = match &select.options {
-            SessionConfigSelectOptions::Ungrouped(options) => options.iter().collect(),
-            SessionConfigSelectOptions::Grouped(groups) => groups.iter().flat_map(|group| &group.options).collect(),
-            _ => Vec::new(),
-        };
-        Some(ModelOptions {
-            config_id: option.id.0.to_string(),
-            current: select.current_value.0.to_string(),
-            choices: choices.into_iter().map(|choice| (choice.value.0.to_string(), choice.name.clone())).collect(),
-        })
+        select_options(option)
+    })
+}
+
+/// The agent's reasoning effort selector, identified by the ACP `thought_level` category
+/// rather than an id, since each agent names it differently.
+fn effort_from_options(options: &[agent_client_protocol::schema::v1::SessionConfigOption]) -> Option<ModelOptions> {
+    use agent_client_protocol::schema::v1::SessionConfigOptionCategory;
+    options.iter()
+        .filter(|option| option.category == Some(SessionConfigOptionCategory::ThoughtLevel))
+        .find_map(select_options)
+}
+
+fn select_options(option: &agent_client_protocol::schema::v1::SessionConfigOption) -> Option<ModelOptions> {
+    use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigSelectOptions};
+    let SessionConfigKind::Select(select) = &option.kind else { return None };
+    let choices: Vec<_> = match &select.options {
+        SessionConfigSelectOptions::Ungrouped(options) => options.iter().collect(),
+        SessionConfigSelectOptions::Grouped(groups) => groups.iter().flat_map(|group| &group.options).collect(),
+        _ => Vec::new(),
+    };
+    Some(ModelOptions {
+        config_id: option.id.0.to_string(),
+        current: select.current_value.0.to_string(),
+        choices: choices.into_iter().map(|choice| (choice.value.0.to_string(), choice.name.clone())).collect(),
     })
 }
 
@@ -1264,6 +1390,94 @@ mod tests {
     }
 
     #[test]
+    fn effort_levels_are_whatever_the_agent_reports_for_the_model() {
+        // Shapes taken from claude-agent-acp and codex-acp: different ids and levels, same category.
+        let parse = |value| serde_json::from_value::<Vec<agent_client_protocol::schema::v1::SessionConfigOption>>(value).unwrap();
+        let claude = SessionConfig::from_options(&parse(serde_json::json!([
+            {"id":"model", "category":"model", "name":"Model", "type":"select", "currentValue":"opus", "options":[{"value":"opus", "name":"Opus"}]},
+            {"id":"effort", "category":"thought_level", "name":"Effort", "type":"select", "currentValue":"default", "options":[
+                {"value":"default", "name":"Default"}, {"value":"low", "name":"Low"}, {"value":"x_high", "name":"X High"}
+            ]}
+        ])));
+        let effort = claude.effort.unwrap();
+        assert_eq!(effort.config_id, "effort");
+        assert_eq!(effort.current_name(), "Default");
+        assert_eq!(effort.choices, vec![("default".into(), "Default".into()), ("low".into(), "Low".into()), ("x_high".into(), "X High".into())]);
+        assert_eq!(claude.model.unwrap().current, "opus");
+
+        let codex = SessionConfig::from_options(&parse(serde_json::json!([
+            {"id":"reasoning_effort", "category":"thought_level", "name":"Reasoning effort", "type":"select", "currentValue":"medium", "options":[
+                {"value":"minimal", "name":"Minimal"}, {"value":"medium", "name":"Medium"}
+            ]}
+        ])));
+        assert_eq!(codex.effort.unwrap().config_id, "reasoning_effort");
+
+        // A model without effort support reports no selector, so none is shown.
+        let none = SessionConfig::from_options(&parse(serde_json::json!([
+            {"id":"model", "category":"model", "name":"Model", "type":"select", "currentValue":"haiku", "options":[]},
+            {"id":"effort", "name":"Effort", "type":"select", "currentValue":"low", "options":[]}
+        ])));
+        assert_eq!(none.effort, None);
+    }
+
+    #[test]
+    fn effort_change_is_confirmed_only_by_the_exact_level() {
+        let config = |current: &str| SessionConfig {
+            model: None,
+            effort: Some(ModelOptions { config_id: "effort".into(), current: current.into(), choices: vec![] }),
+        };
+        assert_eq!(confirm_setting(&config("high"), Setting::Effort, "high"), Ok(()));
+        assert!(confirm_setting(&config("high"), Setting::Effort, "low").is_err());
+        assert!(confirm_setting(&config("high[1m]"), Setting::Effort, "high").is_err());
+        assert!(confirm_setting(&SessionConfig::default(), Setting::Effort, "high").is_err());
+    }
+
+    #[test]
+    fn selecting_an_effort_requests_the_change_and_remembers_it() {
+        let mut state = AcpState::default();
+        let (model_tx, mut model_rx) = tokio::sync::mpsc::unbounded_channel();
+        state.model_tx = Some(model_tx);
+        let levels = ModelOptions { config_id: "effort".into(), current: "medium".into(), choices: vec![("medium".into(), "Medium".into()), ("high".into(), "High".into())] };
+        state.effort = Some(levels.clone());
+        state.effort_menu_open = true;
+        state.select_effort("high".into());
+        assert_eq!(model_rx.try_recv().unwrap(), (Setting::Effort, "effort".into(), "high".into()));
+        assert!(state.effort_switching);
+        assert!(!state.effort_menu_open);
+        assert_eq!(state.preferred_effort, None);
+
+        // Neither sending nor a model change may race an effort change.
+        state.input = text_editor::Content::with_text("keep this draft");
+        state.send(PathBuf::from("."));
+        assert!(!state.started);
+        state.models = Some(ModelOptions { config_id: "model".into(), current: "a".into(), choices: vec![] });
+        state.select_model("b".into());
+        assert!(model_rx.try_recv().is_err());
+
+        let (tx, rx) = mpsc::channel();
+        state.rx = Some(rx);
+        tx.send(Event::SettingChanged(Setting::Effort, Ok(SessionConfig { model: None, effort: Some(ModelOptions { current: "high".into(), ..levels }) }))).unwrap();
+        state.poll();
+        assert!(!state.effort_switching);
+        assert_eq!(state.effort.as_ref().unwrap().current_name(), "High");
+        assert_eq!(state.preferred_effort.as_deref(), Some("high"));
+
+        // Levels the agent derives from a model change are shown but not remembered as a choice.
+        tx.send(Event::Config(SessionConfig { model: None, effort: Some(ModelOptions { config_id: "effort".into(), current: "low".into(), choices: vec![("low".into(), "Low".into())] }) })).unwrap();
+        state.poll();
+        assert_eq!(state.effort.as_ref().unwrap().current, "low");
+        assert_eq!(state.preferred_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn saved_effort_round_trips_and_old_files_still_load() {
+        let store: ThreadStore = serde_json::from_str(r#"{"threads":[],"active":0,"model":"m"}"#).unwrap();
+        assert_eq!(store.effort, None);
+        let saved = serde_json::to_string(&ThreadStore { effort: Some("high".into()), ..store }).unwrap();
+        assert_eq!(serde_json::from_str::<ThreadStore>(&saved).unwrap().effort.as_deref(), Some("high"));
+    }
+
+    #[test]
     fn model_variants_reported_by_the_agent_confirm_the_request() {
         assert!(is_same_model("claude-fable-5-1", "claude-fable-5-1"));
         assert!(is_same_model("claude-fable-5-1", "claude-fable-5-1[1m]"));
@@ -1281,7 +1495,7 @@ mod tests {
         state.models = Some(ModelOptions { config_id: "model".into(), current: "fast".into(), choices: vec![("fast".into(), "Fast".into()), ("deep".into(), "Deep".into())] });
         state.model_menu_open = true;
         state.select_model("deep".into());
-        assert_eq!(model_rx.try_recv().unwrap(), ("model".into(), "deep".into()));
+        assert_eq!(model_rx.try_recv().unwrap(), (Setting::Model, "model".into(), "deep".into()));
         assert_eq!(state.models.as_ref().unwrap().current, "fast");
         assert_eq!(state.preferred_model, None);
         assert!(state.model_switching);
@@ -1294,7 +1508,7 @@ mod tests {
         state.rx = Some(rx);
         let mut confirmed = state.models.clone().unwrap();
         confirmed.current = "deep".into();
-        tx.send(Event::ModelChanged(Ok(confirmed))).unwrap();
+        tx.send(Event::SettingChanged(Setting::Model, Ok(SessionConfig { model: Some(confirmed), effort: None }))).unwrap();
         state.poll();
         assert!(!state.model_switching);
         assert_eq!(state.models.as_ref().unwrap().current, "deep");
@@ -1302,7 +1516,7 @@ mod tests {
 
         state.select_model("fast".into());
         assert!(state.model_switching);
-        tx.send(Event::ModelChanged(Err("rejected".into()))).unwrap();
+        tx.send(Event::SettingChanged(Setting::Model, Err("rejected".into()))).unwrap();
         state.poll();
         assert!(!state.model_switching);
         assert_eq!(state.models.as_ref().unwrap().current, "deep");
