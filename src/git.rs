@@ -6,6 +6,7 @@
 
 pub mod cli;
 pub mod blame;
+pub mod branches;
 pub mod repo;
 pub mod status;
 mod watch;
@@ -39,6 +40,18 @@ pub struct GitState {
     tree_view: bool,
     /// Directories collapsed in tree view, by repository-relative path.
     collapsed: HashSet<String>,
+    picker: BranchPicker,
+}
+
+/// The branch picker opened from the branch name, like Zed's.
+#[derive(Default)]
+struct BranchPicker {
+    open: bool,
+    query: String,
+    filter: branches::Filter,
+    filter_menu: bool,
+    branches: Vec<branches::Branch>,
+    loading: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +74,21 @@ pub enum Message {
     Committed(Result<(), String>),
     ToggleTreeView,
     ToggleDir(String),
+    ToggleBranches,
+    CloseBranches,
+    BranchesLoaded(Result<Vec<branches::Branch>, String>),
+    BranchQueryChanged(String),
+    ToggleBranchFilter,
+    BranchFilterChosen(branches::Filter),
+    /// Enter in the search box: the first listed branch, else create the typed name.
+    BranchSubmit,
+    Branch(branches::Action),
+    /// Checked out a branch; the app reloads open files and diffs.
+    BranchDone(Result<(), String>),
+}
+
+fn branch_query_id() -> iced::widget::Id {
+    iced::widget::Id::new("git-branch-query")
 }
 
 impl GitState {
@@ -82,6 +110,7 @@ impl GitState {
         self.watch = self.repo.clone().map(watch::Watch::start);
         self.status = status::Status::default();
         self.error = None;
+        self.picker = BranchPicker { filter: self.picker.filter, ..BranchPicker::default() };
         true
     }
 
@@ -128,6 +157,46 @@ pub fn update(state: &mut GitState, message: Message, cwd: PathBuf) -> Task<Mess
         }
         Message::ToggleDir(path) => {
             if !state.collapsed.remove(&path) { state.collapsed.insert(path); }
+        }
+        Message::ToggleBranches => {
+            if state.picker.open { state.picker.open = false; return Task::none(); }
+            state.picker = BranchPicker { open: true, loading: true, filter: state.picker.filter, ..BranchPicker::default() };
+            let load = Task::perform(async move {
+                tokio::task::spawn_blocking(move || branches::load(&cwd)).await.map_err(|err| err.to_string())?
+            }, Message::BranchesLoaded);
+            return Task::batch([load, iced::widget::operation::focus(branch_query_id())]);
+        }
+        Message::CloseBranches => state.picker.open = false,
+        Message::BranchesLoaded(result) => {
+            state.picker.loading = false;
+            match result {
+                Ok(list) => state.picker.branches = list,
+                Err(err) => state.error = Some(err),
+            }
+        }
+        Message::BranchQueryChanged(query) => state.picker.query = query,
+        Message::ToggleBranchFilter => state.picker.filter_menu = !state.picker.filter_menu,
+        Message::BranchFilterChosen(filter) => {
+            state.picker.filter = filter;
+            state.picker.filter_menu = false;
+        }
+        Message::BranchSubmit => {
+            if let Some(action) = submit_action(&state.picker) { return update(state, Message::Branch(action), cwd); }
+        }
+        Message::Branch(action) => {
+            if state.committing { return Task::none(); }
+            state.committing = true;
+            state.picker.open = false;
+            return Task::perform(async move {
+                tokio::task::spawn_blocking(move || branches::run(&cwd, &action)).await.map_err(|err| err.to_string())?
+            }, Message::BranchDone);
+        }
+        Message::BranchDone(result) => {
+            state.committing = false;
+            match result {
+                Ok(()) => return refresh(state, cwd),
+                Err(err) => state.error = Some(err),
+            }
         }
         Message::Staged(result) => {
             state.committing = false;
@@ -181,6 +250,19 @@ pub fn update(state: &mut GitState, message: Message, cwd: PathBuf) -> Task<Mess
     Task::none()
 }
 
+/// What Enter does: the first listed branch, else create the typed name; nothing while loading.
+fn submit_action(picker: &BranchPicker) -> Option<branches::Action> {
+    if picker.loading { return None; }
+    match branches::visible(&picker.branches, &picker.query, picker.filter).first() {
+        Some(branch) => Some(branch_action(branch)),
+        None => branches::new_name(&picker.branches, &picker.query).map(|name| branches::Action::Create(name.to_owned())),
+    }
+}
+
+fn branch_action(branch: &branches::Branch) -> branches::Action {
+    if branch.remote { branches::Action::Track(branch.name.clone()) } else { branches::Action::Switch(branch.name.clone()) }
+}
+
 fn can_commit(state: &GitState) -> bool {
     !state.committing && !state.commit_message.text().trim().is_empty() && state.status.files.iter().any(ChangedFile::staged)
 }
@@ -210,12 +292,17 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
     let label = state.status.branch.label();
     let mut branch = row![
         text(branch_icon).font(iced::Font::with_name("lucide")).size(14),
-        text(if label.is_empty() { "No branch".to_string() } else { label }).size(13),
+        text(if label.is_empty() { "No branch".to_string() } else { label.clone() }).size(13),
     ].spacing(8).align_y(iced::Alignment::Center);
     let (ahead, behind) = (state.status.branch.ahead, state.status.branch.behind);
     if ahead > 0 || behind > 0 {
         branch = branch.push(text(format!("↑{ahead} ↓{behind}")).size(12).style(iced::widget::text::secondary));
     }
+    let branch_button = button(branch.push(Space::new().width(Length::Fill)))
+        .padding([2, 4]).width(Length::Fill).style(crate::flat_button_style)
+        .on_press_maybe((!state.committing).then_some(Message::ToggleBranches));
+    let branch = iced_aw::DropDown::new(branch_button, branch_picker(&state.picker, &label), state.picker.open)
+        .alignment(iced_aw::drop_down::Alignment::Bottom).on_dismiss(Message::CloseBranches);
     let mut files_col = column![].spacing(2);
     if state.status.files.is_empty() && state.error.is_none() {
         files_col = files_col.push(container(text("Working tree clean").size(13)).padding([16, 0]));
@@ -351,6 +438,70 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
         .padding(8)
         .height(Length::Fill)
         .into()
+}
+
+/// Search box, filter menu, the matching branches and a "Create Branch" row for the typed name.
+fn branch_picker<'a>(picker: &'a BranchPicker, current: &str) -> Element<'a, Message> {
+    let secondary = iced::widget::text::secondary;
+    let search = row![
+        iced::widget::text_input("Select branch…", &picker.query).id(branch_query_id()).size(13).padding([5, 8])
+            .on_input(Message::BranchQueryChanged).on_submit(Message::BranchSubmit),
+        crate::icon_control(lucide_icons::Icon::SlidersHorizontal, "Filter branches", Some(Message::ToggleBranchFilter),
+            picker.filter_menu || picker.filter != branches::Filter::All),
+    ].spacing(4).align_y(iced::Alignment::Center);
+    let mut content = column![search].spacing(6);
+    if picker.filter_menu {
+        content = content.push(branches::Filter::ALL.into_iter().fold(column![].spacing(1), |menu, filter| {
+            let label = if filter == picker.filter { format!("✓ {}", filter.label()) } else { filter.label().to_owned() };
+            menu.push(button(text(label).size(12)).width(Length::Fill).padding([3, 8]).style(crate::flat_button_style)
+                .on_press(Message::BranchFilterChosen(filter)))
+        }));
+    }
+
+    let visible = branches::visible(&picker.branches, &picker.query, picker.filter);
+    let now = crate::ai_history::now();
+    let mut list = column![].spacing(2);
+    for (remote, heading) in [(false, "Local Branches"), (true, "Remote Branches")] {
+        let group: Vec<_> = visible.iter().filter(|branch| branch.remote == remote).collect();
+        if group.is_empty() { continue; }
+        list = list.push(container(text(heading).size(11).style(secondary)).padding([4, 4]));
+        for branch in group {
+            let name = if !branch.remote && branch.name == current { format!("✓ {}", branch.name) } else { branch.name.clone() };
+            let details = branch_details(branch, now);
+            list = list.push(button(column![text(name).size(13), text(details).size(11).style(secondary)].spacing(1))
+                .width(Length::Fill).padding([4, 8]).style(crate::flat_button_style)
+                .on_press(Message::Branch(branch_action(branch))));
+        }
+    }
+    // Until the list is in, the typed name may be an existing branch.
+    if picker.loading {
+        list = list.push(text("Loading branches…").size(12).style(secondary));
+    } else if let Some(name) = branches::new_name(&picker.branches, &picker.query) {
+        let plus: char = lucide_icons::Icon::Plus.into();
+        list = list.push(button(row![
+            text(plus).font(iced::Font::with_name("lucide")).size(13),
+            column![
+                text(format!("Create Branch: \"{name}\"…")).size(13),
+                text(format!("Based off {}", if current.is_empty() { "the current commit" } else { current })).size(11).style(secondary),
+            ].spacing(1),
+        ].spacing(8).align_y(iced::Alignment::Center))
+            .width(Length::Fill).padding([4, 8]).style(crate::flat_button_style)
+            .on_press(Message::Branch(branches::Action::Create(name.to_owned()))));
+    } else if visible.is_empty() {
+        list = list.push(text(if picker.branches.is_empty() { "No branches yet. Type a name to create one." } else { "No matching branches" }).size(12).style(secondary));
+    }
+    content = content.push(container(scrollable(list)).max_height(320));
+    container(content).padding(6).width(Length::Fill).style(crate::overlay_style).into()
+}
+
+/// "Ann · 2w ago · fix: e2e", leaving out whatever git did not report.
+fn branch_details(branch: &branches::Branch, now: u64) -> String {
+    let age = match crate::ai_history::ago(now, branch.date) {
+        age if age.is_empty() => age,
+        age if age == "now" => "just now".to_owned(),
+        age => format!("{age} ago"),
+    };
+    [branch.author.as_str(), &age, &branch.subject].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" · ")
 }
 
 /// Restore tracked files from the index, preserving staged changes. Untracked files are removed.
@@ -642,6 +793,36 @@ mod tests {
         assert_eq!(collapsed.iter().map(Row::path).collect::<Vec<_>>(), ["src", "src/git", "src/main.rs", "README.md"]);
         assert_eq!(stage_state(&[&files[0]]), (true, false));
         assert_eq!(stage_state(&[&files[2]]), (false, false));
+    }
+
+    #[test]
+    fn branch_picker_opens_submits_and_blocks_while_git_runs() {
+        use branches::{Action, Branch, Filter};
+        let branch = |name: &str, remote| Branch { name: name.into(), remote, author: "Ann".into(), date: 0, subject: String::new() };
+        let mut state = GitState::default();
+        let cwd = PathBuf::from(".");
+        let _ = update(&mut state, Message::ToggleBranches, cwd.clone());
+        assert!(state.picker.open && state.picker.loading);
+        let _ = update(&mut state, Message::BranchQueryChanged("dev".into()), cwd.clone());
+        assert_eq!(submit_action(&state.picker), None, "nothing is chosen before the list loads");
+        let _ = update(&mut state, Message::BranchesLoaded(Ok(vec![branch("main", false), branch("origin/dev", true)])), cwd.clone());
+        assert_eq!(submit_action(&state.picker), Some(Action::Track("origin/dev".into())));
+        let _ = update(&mut state, Message::BranchFilterChosen(Filter::Local), cwd.clone());
+        assert_eq!(submit_action(&state.picker), Some(Action::Create("dev".into())));
+        let _ = update(&mut state, Message::BranchQueryChanged("MAI".into()), cwd.clone());
+        assert_eq!(submit_action(&state.picker), Some(Action::Switch("main".into())));
+        assert_eq!(branch_details(&branch("main", false), 100), "Ann");
+
+        let _ = update(&mut state, Message::Branch(Action::Switch("main".into())), cwd.clone());
+        assert!(state.committing && !state.picker.open);
+        let _ = update(&mut state, Message::ToggleBranches, cwd.clone());
+        let _ = update(&mut state, Message::Branch(Action::Create("x".into())), cwd.clone());
+        assert!(state.committing, "a second git write waits for the first");
+        let _ = update(&mut state, Message::BranchDone(Err("error: Your local changes would be overwritten".into())), cwd.clone());
+        assert!(!state.committing);
+        assert!(state.error.as_deref().unwrap().contains("overwritten"));
+        let _ = update(&mut state, Message::CloseBranches, cwd);
+        assert!(!state.picker.open);
     }
 
     #[test]

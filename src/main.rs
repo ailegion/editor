@@ -1514,11 +1514,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 git::Message::Staged(Ok(())) => state.notify("Staging updated"),
                 git::Message::Committed(Err(err)) | git::Message::Staged(Err(err)) | git::Message::Refreshed(Err(err)) => state.notify(format!("Git: {err}")),
                 git::Message::MessageGenerated(Err(err)) => state.notify(format!("Could not write a commit message: {err}")),
+                git::Message::BranchDone(Err(err)) | git::Message::BranchesLoaded(Err(err)) => state.notify(format!("Git: {err}")),
                 _ => {},
             }
             let cwd = state.root_or_cwd();
             if matches!(msg, git::Message::Refresh) {
                 task = state.reload_git_views();
+            }
+            // The checkout rewrote files: tabs without unsaved edits follow it, as after an AI edit.
+            if matches!(msg, git::Message::BranchDone(Ok(()))) {
+                state.notify("Switched branch");
+                task = Task::batch([state.reload_open_tabs(), state.reload_git_views()]);
             }
             task = Task::batch([task, git::update(&mut state.git, msg, cwd).map(Message::Git)]);
         }
