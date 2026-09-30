@@ -35,6 +35,8 @@ pub struct SearchResult {
 #[derive(Default)]
 pub struct SearchState {
     pub query: String,
+    /// Treat the query as a regular expression (the `.*` toggle).
+    pub regex: bool,
     pub results: Vec<SearchResult>,
     generation: u64,
     searching: bool,
@@ -44,6 +46,7 @@ pub struct SearchState {
 #[derive(Debug, Clone)]
 pub enum Message {
     QueryChanged(String),
+    ToggleRegex,
     Submit,
     Run(u64),
     Finished(u64, PathBuf, Result<Vec<SearchResult>, String>),
@@ -68,6 +71,10 @@ pub fn update(state: &mut SearchState, message: Message, root: Option<&Path>) ->
                 }, Message::Run), None);
             }
         }
+        Message::ToggleRegex => {
+            state.regex = !state.regex;
+            return update(state, Message::Submit, root);
+        }
         Message::Submit => {
             state.generation += 1;
             return update(state, Message::Run(state.generation), root);
@@ -75,6 +82,17 @@ pub fn update(state: &mut SearchState, message: Message, root: Option<&Path>) ->
         Message::Run(generation) if generation == state.generation => {
             let Some(root) = root else { state.searching = false; return (Task::none(), None); };
             if state.query.trim().is_empty() { state.searching = false; state.results.clear(); return (Task::none(), None); }
+            let matcher = if state.regex {
+                match matcher(&state.query, true) {
+                    Ok(matcher) => Some(matcher),
+                    Err(_) => {
+                        state.searching = false;
+                        state.results.clear();
+                        state.error = Some("Invalid regex".into());
+                        return (Task::none(), None);
+                    }
+                }
+            } else { None };
             let root = root.to_path_buf();
             let target = root.clone();
             let query = state.query.clone();
@@ -83,7 +101,10 @@ pub fn update(state: &mut SearchState, message: Message, root: Option<&Path>) ->
             return (Task::perform(async move {
                 tokio::task::spawn_blocking(move || {
                     std::fs::read_dir(&target).map_err(|err| format!("Cannot search {}: {err}", target.display()))?;
-                    Ok(search(&target, &query))
+                    Ok(match &matcher {
+                        Some(matcher) => search_lines(&target, |line| matcher.is_match(line)),
+                        None => search(&target, &query),
+                    })
                 }).await.map_err(|err| err.to_string())?
             }, move |result| Message::Finished(generation, root.clone(), result)), None);
         }
@@ -108,7 +129,17 @@ pub(crate) fn search(root: &Path, query: &str) -> Vec<SearchResult> {
         return Vec::new();
     }
     let query_lower = query.to_lowercase();
+    search_lines(root, |line| line.to_lowercase().contains(&query_lower))
+}
 
+/// Case-insensitive matcher for `query`: the literal text, or a regex (matched per line).
+fn matcher(query: &str, regex: bool) -> Result<regex::Regex, regex::Error> {
+    let pattern = if regex { query.to_owned() } else { regex::escape(query) };
+    regex::RegexBuilder::new(&pattern).case_insensitive(true).build()
+}
+
+/// Every line under `root` that `matches`, capped at `MAX_RESULTS`.
+fn search_lines(root: &Path, matches: impl Fn(&str) -> bool) -> Vec<SearchResult> {
     let mut files = Vec::new();
     walk(root, &mut files);
 
@@ -118,7 +149,7 @@ pub(crate) fn search(root: &Path, query: &str) -> Vec<SearchResult> {
             continue;
         };
         for (i, line) in text.lines().enumerate() {
-            if line.to_lowercase().contains(&query_lower) {
+            if matches(line) {
                 results.push(SearchResult {
                     path: path.clone(),
                     line: i + 1,
@@ -162,10 +193,27 @@ pub fn view<'a>(state: &'a SearchState, root: Option<&Path>) -> Element<'a, Mess
         .into();
     }
 
-    let input = text_input("Find in project", &state.query)
-        .size(13).padding([5, 8])
-        .on_input(Message::QueryChanged)
-        .on_submit(Message::Submit);
+    let regex = state.regex;
+    let regex_toggle = button(text(".*").size(13)).padding([4, 8])
+        .style(move |theme: &iced::Theme, status| {
+            use iced::widget::button::{Status, Style};
+            let palette = theme.extended_palette();
+            let base = Style { text_color: palette.background.base.text, border: iced::Border::default().rounded(4.0), ..Style::default() };
+            match (regex, status) {
+                (true, _) => base.with_background(palette.primary.weak.color),
+                (false, Status::Hovered) => base.with_background(palette.background.weak.color),
+                (false, Status::Pressed) => base.with_background(palette.background.strong.color),
+                (false, _) => base.with_background(iced::Color::TRANSPARENT),
+            }
+        })
+        .on_press(Message::ToggleRegex);
+    let input = row![
+        text_input("Find in project", &state.query)
+            .size(13).padding([5, 8])
+            .on_input(Message::QueryChanged)
+            .on_submit(Message::Submit),
+        iced::widget::tooltip(regex_toggle, text("Use regular expression").size(12), iced::widget::tooltip::Position::Bottom),
+    ].spacing(4).align_y(iced::Alignment::Center);
 
     let summary = if let Some(error) = &state.error {
         error.clone()
@@ -184,7 +232,7 @@ pub fn view<'a>(state: &'a SearchState, root: Option<&Path>) -> Element<'a, Mess
     for (index, result) in state.results.iter().enumerate() {
         groups.entry(&result.path).or_default().push((index, result));
     }
-    let matcher = regex::RegexBuilder::new(&regex::escape(&state.query)).case_insensitive(true).build().ok();
+    let matcher = matcher(&state.query, state.regex).ok();
     for (path, results) in groups {
         let relative = root.and_then(|root| path.strip_prefix(root).ok()).unwrap_or(path);
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
@@ -249,6 +297,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn regex_toggle_matches_patterns_and_reports_invalid_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "ABC\na.c\nnothing\n").unwrap();
+        let lines = |state: &SearchState| state.results.iter().map(|r| r.preview.clone()).collect::<Vec<_>>();
+        let mut state = SearchState { query: "a.c".into(), ..Default::default() };
+        let (task, _) = update(&mut state, Message::Submit, Some(root));
+        finish(&mut state, task, root).await;
+        assert_eq!(lines(&state), ["a.c"], "plain mode is literal");
+
+        let (task, _) = update(&mut state, Message::ToggleRegex, Some(root));
+        finish(&mut state, task, root).await;
+        assert!(state.regex);
+        assert_eq!(lines(&state), ["ABC", "a.c"], "regex mode, case-insensitive");
+
+        let (task, _) = update(&mut state, Message::QueryChanged("(".into()), Some(root));
+        finish(&mut state, task, root).await;
+        assert_eq!(state.error.as_deref(), Some("Invalid regex"));
+        assert!(state.results.is_empty() && !state.searching);
+
+        let (task, _) = update(&mut state, Message::QueryChanged("^n.*g$".into()), Some(root));
+        finish(&mut state, task, root).await;
+        assert_eq!(lines(&state), ["nothing"]);
+        assert_eq!(state.error, None);
     }
 
     #[tokio::test]

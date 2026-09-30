@@ -32,8 +32,8 @@ for a "minimal, no-bloat" positioning.
   first, never overwrites; open tabs follow)
 - Quick Open (Cmd+P): fuzzy file finder, recently opened files first
 - Command Palette (Cmd+Shift+P), Go to Line (Cmd+G)
-- Find in Project (Cmd+Shift+F): case-insensitive substring search (up to 500 results),
-  skipping `.git`/`target`/`node_modules`/etc.
+- Find in Project (Cmd+Shift+F): case-insensitive search, plain or regex (`.*` toggle), up to
+  500 results, skipping `.git`/`target`/`node_modules`/etc.
 
 ### Language intelligence (LSP)
 - Servers: rust-analyzer (Rust), Ruff (Python), Biome (JS/TS/JSON/CSS), just-lsp (justfiles),
@@ -94,7 +94,7 @@ for a "minimal, no-bloat" positioning.
 | Go to line | ✅ Ctrl+G | ✅ Cmd+G (done) |
 | Multi-cursor / column select | ✅ | ❌ single cursor only |
 | Find in file: regex | ✅ | ✅ `.*` toggle in the find bar (done) |
-| Find in project: regex / `.gitignore` | ✅ | ❌ plain substring; fixed skip list |
+| Find in project: regex / `.gitignore` | ✅ | ⚠️ regex `.*` toggle done; `.gitignore` ❌ (fixed skip list) |
 | LSP (autocomplete, hover, diagnostics, go-to-def) | ✅ | ⚠️ diagnostics, hover and go-to-definition (F12); no autocomplete |
 | Diff gutter in editor (vs. git HEAD) | ✅ | ✅ (done) |
 | Stage individual files / hunks | ✅ | ⚠️ per-file staging done; hunk staging ❌ |
@@ -160,7 +160,7 @@ not a toggle -- worth scoping as its own task.
 6. **Hunk staging** — stage/unstage individual hunks from the diff view.
 
 ### Next — Files and search
-7. **Project search: regex and `.gitignore`** — reuse the find bar's regex handling.
+7. **Project search: `.gitignore`** — skip ignored files instead of a fixed directory list.
 8. **Drag-and-drop to open files** from the OS.
 
 ### Next — Layout and settings
