@@ -1257,7 +1257,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
                 .size(13)
                 .placeholder("Ask your assistant… (Cmd/Ctrl+Enter to send)")
                 .on_action(Message::InputChanged)
-                .height(Length::Fixed(60.0))
+                .min_height(50.0).max_height(290.0)
                 .key_binding(|key_press| crate::ai_composer::key_binding(key_press, Message::Send, Message::Composer)),
             row![text(if state.stopping { "Stopping…" } else if awaiting_permission { "Waiting for approval" } else if state.streaming { "Working…" } else { "Ready" }).size(12).style(iced::widget::text::secondary), Space::new().width(Length::Fill), model_button].push(effort_button).push(usage_ring).push(send_button).spacing(6).align_y(iced::Alignment::Center),
         ]

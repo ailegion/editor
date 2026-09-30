@@ -869,7 +869,7 @@ pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>)
                 .size(13)
                 .placeholder("Ask about your project… (Cmd/Ctrl+Enter to send)")
                 .on_action(Message::InputChanged)
-                .height(Length::Fixed(60.0))
+                .min_height(50.0).max_height(290.0)
                 .key_binding(|key_press| crate::ai_composer::key_binding(key_press, Message::Send, Message::Composer)),
             row![
                 text(if state.model.is_empty() {
