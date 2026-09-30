@@ -90,6 +90,8 @@ pub enum Message {
     BranchDone(Result<(), String>),
     ToggleSyncMenu,
     CloseSyncMenu,
+    /// Open the commit graph (handled by the app).
+    ShowGraph,
     Sync(remote::Sync),
     /// A pull may have changed files even when it failed (conflicts); the app reloads them.
     SyncDone(remote::Sync, Result<(), String>),
@@ -207,7 +209,7 @@ pub fn update(state: &mut GitState, message: Message, cwd: PathBuf) -> Task<Mess
             }
         }
         Message::ToggleSyncMenu => state.sync_menu = !state.sync_menu,
-        Message::CloseSyncMenu => state.sync_menu = false,
+        Message::CloseSyncMenu | Message::ShowGraph => state.sync_menu = false,
         Message::Sync(sync) => {
             state.sync_menu = false;
             if state.committing { return Task::none(); }
@@ -322,7 +324,8 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
     let sync_items = remote::Sync::ALL.into_iter().fold(column![].spacing(1), |menu, sync| {
         menu.push(button(text(sync.label()).size(13)).width(Length::Fill).padding([4, 10]).style(crate::flat_button_style)
             .on_press_maybe((!state.committing).then_some(Message::Sync(sync))))
-    });
+    }).push(iced::widget::rule::horizontal(1))
+        .push(button(text("Show Graph").size(13)).width(Length::Fill).padding([4, 10]).style(crate::flat_button_style).on_press(Message::ShowGraph));
     let sync_menu = iced_aw::DropDown::new(
         crate::icon_control(lucide_icons::Icon::Ellipsis, "Fetch, pull, push", Some(Message::ToggleSyncMenu), state.sync_menu),
         container(sync_items).padding(4).style(crate::overlay_style),
