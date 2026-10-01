@@ -41,6 +41,10 @@ for a "minimal, no-bloat" positioning.
   checked when published)
 - Diagnostics (wavy underline, gutter dot, status bar message with "Fix with AI"), hover after
   a short pause, go to definition (F12 or Cmd+click); servers restart after a crash
+- Autocomplete: suggestions while typing a word, after the server's trigger characters, or on
+  Ctrl+Space; fuzzy-narrowed as you type; Up/Down, Enter/Tab to accept, Esc to close.
+  Plain-text items (no snippets); no auto-import items for Rust (rust-analyzer only offers
+  them with `completionItem/resolve`, which isn't implemented)
 
 ### Terminal
 - Integrated terminal (Ctrl+`) below the editor: multiple tabs, shell profiles (PowerShell,
@@ -95,7 +99,7 @@ for a "minimal, no-bloat" positioning.
 | Multi-cursor / column select | ✅ | ❌ single cursor only |
 | Find in file: regex | ✅ | ✅ `.*` toggle in the find bar (done) |
 | Find in project: regex / `.gitignore` | ✅ | ⚠️ regex `.*` toggle done; `.gitignore` ❌ (fixed skip list) |
-| LSP (autocomplete, hover, diagnostics, go-to-def) | ✅ | ⚠️ diagnostics, hover and go-to-definition (F12); no autocomplete |
+| LSP (autocomplete, hover, diagnostics, go-to-def) | ✅ | ✅ autocomplete, diagnostics, hover, go-to-definition (done; no Rust auto-imports) |
 | Diff gutter in editor (vs. git HEAD) | ✅ | ✅ (done) |
 | Stage individual files / hunks | ✅ | ⚠️ per-file staging done; hunk staging ❌ |
 | Branch switch / create | ✅ | ✅ branch picker with search and local/remote filter (done) |
@@ -132,18 +136,17 @@ Ordered by (impact on daily editing) ÷ (implementation cost). Completed phases 
 - **Git:** diff gutter (`git_diff.rs`), per-file staging, side-by-side diffs
   (`git_preview.rs`), inline blame (`git/blame.rs`), branch picker (`git/branches.rs`),
   fetch/pull/push (`git/remote.rs`), commit graph (`git_graph.rs`)
-- **LSP basics:** client, server registry and installer, diagnostics, hover, go to
-  definition (`lsp/`)
+- **LSP:** client, server registry and installer, diagnostics, hover, go to definition,
+  autocomplete (`lsp/`, `completion.rs`)
 - **Terminal:** tabs and shell profiles (`terminal.rs`, `terminal/`)
 - **AI:** HTTP and ACP backends, history, attachments, inline edit (`chat.rs`, `acp.rs`,
   `ai_*.rs`, `inline_edit.rs`)
 
 ### Next — Editing
-1. **Autocomplete popup** — LSP `textDocument/completion` wired into `code_editor`.
-2. **Diagnostics panel** — list of the project's diagnostics, click to jump.
-3. **Word wrap toggle** — a renderer change, see the note below.
-4. **Multi-cursor** — the buffer has a single cursor and selection today.
-5. **Outline / symbols** — LSP `textDocument/documentSymbol`.
+1. **Diagnostics panel** — list of the project's diagnostics, click to jump.
+2. **Word wrap toggle** — a renderer change, see the note below.
+3. **Multi-cursor** — the buffer has a single cursor and selection today.
+4. **Outline / symbols** — LSP `textDocument/documentSymbol`.
 
 **Word wrap note:** the custom canvas renderer (`code_editor/render.rs`) draws one row per
 `BufferLine` at a fixed `y = line_index * line_height`, and `Buffer::sync` (cursor/selection
@@ -157,20 +160,20 @@ numbers only draw on a buffer line's first visual row. That's a renderer-archite
 not a toggle -- worth scoping as its own task.
 
 ### Next — Git
-6. **Hunk staging** — stage/unstage individual hunks from the diff view.
+5. **Hunk staging** — stage/unstage individual hunks from the diff view.
 
 ### Next — Files and search
-7. **Project search: `.gitignore`** — skip ignored files instead of a fixed directory list.
-8. **Drag-and-drop to open files** from the OS.
+6. **Project search: `.gitignore`** — skip ignored files instead of a fixed directory list.
+7. **Drag-and-drop to open files** from the OS.
 
 ### Next — Layout and settings
-9. **Split editor panes** — two `PaneKind::Main`-equivalent editors side by side.
-10. **Unified settings file** — consolidate the `~/.config/editor/*` files (`session.json`,
+8. **Split editor panes** — two `PaneKind::Main`-equivalent editors side by side.
+9. **Unified settings file** — consolidate the `~/.config/editor/*` files (`session.json`,
     `last_project`, `app_theme`, `file_tree_exclude`, `zoom`, `sidebar_ratio`, `ai_ratio`,
     `window_*`, `ai_visible`, `sidebar_visible`, `recent_files`, `terminal_shell`,
     `git_tree_view`, `ai_connections.json`, `chat_threads/`, `acp_threads/`, `themes/`,
     `lsp/`) into one `settings.json`, with a minimal settings UI.
-11. **Auto-save toggle** — debounce writes to disk.
+10. **Auto-save toggle** — debounce writes to disk.
 
 ### To verify
 - **CRLF files may be saved as LF:** line endings are detected and shown, but saving writes
