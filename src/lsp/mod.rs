@@ -45,6 +45,33 @@ pub enum Event {
     Hover { path: PathBuf, line: usize, column: usize, lines: Vec<String> },
     /// Where a definition request landed (UTF-16 `column`).
     Definition { path: PathBuf, line: usize, column: usize },
+    /// Completions for a position (UTF-16 `column`). `incomplete`: the server wants to be
+    /// asked again as the word grows, rather than having this list filtered.
+    Completion { path: PathBuf, line: usize, column: usize, items: Vec<CompletionItem>, incomplete: bool },
+}
+
+/// A text replacement in LSP coordinates: (line, UTF-16 column) start and end.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextEdit {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompletionItem {
+    pub label: String,
+    /// LSP `CompletionItemKind` (1 = text, 2 = method, 3 = function, ...).
+    pub kind: Option<u64>,
+    pub detail: Option<String>,
+    /// What the typed word is matched against, and the server's ordering.
+    pub filter: String,
+    pub sort: String,
+    /// The server's replacement; without one, `insert` replaces the word being typed.
+    pub edit: Option<TextEdit>,
+    pub insert: String,
+    /// Edits elsewhere, e.g. an import the completion needs.
+    pub additional: Vec<TextEdit>,
 }
 
 struct Doc { server: &'static str, language: &'static str, version: i64, text: String }
@@ -53,7 +80,11 @@ struct Doc { server: &'static str, language: &'static str, version: i64, text: S
 enum Pending {
     Hover { path: PathBuf, line: usize, column: usize },
     Definition,
+    Completion { path: PathBuf, line: usize, column: usize },
 }
+
+/// Most suggestions kept from one response; servers can send thousands.
+const MAX_COMPLETIONS: usize = 1000;
 struct InFlight { kind: Pending, method: &'static str, params: Value, sent: Instant, attempts: u8 }
 
 /// Responses older than this are dropped. Generous because rust-analyzer answers nothing
@@ -74,6 +105,9 @@ struct Slot {
     crashes: u32,
     retry_at: Option<Instant>,
     disabled: bool,
+    /// Whether the server offers completions, and the characters it completes after.
+    completion: bool,
+    triggers: Vec<String>,
 }
 
 /// UI-side handle. No server discovery, process lifecycle or protocol processing runs here.
@@ -149,6 +183,11 @@ impl Manager {
     }
     pub fn definition(&self, path: &Path, line: usize, column: usize) {
         let path = path.to_owned(); self.send(move |core| core.definition(&path, line, column));
+    }
+    /// See [`Core::completion`]. Sends `text` now, so a pending debounced change is dropped.
+    pub fn completion(&mut self, path: &Path, line: usize, column: usize, text: String, trigger: Option<char>) {
+        self.due.remove(path);
+        let path = path.to_owned(); self.send(move |core| core.completion(&path, line, column, text, trigger));
     }
     pub fn install(&self, server: &'static Server) { self.send(move |core| core.install(server)); }
     pub fn dismiss(&self, server: &'static Server) { self.send(move |core| core.dismiss(server)); }
@@ -247,16 +286,32 @@ impl Core {
 
     /// Asks what's at (`line`, UTF-16 `column`); answered by [`Event::Hover`].
     pub fn hover(&mut self, path: &Path, line: usize, column: usize) {
-        self.send_request(path, "textDocument/hover", line, column, Pending::Hover { path: path.to_path_buf(), line, column });
+        self.send_request(path, "textDocument/hover", line, column, Pending::Hover { path: path.to_path_buf(), line, column }, None);
     }
 
     /// Asks where the symbol at (`line`, UTF-16 `column`) is defined; answered by
     /// [`Event::Definition`], or a notice when there is none.
     pub fn definition(&mut self, path: &Path, line: usize, column: usize) {
-        self.send_request(path, "textDocument/definition", line, column, Pending::Definition);
+        self.send_request(path, "textDocument/definition", line, column, Pending::Definition, None);
     }
 
-    fn send_request(&mut self, path: &Path, method: &'static str, line: usize, column: usize, kind: Pending) {
+    /// Asks for completions at (`line`, UTF-16 `column`) of `text`, which the server gets
+    /// first so it never answers for stale text; answered by [`Event::Completion`].
+    /// `trigger` is the character just typed when it isn't part of a word: the request is
+    /// only sent if the server completes after that character.
+    pub fn completion(&mut self, path: &Path, line: usize, column: usize, text: String, trigger: Option<char>) {
+        self.change(path, text);
+        let Some(slot) = self.docs.get(path).and_then(|doc| self.slots.get(doc.server)) else { return };
+        if !slot.completion { return; }
+        let context = match trigger {
+            Some(ch) if slot.triggers.iter().any(|t| t.chars().eq([ch])) => json!({"triggerKind": 2, "triggerCharacter": ch.to_string()}),
+            Some(_) => return,
+            None => json!({"triggerKind": 1}),
+        };
+        self.send_request(path, "textDocument/completion", line, column, Pending::Completion { path: path.to_path_buf(), line, column }, Some(("context", context)));
+    }
+
+    fn send_request(&mut self, path: &Path, method: &'static str, line: usize, column: usize, kind: Pending, extra: Option<(&str, Value)>) {
         let Some(server) = self.docs.get(path).map(|doc| doc.server) else { return };
         // One outstanding request of each kind per server: the previous one is obsolete.
         let stale: Vec<i64> = self.pending.iter()
@@ -267,10 +322,11 @@ impl Core {
             if let Some(client) = self.ready_client(server) { client.notify("$/cancelRequest", json!({"id": id})); }
         }
         self.retries.retain(|(s, inflight, _)| *s != server || std::mem::discriminant(&inflight.kind) != std::mem::discriminant(&kind));
-        let params = json!({
+        let mut params = json!({
             "textDocument": {"uri": path_to_uri(path)},
             "position": {"line": line, "character": column},
         });
+        if let Some((key, value)) = extra { params[key] = value; }
         self.dispatch(server, InFlight { kind, method, params, sent: Instant::now(), attempts: 0 });
     }
 
@@ -362,12 +418,14 @@ impl Core {
                 "textDocument": {
                     "synchronization": {"didSave": true},
                     "publishDiagnostics": {"relatedInformation": false},
+                    // Plain-text completions: no snippet placeholders to fill in.
+                    "completion": {"completionItem": {"snippetSupport": false}, "contextSupport": true},
                 },
                 "workspace": {"configuration": false, "workspaceFolders": true},
                 "window": {"workDoneProgress": true},
             },
         }));
-        self.slots.insert(server.id, Slot { client: Some(client), init_id: Some(init_id), initialized: false, crashes, retry_at: None, disabled: false });
+        self.slots.insert(server.id, Slot { client: Some(client), init_id: Some(init_id), initialized: false, crashes, retry_at: None, disabled: false, completion: false, triggers: Vec::new() });
         true
     }
 
@@ -389,12 +447,15 @@ impl Core {
             for _ in 0..256 {
                 let Some(message) = client.try_recv() else { break };
                 match message {
-                    Incoming::Response { id, error, .. } if Some(id) == slot.init_id => {
+                    Incoming::Response { id, result, error } if Some(id) == slot.init_id => {
                         slot.init_id = None;
                         if let Some(error) = error {
                             exited = Some(format!("initialize failed: {error}"));
                             break;
                         }
+                        let provider = result.as_ref().and_then(|r| r.pointer("/capabilities/completionProvider"));
+                        slot.completion = provider.is_some();
+                        slot.triggers = provider.map(completion_triggers).unwrap_or_default();
                         client.notify("initialized", json!({}));
                         slot.initialized = true;
                         initialized_now = true;
@@ -424,6 +485,10 @@ impl Core {
                                 Some((path, line, column)) => self.events.push(Event::Definition { path, line, column }),
                                 None => self.events.push(Event::Notice("No definition found".into())),
                             },
+                            Pending::Completion { path, line, column } => {
+                                let (items, incomplete) = result.as_ref().map(parse_completion).unwrap_or_default();
+                                self.events.push(Event::Completion { path, line, column, items, incomplete });
+                            }
                         }
                     }
                     Incoming::Notification { method, params } => match method.as_str() {
@@ -520,6 +585,96 @@ fn parse_diagnostics(params: &Value) -> Option<(PathBuf, Vec<Diagnostic>)> {
     // Most severe first, so the first diagnostic on a line is the one worth showing.
     diagnostics.sort_by(|a, b| a.line.cmp(&b.line).then(b.severity.cmp(&a.severity)));
     Some((path, diagnostics))
+}
+
+/// `triggerCharacters` of a server's `completionProvider` capability.
+fn completion_triggers(provider: &Value) -> Vec<String> {
+    provider.get("triggerCharacters").and_then(Value::as_array)
+        .map(|chars| chars.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// Items of a `textDocument/completion` result (a `CompletionList` or a bare array) and
+/// whether the list is incomplete.
+fn parse_completion(result: &Value) -> (Vec<CompletionItem>, bool) {
+    let (items, incomplete) = match result {
+        Value::Array(items) => (items.as_slice(), false),
+        Value::Object(list) => (
+            list.get("items").and_then(Value::as_array).map_or(&[][..], Vec::as_slice),
+            list.get("isIncomplete").and_then(Value::as_bool).unwrap_or(false),
+        ),
+        _ => (&[][..], false),
+    };
+    let items = items.iter().take(MAX_COMPLETIONS).filter_map(|item| {
+        let label = item.get("label")?.as_str()?.to_owned();
+        let text = |key: &str| item.get(key).and_then(Value::as_str).map(str::to_owned);
+        // Snippets weren't asked for, but a server may send them anyway: keep the plain text.
+        let snippet = item.get("insertTextFormat").and_then(Value::as_u64) == Some(2);
+        let plain = |text: String| if snippet { strip_snippet(&text) } else { text };
+        let edit = item.get("textEdit").and_then(|edit| {
+            // An `InsertReplaceEdit` has `insert`/`replace` ranges instead of `range`.
+            let range = edit.get("range").or_else(|| edit.get("insert"))?;
+            Some(TextEdit { text: plain(edit.get("newText")?.as_str()?.to_owned()), ..text_edit_range(range)? })
+        });
+        let additional = item.get("additionalTextEdits").and_then(Value::as_array).map(|edits| {
+            edits.iter().filter_map(|edit| Some(TextEdit { text: edit.get("newText")?.as_str()?.to_owned(), ..text_edit_range(edit.get("range")?)? })).collect()
+        }).unwrap_or_default();
+        Some(CompletionItem {
+            kind: item.get("kind").and_then(Value::as_u64),
+            detail: text("detail").filter(|detail| !detail.is_empty()),
+            filter: text("filterText").unwrap_or_else(|| label.clone()),
+            sort: text("sortText").unwrap_or_else(|| label.clone()),
+            insert: plain(text("insertText").unwrap_or_else(|| label.clone())),
+            edit,
+            additional,
+            label,
+        })
+    }).collect();
+    (items, incomplete)
+}
+
+/// A `TextEdit` with only its range filled in.
+fn text_edit_range(range: &Value) -> Option<TextEdit> {
+    let position = |value: &Value| -> Option<(usize, usize)> {
+        Some((value.get("line")?.as_u64()? as usize, value.get("character")?.as_u64()? as usize))
+    };
+    Some(TextEdit { start: position(range.get("start")?)?, end: position(range.get("end")?)?, text: String::new() })
+}
+
+/// Snippet syntax as plain text: `${1:value}` keeps `value`, `$1`/`$0` and choices vanish,
+/// `\$` stays a dollar sign.
+fn strip_snippet(snippet: &str) -> String {
+    let mut out = String::new();
+    let mut chars = snippet.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => { if let Some(next) = chars.next() { out.push(next); } }
+            '$' if chars.peek().is_some_and(char::is_ascii_digit) => {
+                while chars.peek().is_some_and(char::is_ascii_digit) { chars.next(); }
+            }
+            '$' if chars.peek() == Some(&'{') => {
+                chars.next();
+                while chars.peek().is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_') { chars.next(); }
+                match chars.next() {
+                    // `${1:default}`: keep the default, which may itself hold placeholders.
+                    Some(':') => {
+                        let mut depth = 1;
+                        let mut inner = String::new();
+                        for c in chars.by_ref() {
+                            match c { '{' => depth += 1, '}' => { depth -= 1; if depth == 0 { break; } } _ => {} }
+                            inner.push(c);
+                        }
+                        out.push_str(&strip_snippet(&inner));
+                    }
+                    // `${1|a,b|}`: no single text to keep; `${1}`: nothing.
+                    Some('|') => { for c in chars.by_ref() { if c == '}' { break; } } }
+                    _ => {}
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// First target of a `textDocument/definition` result: a `Location`, an array of them, or
@@ -659,6 +814,44 @@ mod tests {
     }
 
     #[test]
+    fn completion_responses_are_read_in_every_shape() {
+        let list = json!({"isIncomplete": true, "items": [
+            {"label": "push", "kind": 2, "detail": "fn(&mut self, T)", "sortText": "0001",
+             "textEdit": {"range": {"start": {"line": 3, "character": 4}, "end": {"line": 3, "character": 6}}, "newText": "push"},
+             "additionalTextEdits": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "newText": "use a::b;\n"}]},
+            {"label": "len", "insertText": "len", "filterText": "length"},
+            {"label": "replace", "textEdit": {"insert": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}},
+             "replace": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 5}}, "newText": "replace"}},
+            {"label": "fmt", "insertTextFormat": 2, "insertText": "format!(\"${1:{}}\", $2)$0"},
+            {"kind": 3}
+        ]});
+        let (items, incomplete) = parse_completion(&list);
+        assert!(incomplete);
+        assert_eq!(items.len(), 4, "an item without a label is skipped");
+        assert_eq!(items[0], CompletionItem {
+            label: "push".into(), kind: Some(2), detail: Some("fn(&mut self, T)".into()), filter: "push".into(), sort: "0001".into(),
+            edit: Some(TextEdit { start: (3, 4), end: (3, 6), text: "push".into() }), insert: "push".into(),
+            additional: vec![TextEdit { start: (0, 0), end: (0, 0), text: "use a::b;\n".into() }],
+        });
+        assert_eq!((items[1].filter.as_str(), items[1].sort.as_str(), items[1].edit.as_ref()), ("length", "len", None));
+        assert_eq!(items[2].edit, Some(TextEdit { start: (1, 0), end: (1, 2), text: "replace".into() }), "insert range of an InsertReplaceEdit");
+        assert_eq!(items[3].insert, "format!(\"{}\", )", "snippet placeholders become plain text");
+
+        let (items, incomplete) = parse_completion(&json!([{"label": "a"}]));
+        assert_eq!((items.len(), incomplete), (1, false), "a bare array is complete");
+        assert_eq!(parse_completion(&Value::Null), (Vec::new(), false));
+    }
+
+    #[test]
+    fn snippets_and_trigger_characters() {
+        assert_eq!(strip_snippet("push(${1:value})$0"), "push(value)");
+        assert_eq!(strip_snippet("${1:Vec<${2:T}>}"), "Vec<T>");
+        assert_eq!(strip_snippet("${1|a,b|} and ${2} \\$x"), " and  $x");
+        assert_eq!(completion_triggers(&json!({"triggerCharacters": [".", ":", "<"]})), [".", ":", "<"]);
+        assert!(completion_triggers(&json!({})).is_empty());
+    }
+
+    #[test]
     fn hover_contents_become_short_plain_lines_and_definitions_resolve() {
         let markdown = json!({"kind": "markdown", "value": "```rust\nfn main()\n```\n\n\nDoes things.\n\n    indented code\n"});
         assert_eq!(hover_lines(&markdown), ["fn main()", "", "Does things.", "", "    indented code"]);
@@ -779,7 +972,7 @@ mod tests {
                             if path == main && has_error == want_error { return true; }
                         }
                         Event::Notice(text) => eprintln!("notice: {text}"),
-                        Event::Prompt(_) | Event::Hover { .. } | Event::Definition { .. } => {}
+                        Event::Prompt(_) | Event::Hover { .. } | Event::Definition { .. } | Event::Completion { .. } => {}
                     }
                 }
                 std::thread::sleep(Duration::from_millis(50));

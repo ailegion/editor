@@ -24,6 +24,7 @@ mod git;
 mod file_icons;
 mod git_diff;
 mod titlebar;
+mod completion;
 mod git_graph;
 mod git_preview;
 mod goto_line;
@@ -343,6 +344,8 @@ enum Message {
     AiModeSelected(AiMode),
     TreeDragReleased,
     TreeDragCancel,
+    /// Accept a completion: this item (clicked), or the selected one (Enter/Tab).
+    CompletionAccept(Option<usize>),
     /// Move these files and folders into this folder (confirmed by the user).
     TreeMoveConfirmed(Vec<PathBuf>, PathBuf),
     AiAttach,
@@ -436,6 +439,10 @@ struct State {
     /// The (line, byte index) the mouse is resting on, awaiting hover text, and the canvas
     /// pixel to anchor the popup at. A late answer for any other position is ignored.
     hover_request: Option<(usize, usize, iced::Point)>,
+    /// The completion list showing, and the latest position completions were asked for
+    /// (path, line, byte index), so answers to older requests are ignored.
+    completion: Option<completion::Session>,
+    completion_request: Option<(PathBuf, usize, usize)>,
 
     app_theme: theme::EditorTheme,
     themes: theme::ThemeRegistry,
@@ -549,6 +556,8 @@ impl State {
             lsp: lsp::Manager::default(),
             lsp_prompt: None,
             hover_request: None,
+            completion: None,
+            completion_request: None,
             app_theme,
             themes,
             highlighter: code_editor::Highlighter::new(),
@@ -930,6 +939,16 @@ impl State {
                         }
                     }
                 }
+                lsp::Event::Completion { path, line, column, items, incomplete } => {
+                    // Only the answer to the latest request, for the tab and line it was about.
+                    let Some((_, _, request)) = self.completion_request.clone().filter(|(p, l, _)| *p == path && *l == line) else { continue };
+                    let Some(tab) = self.tabs.get(self.active_tab).filter(|tab| tab.path.as_deref() == Some(path.as_path())) else { continue };
+                    let Some(text) = tab.content.inner.lines.get(line).map(|l| l.text()) else { continue };
+                    if text.get(..request).is_none() || lsp::byte_to_utf16(text, request) != column { continue; }
+                    let word = completion::word_start(text, request);
+                    let mut session = completion::Session::new(path, line, request, word, items, incomplete);
+                    self.completion = session.refilter(&tab.content).then_some(session);
+                }
                 lsp::Event::Definition { path, line, column } => {
                     tasks.push(self.open_path(path.clone()));
                     if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.path.as_deref() == Some(path.as_path())) {
@@ -942,6 +961,59 @@ impl State {
             }
         }
         Task::batch(tasks)
+    }
+
+    /// Asks the language server for completions at the active tab's cursor. `trigger` is the
+    /// non-word character just typed, when that is what prompted it.
+    fn request_completion(&mut self, trigger: Option<char>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else { return };
+        let Some(path) = tab.path.clone() else { return };
+        let cursor = tab.content.cursor;
+        let Some(line) = tab.content.inner.lines.get(cursor.line) else { return };
+        let column = lsp::byte_to_utf16(line.text(), cursor.index);
+        let text = tab.content.text();
+        self.completion_request = Some((path.clone(), cursor.line, cursor.index));
+        self.lsp.completion(&path, cursor.line, column, text, trigger);
+    }
+
+    fn close_completion(&mut self) {
+        self.completion = None;
+        self.completion_request = None;
+    }
+
+    /// The completion list, if it belongs to the active tab and the cursor is still in its word.
+    fn active_completion(&mut self) -> Option<&mut completion::Session> {
+        let tab = self.tabs.get(self.active_tab)?;
+        let valid = self.completion.as_ref().is_some_and(|session| tab.path.as_deref() == Some(session.path.as_path()) && session.at_cursor(&tab.content));
+        if !valid { self.close_completion(); }
+        self.completion.as_mut()
+    }
+
+    /// After the editor handled `key`: keeps the list in step with the typed word, and asks
+    /// for completions while a word is typed or after a character the server completes after.
+    fn after_editor_key(&mut self, key: &keyboard::Key, modifiers: keyboard::Modifiers) {
+        let typed = match key.as_ref() {
+            keyboard::Key::Character(c) if !modifiers.command() && !modifiers.alt() => c.chars().next(),
+            keyboard::Key::Named(keyboard::key::Named::Space) => Some(' '),
+            keyboard::Key::Named(keyboard::key::Named::Backspace) => None,
+            _ => { self.close_completion(); return; }
+        };
+        if let Some(ch) = typed.filter(|ch| !completion::is_word_char(*ch)) {
+            self.close_completion();
+            self.request_completion(Some(ch));
+            return;
+        }
+        // A word character, or Backspace (`typed` is `None`): narrow the list to the word.
+        let Some(tab) = self.tabs.get(self.active_tab) else { return };
+        let (open, incomplete) = match self.completion.as_mut() {
+            Some(session) => (session.refilter(&tab.content), session.incomplete),
+            None => (false, false),
+        };
+        let had_list = self.completion.is_some();
+        if !open { self.completion = None; }
+        // Typing a word with no list yet, or one the server marked incomplete (it may be
+        // missing what matches now): ask again, keeping what shows meanwhile.
+        if typed.is_some() && (!had_list || incomplete) { self.request_completion(None); }
     }
 
     /// UTF-16 column of byte `index` on `line` of the active tab, with the tab's path.
@@ -1345,8 +1417,19 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::ToggleFold(line) => {
             if let Some(tab) = state.tabs.get_mut(state.active_tab) { tab.content.toggle_fold(line); }
         }
+        Message::CompletionAccept(index) => {
+            let Some(session) = state.completion.take() else { return Task::none() };
+            state.completion_request = None;
+            let Some(tab) = state.tabs.get_mut(state.active_tab).filter(|tab| tab.path.as_deref() == Some(session.path.as_path())) else { return Task::none() };
+            let Some(edits) = index.or_else(|| session.selected_item()).and_then(|index| session.edits(index, &tab.content)) else { return Task::none() };
+            let before = tab.content.undo_count();
+            tab.content.replace_ranges(&edits, 0);
+            state.focus = Focus::Editor;
+            state.mark_edited_if_changed(before);
+        }
         Message::EditorAction(action) => {
             state.focus = Focus::Editor;
+            state.close_completion();
             let before = state
                 .tabs
                 .get(state.active_tab)
@@ -1992,6 +2075,34 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if key == keyboard::Key::Named(keyboard::key::Named::F12) && state.focus == Focus::Editor {
                 return update(state, Message::GoToDefinition);
             }
+            // Completion keys come before the editor's own: Ctrl+Space (Ctrl on every platform)
+            // asks for suggestions, and while the list shows it takes the arrows, Enter/Tab, Esc.
+            let editing = state.focus == Focus::Editor && !state.editor_hidden() && !state.quick_open.visible
+                && !state.command_palette.visible && !state.goto_line.visible && !state.theme_install.visible;
+            if editing && modifiers.control() && key == keyboard::Key::Named(keyboard::key::Named::Space) {
+                state.request_completion(None);
+                return Task::none();
+            }
+            if editing && state.active_completion().is_some() {
+                use keyboard::key::Named;
+                let plain = !modifiers.shift() && !modifiers.command() && !modifiers.alt();
+                match key.as_ref() {
+                    keyboard::Key::Named(Named::ArrowDown) if plain => {
+                        if let Some(session) = state.active_completion() { session.select(1); }
+                        return Task::none();
+                    }
+                    keyboard::Key::Named(Named::ArrowUp) if plain => {
+                        if let Some(session) = state.active_completion() { session.select(-1); }
+                        return Task::none();
+                    }
+                    keyboard::Key::Named(Named::Enter | Named::Tab) if plain => return update(state, Message::CompletionAccept(None)),
+                    keyboard::Key::Named(Named::Escape) => {
+                        state.close_completion();
+                        return Task::none();
+                    }
+                    _ => {}
+                }
+            }
             if modifiers.command() {
                 match key.as_ref() {
                     keyboard::Key::Character(c) if modifiers.shift() && c.eq_ignore_ascii_case("t") => {
@@ -2093,7 +2204,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     }
                     // Other command combos (undo/redo, ...) are the active editor's to handle.
                     _ => {
-                        state.handle_editor_key(&key, modifiers);
+                        if state.handle_editor_key(&key, modifiers) { state.close_completion(); }
                     }
                 }
             } else if state.theme_install.visible {
@@ -2174,8 +2285,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     } else {
                         task = open_task;
                     }
-                } else if state.focus == Focus::Editor {
-                    state.handle_editor_key(&key, modifiers);
+                } else if state.focus == Focus::Editor && state.handle_editor_key(&key, modifiers) {
+                    state.after_editor_key(&key, modifiers);
                 }
             }
         }
@@ -3269,6 +3380,14 @@ fn view_editor(state: &State) -> Element<'_, Message> {
                 });
                 let offset = iced::Padding { top: hover.anchor.y.max(0.0) + 2.0, left: hover.anchor.x.max(0.0), right: 0.0, bottom: 0.0 };
                 layers = layers.push(container(popup).padding(offset));
+        }
+        // Completions below the cursor, drawn over the canvas like the hover popup.
+        if let Some(session) = state.completion.as_ref()
+            .filter(|session| tab.path.as_deref() == Some(session.path.as_path()) && session.at_cursor(&tab.content))
+        {
+            if let Some(anchor) = code_editor::caret_anchor(&tab.content, &state.app_theme.editor, state.zoom) {
+                layers = layers.push(completion::view(session, anchor, |index| Message::CompletionAccept(Some(index))));
+            }
         }
         let editor: Element<'_, Message> = layers.into();
         let can_undo = tab.content.can_undo();

@@ -31,6 +31,9 @@ pub struct Buffer {
     pub collapsed: std::collections::BTreeSet<usize>,
     visible_lines: Vec<usize>,
     folding_text: String,
+    /// Vertical and horizontal scroll as last drawn (`f32` bits), copied from the editor
+    /// widget so the app can place popups at the cursor. Atomics keep `Buffer` `Sync`.
+    view_scroll: [std::sync::atomic::AtomicU32; 2],
 }
 
 impl Buffer {
@@ -54,6 +57,7 @@ impl Buffer {
             redo_stack: Vec::new(),
             folds: Default::default(), collapsed: Default::default(),
             visible_lines: Vec::new(), folding_text: String::new(),
+            view_scroll: Default::default(),
         };
         buffer.sync();
         buffer
@@ -167,6 +171,19 @@ impl Buffer {
     /// Pixel position of the top-left corner of the cursor, relative to the buffer origin.
     pub fn cursor_pixel(&self) -> Option<(i32, i32)> {
         self.cursor_pixel
+    }
+
+    /// Records the editor widget's scroll offsets as it draws; see `view_scroll`.
+    pub(super) fn set_view_scroll(&self, scroll: f32, scroll_x: f32) {
+        use std::sync::atomic::Ordering;
+        self.view_scroll[0].store(scroll.to_bits(), Ordering::Relaxed);
+        self.view_scroll[1].store(scroll_x.to_bits(), Ordering::Relaxed);
+    }
+
+    /// `(vertical, horizontal)` scroll as last drawn.
+    pub fn view_scroll(&self) -> (f32, f32) {
+        use std::sync::atomic::Ordering;
+        (f32::from_bits(self.view_scroll[0].load(Ordering::Relaxed)), f32::from_bits(self.view_scroll[1].load(Ordering::Relaxed)))
     }
 
     /// `(line, x_start, x_end)` selection highlight rects, one per selected line, relative to
@@ -293,6 +310,45 @@ impl Buffer {
         editor.delete_range(start, end);
         let new_cursor = editor.insert_at(start, replacement, None);
         editor.set_cursor(new_cursor);
+        let change = editor.finish_change();
+        self.cursor = editor.cursor();
+        self.selection = Selection::None;
+        self.push_undo(change);
+        self.sync();
+    }
+
+    /// Applies non-overlapping `edits` (start, end, replacement) as one undo step, leaving the
+    /// cursor just after the replacement of `edits[main]` -- e.g. an accepted completion plus
+    /// the import it needs further up. Edits run from the end of the document backwards so
+    /// earlier positions stay valid; the cursor is shifted by any edits applied above it.
+    pub fn replace_ranges(&mut self, edits: &[(Cursor, Cursor, String)], main: usize) {
+        let mut order: Vec<usize> = (0..edits.len()).collect();
+        order.sort_by(|a, b| {
+            let (a, b) = (edits[*a].0, edits[*b].0);
+            (b.line, b.index).cmp(&(a.line, a.index))
+        });
+        let mut editor = Editor::new(&mut self.inner);
+        editor.start_change();
+        let mut cursor: Option<Cursor> = None;
+        for index in order {
+            let (start, end, text) = &edits[index];
+            editor.delete_range(*start, *end);
+            let after = editor.insert_at(*start, text, None);
+            if index == main {
+                cursor = Some(after);
+            } else if let Some(c) = cursor.as_mut() {
+                // This edit lies before the cursor: move it by the lines/bytes it added or
+                // removed (signed, since an edit can remove more than it inserts).
+                let shift = |value: usize, from: usize, to: usize| (value as isize + to as isize - from as isize).max(0) as usize;
+                if end.line < c.line {
+                    c.line = shift(c.line, end.line, after.line);
+                } else if end.line == c.line {
+                    c.line = after.line;
+                    c.index = shift(c.index, end.index, after.index);
+                }
+            }
+        }
+        if let Some(cursor) = cursor { editor.set_cursor(cursor); }
         let change = editor.finish_change();
         self.cursor = editor.cursor();
         self.selection = Selection::None;

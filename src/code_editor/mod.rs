@@ -69,6 +69,16 @@ pub struct Hover {
     pub lines: Vec<String>,
 }
 
+/// Canvas pixel just below the text cursor, for anchoring a popup such as completions;
+/// `None` when the cursor's line is folded away or not laid out.
+pub fn caret_anchor(content: &Buffer, colors: &EditorColors, zoom: f32) -> Option<iced::Point> {
+    let style = Style::new(colors, zoom);
+    let (x, _) = content.cursor_pixel()?;
+    let row = content.visual_row(content.cursor.line)? as f32;
+    let (scroll, scroll_x) = content.view_scroll();
+    Some(iced::Point::new(style.gutter_width(content.line_count()) - scroll_x + x as f32, (row + 1.0) * style.line_height - scroll))
+}
+
 /// How long the mouse must rest on a word before hover information is requested.
 const HOVER_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 
@@ -250,6 +260,7 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
         cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
+        self.content.set_view_scroll(state.scroll, state.scroll_x);
         render::draw(self.content, self.diff, self.diagnostics, self.blame, &mut frame, &self.style, state.scroll, state.scroll_x);
         // Scrollbars: semi-transparent overlays, brighter while hovered or dragged.
         let local = Rectangle::with_size(bounds.size());
