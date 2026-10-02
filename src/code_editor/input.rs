@@ -164,6 +164,67 @@ mod tests {
         assert!(handle_key(buffer, &Key::Named(key), modifiers));
     }
 
+    /// Whether glyphs have width here; without a usable font every position is x = 0 and
+    /// moving by horizontal position can't be checked.
+    fn has_glyph_widths(buffer: &mut Buffer) -> bool {
+        buffer.goto(0, 1);
+        let wide = buffer.caret().is_some_and(|(_, x)| x > 0.0);
+        buffer.goto(0, 0);
+        wide
+    }
+
+    #[test]
+    fn up_and_down_keep_their_column_through_shorter_lines() {
+        // The first and last lines are the same text, so a column is the same x on both.
+        let mut buffer = Buffer::new("a line long enough\nab\n\na line long enough", cosmic_text::Metrics::new(14.0, 20.0));
+        if !has_glyph_widths(&mut buffer) { return; }
+        buffer.goto(0, 12);
+        press(&mut buffer, Named::ArrowDown, Modifiers::empty());
+        assert_eq!((buffer.cursor.line, buffer.cursor.index), (1, 2), "a shorter line clamps to its end");
+        press(&mut buffer, Named::ArrowDown, Modifiers::empty());
+        assert_eq!((buffer.cursor.line, buffer.cursor.index), (2, 0));
+        press(&mut buffer, Named::ArrowDown, Modifiers::empty());
+        assert_eq!((buffer.cursor.line, buffer.cursor.index), (3, 12), "back at the column it started in");
+        press(&mut buffer, Named::ArrowUp, Modifiers::empty());
+        press(&mut buffer, Named::ArrowUp, Modifiers::empty());
+        press(&mut buffer, Named::ArrowUp, Modifiers::empty());
+        assert_eq!((buffer.cursor.line, buffer.cursor.index), (0, 12));
+        // Moving sideways sets a new column to keep.
+        press(&mut buffer, Named::ArrowLeft, Modifiers::empty());
+        press(&mut buffer, Named::ArrowDown, Modifiers::empty());
+        press(&mut buffer, Named::ArrowDown, Modifiers::empty());
+        press(&mut buffer, Named::ArrowDown, Modifiers::empty());
+        assert_eq!((buffer.cursor.line, buffer.cursor.index), (3, 11));
+        // Past the last line is the end of the text; past the first, its start.
+        press(&mut buffer, Named::ArrowDown, Modifiers::empty());
+        assert_eq!((buffer.cursor.line, buffer.cursor.index), (3, 18));
+        buffer.goto(0, 5);
+        press(&mut buffer, Named::ArrowUp, Modifiers::empty());
+        assert_eq!((buffer.cursor.line, buffer.cursor.index), (0, 0));
+    }
+
+    #[test]
+    fn page_keys_move_by_the_rows_in_view() {
+        let text = (0..40).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let mut buffer = Buffer::new(&text, cosmic_text::Metrics::new(14.0, 20.0));
+        // 100px of 20px rows: five rows in view.
+        buffer.set_viewport(400.0, 100.0);
+        press(&mut buffer, Named::PageDown, Modifiers::empty());
+        assert_eq!(buffer.cursor.line, 5);
+        press(&mut buffer, Named::PageDown, Modifiers::SHIFT);
+        assert_eq!(buffer.cursor.line, 10);
+        assert!(buffer.copy_selection().is_some_and(|text| text.starts_with("line 5\n")));
+        press(&mut buffer, Named::PageUp, Modifiers::empty());
+        assert_eq!(buffer.cursor.line, 5);
+        press(&mut buffer, Named::PageUp, Modifiers::empty());
+        press(&mut buffer, Named::PageUp, Modifiers::empty());
+        assert_eq!(buffer.cursor.line, 0, "stops at the first row");
+        buffer.goto_line(38);
+        press(&mut buffer, Named::PageDown, Modifiers::empty());
+        assert_eq!(buffer.cursor.line, 39, "stops at the last row");
+        assert_eq!(buffer.undo_count(), 0);
+    }
+
     #[test]
     fn shift_arrows_select_and_plain_arrows_collapse() {
         let mut buffer = Buffer::new("hello\nworld", cosmic_text::Metrics::new(14.0, 20.0));

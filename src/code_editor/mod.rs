@@ -12,6 +12,7 @@ mod buffer;
 mod highlight;
 pub mod input;
 mod render;
+mod rows;
 pub mod search;
 mod theme;
 
@@ -43,6 +44,9 @@ pub struct CodeEditor<'a, Message> {
     on_fold: Option<Box<dyn Fn(usize) -> Message + 'a>>,
     on_action: Option<Box<dyn Fn(cosmic_text::Action) -> Message + 'a>>,
     on_probe: Option<Box<dyn Fn(Probe) -> Message + 'a>>,
+    /// Told `(text width, height)` when the widget's size no longer matches what the buffer
+    /// was last given; the app passes it on to `Buffer::set_viewport`.
+    on_viewport: Option<Box<dyn Fn(f32, f32) -> Message + 'a>>,
 }
 
 /// Mouse gestures that ask the language server something about a buffer position
@@ -73,10 +77,9 @@ pub struct Hover {
 /// `None` when the cursor's line is folded away or not laid out.
 pub fn caret_anchor(content: &Buffer, colors: &EditorColors, zoom: f32) -> Option<iced::Point> {
     let style = Style::new(colors, zoom);
-    let (x, _) = content.cursor_pixel()?;
-    let row = content.visual_row(content.cursor.line)? as f32;
+    let (row, x) = content.caret()?;
     let (scroll, scroll_x) = content.view_scroll();
-    Some(iced::Point::new(style.gutter_width(content.line_count()) - scroll_x + x as f32, (row + 1.0) * style.line_height - scroll))
+    Some(iced::Point::new(style.gutter_width(content.line_count()) - scroll_x + x, (row as f32 + 1.0) * style.line_height - scroll))
 }
 
 /// How long the mouse must rest on a word before hover information is requested.
@@ -99,6 +102,7 @@ impl<'a, Message> CodeEditor<'a, Message> {
             on_action: None,
             on_fold: None,
             on_probe: None,
+            on_viewport: None,
         }
     }
 
@@ -109,29 +113,36 @@ impl<'a, Message> CodeEditor<'a, Message> {
         if position.x < gutter_width || position.x >= bounds.width - BAR || position.y >= bounds.height - BAR {
             return None;
         }
-        let y = position.y + state.scroll;
-        let row = (y / self.style.line_height).max(0.0) as usize;
-        if row >= self.content.visible_count() { return None; }
-        let line = self.content.source_line(row);
-        let x = position.x - gutter_width + state.scroll_x;
-        let hit = self.content.inner.hit(x, line as f32 * self.style.line_height + y.rem_euclid(self.style.line_height))?;
-        let length = self.content.inner.lines.get(hit.line)?.text().len();
-        (hit.line == line && hit.index < length).then_some((hit.line, hit.index))
+        let row = ((position.y + state.scroll) / self.style.line_height).max(0.0) as usize;
+        self.content.hit_text(row, position.x - gutter_width + state.scroll_x)
     }
 
     /// Canvas pixel just below (`line`, byte `index`), for anchoring a popup.
     fn anchor_of(&self, state: &State, line: usize, index: usize) -> iced::Point {
         let gutter_width = self.style.gutter_width(self.content.line_count());
-        let x = self.content.inner.lines.get(line)
-            .and_then(|l| l.layout_opt().and_then(|lines| lines.first()).map(|layout| render::x_at(layout, index)))
-            .unwrap_or(0.0);
-        let row = self.content.visual_row(line).unwrap_or(0) as f32;
-        iced::Point::new(gutter_width - state.scroll_x + x, (row + 1.0) * self.style.line_height - state.scroll)
+        let (row, x) = self.content.locate(line, index).unwrap_or((0, 0.0));
+        iced::Point::new(gutter_width - state.scroll_x + x, (row as f32 + 1.0) * self.style.line_height - state.scroll)
+    }
+
+    /// Room for text: the canvas less the gutter and the vertical scrollbar. Lines wrap to
+    /// this width when word wrap is on.
+    fn text_width(&self, bounds: Rectangle) -> f32 {
+        (bounds.width - self.style.gutter_width(self.content.line_count()) - BAR).max(0.0)
+    }
+
+    pub fn on_viewport(mut self, f: impl Fn(f32, f32) -> Message + 'a) -> Self {
+        self.on_viewport = Some(Box::new(f));
+        self
     }
 
     pub fn on_action(mut self, f: impl Fn(cosmic_text::Action) -> Message + 'a) -> Self {
         self.on_action = Some(Box::new(f));
         self
+    }
+
+    /// The caret's place in pixels, as compared between redraws to tell whether it moved.
+    fn caret_key(&self) -> Option<(i32, i32)> {
+        self.content.caret().map(|(row, x)| (x as i32, (row as f32 * self.style.line_height) as i32))
     }
 
     /// If the cursor moved since `state.last_cursor` and now falls outside the visible
@@ -140,9 +151,7 @@ impl<'a, Message> CodeEditor<'a, Message> {
     /// Returns `false` both when the cursor hasn't moved (so a manual scroll-away is left
     /// alone) and when it moved but is still visible.
     fn scroll_correction(&self, state: &mut State, viewport: iced::Size) -> bool {
-        let current = self.content.cursor_pixel().and_then(|(x, _)| {
-            self.content.visual_row(self.content.cursor.line).map(|row| (x, (row as f32 * self.style.line_height) as i32))
-        });
+        let current = self.caret_key();
         let moved = current != state.last_cursor;
         state.last_cursor = current;
         if !moved {
@@ -156,6 +165,10 @@ impl<'a, Message> CodeEditor<'a, Message> {
         if let Some(scroll) = reveal_row(state.scroll, y, line_height, viewport.height) {
             state.scroll = scroll;
             changed = true;
+        }
+        // Wrapped text has nothing off to the side to scroll to.
+        if self.content.wrapped() {
+            return changed;
         }
         // Keep a small margin so the cursor never sits flush against either edge.
         let text_width = (viewport.width - self.style.gutter_width(self.content.line_count())).max(0.0);
@@ -171,6 +184,9 @@ impl<'a, Message> CodeEditor<'a, Message> {
     }
 
     fn max_scroll_x(&self, bounds: Rectangle) -> f32 {
+        if self.content.wrapped() {
+            return 0.0;
+        }
         let text_width = bounds.width - self.style.gutter_width(self.content.line_count());
         (self.content.content_width() + H_SCROLL_PAD - text_width).max(0.0)
     }
@@ -180,7 +196,9 @@ impl<'a, Message> CodeEditor<'a, Message> {
         match axis {
             Axis::X => {
                 let gutter = self.style.gutter_width(self.content.line_count());
-                (gutter, (bounds.width - gutter).max(0.0), self.content.content_width() + H_SCROLL_PAD)
+                // Nothing overflows sideways when lines wrap, so there is no bar.
+                let content = if self.content.wrapped() { 0.0 } else { self.content.content_width() + H_SCROLL_PAD };
+                (gutter, (bounds.width - gutter).max(0.0), content)
             }
             Axis::Y => (0.0, bounds.height, self.content.visible_count() as f32 * self.style.line_height + V_SCROLL_PAD),
         }
@@ -228,6 +246,19 @@ fn max_scroll(rows: usize, line_height: f32, view_height: f32) -> f32 {
     (rows as f32 * line_height + V_SCROLL_PAD - view_height).max(0.0)
 }
 
+/// The scroll that puts the text remembered in `top` -- a line, and how many rows into it the
+/// view began -- back at the top of the view, now that the line occupies `rows`. `None` when
+/// the line is folded away.
+fn top_scroll(top: (usize, f32), rows: std::ops::Range<usize>, line_height: f32) -> Option<f32> {
+    if rows.is_empty() {
+        return None;
+    }
+    // The line may have fewer rows than before: stay within it, keeping the part-row offset.
+    let into = top.1.max(0.0);
+    let into = into.min((rows.len() - 1) as f32 + into.fract());
+    Some((rows.start as f32 + into) * line_height)
+}
+
 /// The scroll that brings the line at `y` fully into view, clear of the horizontal
 /// scrollbar; `None` when it already is.
 fn reveal_row(scroll: f32, y: f32, line_height: f32, view_height: f32) -> Option<f32> {
@@ -264,6 +295,12 @@ pub struct State {
     last_cursor: Option<(i32, i32)>,
     /// Previous left-click, so the next press can be recognized as a double/triple click.
     last_click: Option<Click>,
+    /// The buffer and row layout `scroll` was last reconciled with, and the text then at the
+    /// top of the view: its line, and how many rows into that line the view began. When the
+    /// rows change shape under the same buffer (wrap, width, zoom), `scroll` is moved so that
+    /// text is still at the top.
+    layout: (u64, u64),
+    top: (usize, f32),
 }
 
 impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
@@ -309,8 +346,28 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
         // animation tick, see `render::draw`'s blinking cursor) as a chance to notice the
         // cursor drifted outside the visible window and correct `scroll` to bring it back in.
         if let Event::Window(iced::window::Event::RedrawRequested(_)) = event {
-            state.scroll = state.scroll.min(max_scroll(self.content.visible_count(), self.style.line_height, bounds.height));
+            let viewport = (self.text_width(bounds), bounds.height);
+            if viewport != self.content.viewport() {
+                if let Some(on_viewport) = self.on_viewport.as_ref() {
+                    return Some(canvas::Action::publish(on_viewport(viewport.0, viewport.1)));
+                }
+            }
+            let line_height = self.style.line_height;
+            let layout = (self.content.id(), self.content.layout_epoch());
+            if state.layout != layout {
+                // Same buffer, rows reshaped: put the text that was at the top back there,
+                // and don't mistake the caret's new row for the cursor having moved.
+                if state.layout.0 == layout.0 {
+                    state.scroll = top_scroll(state.top, self.content.rows_of(state.top.0), line_height).unwrap_or(state.scroll);
+                    state.last_cursor = self.caret_key();
+                }
+                state.layout = layout;
+            }
+            state.scroll = state.scroll.min(max_scroll(self.content.visible_count(), line_height, bounds.height));
             state.scroll_x = state.scroll_x.min(self.max_scroll_x(bounds));
+            let top_row = (state.scroll / line_height).max(0.0) as usize;
+            let top_line = self.content.source_line(top_row);
+            state.top = (top_line, state.scroll / line_height - self.content.visual_row(top_line).unwrap_or(top_row) as f32);
             if !state.hover_sent && state.hover_since.is_some_and(|since| since.elapsed() >= HOVER_DELAY) {
                 if let (Some((line, index)), Some(on_probe)) = (state.hover_cell, self.on_probe.as_ref()) {
                     state.hover_sent = true;
@@ -334,13 +391,7 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
         let scroll = state.scroll;
         let scroll_x = state.scroll_x;
         let buffer_position = |position: iced::Point| {
-            let y = position.y + scroll;
-            let row = (y / self.style.line_height).max(0.0) as usize;
-            (
-                (position.x - gutter_width + scroll_x) as i32,
-                (self.content.source_line(row) as f32 * self.style.line_height
-                    + y.rem_euclid(self.style.line_height)) as i32,
-            )
+            ((position.x - gutter_width + scroll_x) as i32, (position.y + scroll) as i32)
         };
 
         let Event::Mouse(mouse_event) = event else {
@@ -376,7 +427,8 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
                 let row = ((position.y + state.scroll) / self.style.line_height).max(0.0) as usize;
                 let line = self.content.source_line(row);
                 if position.x >= gutter_width - 18.0 && position.x < gutter_width {
-                    if self.content.folds.contains_key(&line) {
+                    // The fold arrow is on the line's first row.
+                    if self.content.folds.contains_key(&line) && self.content.visual_row(line) == Some(row) {
                         return self.on_fold.as_ref().map(|on_fold| canvas::Action::publish(on_fold(line)).and_capture());
                     }
                 }
@@ -474,9 +526,11 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
         // Same hit area as the fold toggle in `update`.
         let gutter_width = self.style.gutter_width(self.content.line_count());
         let row = ((position.y + state.scroll) / self.style.line_height).max(0.0) as usize;
+        let line = self.content.source_line(row);
         if position.x >= gutter_width - 18.0
             && position.x < gutter_width
-            && self.content.folds.contains_key(&self.content.source_line(row))
+            && self.content.folds.contains_key(&line)
+            && self.content.visual_row(line) == Some(row)
         {
             mouse::Interaction::Pointer
         } else {
@@ -495,11 +549,12 @@ pub fn code_editor<'a, Message>(
     on_action: impl Fn(cosmic_text::Action) -> Message + 'a,
     on_fold: impl Fn(usize) -> Message + 'a,
     on_probe: impl Fn(Probe) -> Message + 'a,
+    on_viewport: impl Fn(f32, f32) -> Message + 'a,
 ) -> Element<'a, Message>
 where
     Message: 'a,
 {
-    let mut editor = CodeEditor::new(content, diff, diagnostics, colors, zoom).on_action(on_action);
+    let mut editor = CodeEditor::new(content, diff, diagnostics, colors, zoom).on_action(on_action).on_viewport(on_viewport);
     editor.blame = blame;
     editor.on_fold = Some(Box::new(on_fold));
     editor.on_probe = Some(Box::new(on_probe));
@@ -530,5 +585,21 @@ mod tests {
         // A line above the view scrolls up to it; one already in view leaves the scroll alone.
         assert_eq!(reveal_row(400.0, 100.0, line_height, view), Some(100.0));
         assert_eq!(reveal_row(400.0, 440.0, line_height, view), None);
+    }
+
+    #[test]
+    fn the_text_at_the_top_stays_there_when_rows_change_shape() {
+        // Line 30 was at the top, the view starting half a row into it. Wrapping lines above
+        // it moved it from row 30 to rows 42..44: it is still at the top, half a row in.
+        assert_eq!(top_scroll((30, 0.5), 42..44, 20.0), Some(850.0));
+        // The view began on the line's third row; narrower now, it has five and that row is
+        // still the one at the top.
+        assert_eq!(top_scroll((30, 2.25), 42..47, 20.0), Some(885.0));
+        // Unwrapped, the line is a single row: the view starts on it, keeping the part row.
+        assert_eq!(top_scroll((30, 2.25), 30..31, 20.0), Some(605.0));
+        // A new line height (zoom) scales with it.
+        assert_eq!(top_scroll((30, 0.5), 30..31, 30.0), Some(915.0));
+        // A line folded away has no place to return to.
+        assert_eq!(top_scroll((30, 0.5), 0..0, 20.0), None);
     }
 }

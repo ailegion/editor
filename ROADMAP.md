@@ -106,7 +106,7 @@ for a "minimal, no-bloat" positioning.
 | Fetch / pull / push | ✅ | ✅ source control ⋯ menu (done) |
 | Commit graph / history | ✅ (Zed, VS Code, JetBrains; extensions elsewhere) | ✅ Git: Show Graph, with commit files and diffs (done) |
 | Inline blame | ✅ | ✅ (done) |
-| Word wrap toggle | ✅ | ❌ none (code editor doesn't wrap) |
+| Word wrap toggle | ✅ | ✅ View → Toggle Word Wrap (Alt+Z), wrapped rows indented like the line (done) |
 | Bracket matching / auto-close | ✅ | ✅ (done) |
 | Code folding | ✅ | ✅ (done) |
 | Markdown preview | ✅ | ✅ toggle for `.md` files (done) |
@@ -132,7 +132,8 @@ Ordered by (impact on daily editing) ÷ (implementation cost). Completed phases 
 - **Navigation:** Quick Open, Command Palette, Go to Line, recent files
   (`quick_open.rs`, `command_palette.rs`, `goto_line.rs`, `recent_files.rs`)
 - **Editing polish:** bracket matching/auto-close (`code_editor/brackets.rs`), regex
-  find/replace (`code_editor/search.rs`), code folding (`code_editor/folding.rs`)
+  find/replace (`code_editor/search.rs`), code folding (`code_editor/folding.rs`), word wrap
+  (`code_editor/rows.rs`; design and history in `docs/WORD_WRAP_PLAN.md`)
 - **Git:** diff gutter (`git_diff.rs`), per-file staging, side-by-side diffs
   (`git_preview.rs`), inline blame (`git/blame.rs`), branch picker (`git/branches.rs`),
   fetch/pull/push (`git/remote.rs`), commit graph (`git_graph.rs`)
@@ -144,36 +145,24 @@ Ordered by (impact on daily editing) ÷ (implementation cost). Completed phases 
 
 ### Next — Editing
 1. **Diagnostics panel** — list of the project's diagnostics, click to jump.
-2. **Word wrap toggle** — a renderer change, see the note below.
-3. **Multi-cursor** — the buffer has a single cursor and selection today.
-4. **Outline / symbols** — LSP `textDocument/documentSymbol`.
-
-**Word wrap note:** the custom canvas renderer (`code_editor/render.rs`) draws one row per
-`BufferLine` at a fixed `y = line_index * line_height`, and `Buffer::sync` (cursor/selection
-pixel math) assumes one `cosmic_text::LayoutLine` per buffer line -- both explicit,
-documented assumptions from when the renderer was built. Real word wrap needs cosmic-text's
-own wrap-aware layout iteration (`Buffer::layout_runs()`, which yields one `LayoutRun` per
-*visual* row with its own correct `line_top`, already accounting for wrapped continuations)
-instead of the current manual `index * line_height` math, plus reworking scrolling (currently
-a raw pixel `f32`) to work in visual rows rather than buffer lines, plus making gutter line
-numbers only draw on a buffer line's first visual row. That's a renderer-architecture change,
-not a toggle -- worth scoping as its own task.
+2. **Multi-cursor** — the buffer has a single cursor and selection today.
+3. **Outline / symbols** — LSP `textDocument/documentSymbol`.
 
 ### Next — Git
-5. **Hunk staging** — stage/unstage individual hunks from the diff view.
+4. **Hunk staging** — stage/unstage individual hunks from the diff view.
 
 ### Next — Files and search
-6. **Project search: `.gitignore`** — skip ignored files instead of a fixed directory list.
-7. **Drag-and-drop to open files** from the OS.
+5. **Project search: `.gitignore`** — skip ignored files instead of a fixed directory list.
+6. **Drag-and-drop to open files** from the OS.
 
 ### Next — Layout and settings
-8. **Split editor panes** — two `PaneKind::Main`-equivalent editors side by side.
-9. **Unified settings file** — consolidate the `~/.config/editor/*` files (`session.json`,
-    `last_project`, `app_theme`, `file_tree_exclude`, `zoom`, `sidebar_ratio`, `ai_ratio`,
+7. **Split editor panes** — two `PaneKind::Main`-equivalent editors side by side.
+8. **Unified settings file** — consolidate the `~/.config/editor/*` files (`session.json`,
+    `last_project`, `app_theme`, `file_tree_exclude`, `zoom`, `word_wrap`, `sidebar_ratio`, `ai_ratio`,
     `window_*`, `ai_visible`, `sidebar_visible`, `recent_files`, `terminal_shell`,
     `git_tree_view`, `ai_connections.json`, `chat_threads/`, `acp_threads/`, `themes/`,
     `lsp/`) into one `settings.json`, with a minimal settings UI.
-10. **Auto-save toggle** — debounce writes to disk.
+9. **Auto-save toggle** — debounce writes to disk.
 
 ### To verify
 - **CRLF files may be saved as LF:** line endings are detected and shown, but saving writes

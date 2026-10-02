@@ -201,6 +201,7 @@ enum ViewAction {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    ToggleWordWrap,
 }
 
 impl std::fmt::Display for ViewAction {
@@ -209,6 +210,7 @@ impl std::fmt::Display for ViewAction {
             ViewAction::ZoomIn => "Zoom In (Cmd+=)",
             ViewAction::ZoomOut => "Zoom Out (Cmd+-)",
             ViewAction::ZoomReset => "Reset Zoom (Cmd+0)",
+            ViewAction::ToggleWordWrap => "Toggle Word Wrap (Alt+Z)",
         };
         write!(f, "{label}")
     }
@@ -370,6 +372,8 @@ enum Message {
     LspDismiss(&'static str),
     /// Hover / Ctrl+click gestures from the editor canvas.
     EditorProbe(code_editor::Probe),
+    /// The editor widget's room for text and its height changed.
+    EditorViewport(f32, f32),
     /// Go to the definition of the symbol under the caret (F12).
     GoToDefinition,
     Codex(acp::Message),
@@ -448,6 +452,8 @@ struct State {
     themes: theme::ThemeRegistry,
     highlighter: code_editor::Highlighter,
     zoom: f32,
+    /// Long lines continue on further rows instead of running off to the right.
+    word_wrap: bool,
 
     panes: pane_grid::State<PaneKind>,
     sidebar_split: Option<pane_grid::Split>,
@@ -562,6 +568,7 @@ impl State {
             themes,
             highlighter: code_editor::Highlighter::new(),
             zoom,
+            word_wrap: load_word_wrap(),
             panes,
             sidebar_split,
             ai_split,
@@ -602,6 +609,7 @@ impl State {
             }
             for recovery in session.recovery {
                 let mut content = code_editor::Buffer::new(&recovery.text, code_editor::metrics_for_zoom(state.zoom));
+                content.set_wrap(state.word_wrap);
                 let extension = recovery.path.as_ref().and_then(|path| path.extension()).and_then(|ext| ext.to_str()).unwrap_or("txt");
                 content.highlight(&state.highlighter, extension, &state.app_theme.syntax);
                 if let Some(path) = &recovery.path { state.lsp.open(path, recovery.text.clone()); }
@@ -740,6 +748,7 @@ impl State {
                     let extension = tab.extension();
                     tab.content =
                         code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
+                    tab.content.set_wrap(self.word_wrap);
                     tab.content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
                     tab.blame.clear();
                     self.lsp.changed(&path);
@@ -794,6 +803,7 @@ impl State {
             .to_string();
         let line_ending = LineEnding::detect(&text);
         let mut content = code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
+        content.set_wrap(self.word_wrap);
         content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
         recent_files::record(&mut self.recent_files, path.clone());
         self.lsp.set_root(&self.root_or_cwd());
@@ -1078,11 +1088,21 @@ impl State {
 
     /// Applies `action` to `self.zoom`, then re-shapes every open tab's buffer at the new
     /// font size/line height and persists the level for next launch.
+    /// Turns word wrap on or off for every open file, and for files opened from now on.
+    fn toggle_word_wrap(&mut self) {
+        self.word_wrap = !self.word_wrap;
+        for tab in &mut self.tabs {
+            tab.content.set_wrap(self.word_wrap);
+        }
+        save_word_wrap(self.word_wrap);
+    }
+
     fn apply_zoom(&mut self, action: ViewAction) {
         self.zoom = match action {
             ViewAction::ZoomIn => (self.zoom + code_editor::ZOOM_STEP).min(code_editor::ZOOM_MAX),
             ViewAction::ZoomOut => (self.zoom - code_editor::ZOOM_STEP).max(code_editor::ZOOM_MIN),
             ViewAction::ZoomReset => code_editor::ZOOM_DEFAULT,
+            ViewAction::ToggleWordWrap => return self.toggle_word_wrap(),
         };
         let metrics = code_editor::metrics_for_zoom(self.zoom);
         for tab in &mut self.tabs {
@@ -1440,6 +1460,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 tab.hover = None;
             }
             state.mark_edited_if_changed(before);
+        }
+        Message::EditorViewport(width, height) => {
+            if let Some(tab) = state.tabs.get_mut(state.active_tab) { tab.content.set_viewport(width, height); }
         }
         Message::Search(msg) => {
             let before = state
@@ -2091,6 +2114,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // asks for suggestions, and while the list shows it takes the arrows, Enter/Tab, Esc.
             let editing = state.focus == Focus::Editor && !state.editor_hidden() && !state.quick_open.visible
                 && !state.command_palette.visible && !state.goto_line.visible && !state.theme_install.visible;
+            if editing && modifiers.alt() && !modifiers.command() && !modifiers.shift() && key.as_ref() == keyboard::Key::Character("z") {
+                state.toggle_word_wrap();
+                return Task::none();
+            }
             if editing && modifiers.control() && key == keyboard::Key::Named(keyboard::key::Named::Space) {
                 state.request_completion(None);
                 return Task::none();
@@ -2892,6 +2919,7 @@ fn command_list(state: &State) -> Vec<command_palette::Command> {
         Command { label: ViewAction::ZoomIn.to_string(), message: Message::ViewAction(ViewAction::ZoomIn) },
         Command { label: ViewAction::ZoomOut.to_string(), message: Message::ViewAction(ViewAction::ZoomOut) },
         Command { label: ViewAction::ZoomReset.to_string(), message: Message::ViewAction(ViewAction::ZoomReset) },
+        Command { label: ViewAction::ToggleWordWrap.to_string(), message: Message::ViewAction(ViewAction::ToggleWordWrap) },
         Command { label: "Toggle Sidebar".to_string(), message: Message::SidebarToggle },
         Command { label: "Toggle Git Panel".to_string(), message: Message::GitPanelToggle },
         Command { label: "Toggle Terminal (Ctrl+`)".into(), message: Message::TerminalToggle },
@@ -3027,6 +3055,10 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
         (menu_button(
             ViewAction::ZoomReset.to_string(),
             Message::ViewAction(ViewAction::ZoomReset)
+        )),
+        (menu_button(
+            ViewAction::ToggleWordWrap.to_string(),
+            Message::ViewAction(ViewAction::ToggleWordWrap)
         )),
         (menu_button("Toggle Terminal (Ctrl+`)".into(), Message::TerminalToggle)),
     );
@@ -3378,6 +3410,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             Message::EditorAction,
             Message::ToggleFold,
             Message::EditorProbe,
+            Message::EditorViewport,
         );
         // Hover text as a real widget over the canvas; see `code_editor::Hover` for why.
         // The stack is always present: wrapping the canvas only while a popup shows would
@@ -3679,6 +3712,19 @@ fn save_zoom(zoom: f32) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(path, zoom.to_string());
+}
+
+fn save_word_wrap(on: bool) {
+    let Some(path) = config_path("word_wrap") else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, on.to_string());
+}
+
+/// Word wrap is off unless it was saved as on.
+fn load_word_wrap() -> bool {
+    config_path("word_wrap").and_then(|path| std::fs::read_to_string(path).ok()).is_some_and(|text| text.trim() == "true")
 }
 
 fn load_zoom() -> f32 {

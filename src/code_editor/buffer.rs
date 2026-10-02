@@ -1,10 +1,19 @@
 use cosmic_text::{
-    Attrs, Buffer as CosmicBuffer, Change, Cursor, Edit, Editor, FontSystem, Metrics, Selection,
-    Shaping, Wrap,
+    Affinity, Attrs, Buffer as CosmicBuffer, Change, Cursor, Edit, Editor, FontSystem, LayoutGlyph,
+    Metrics, Selection, Shaping, Wrap,
 };
 
 use super::brackets;
 use super::highlight::Highlighter;
+use super::rows::{Row, RowMap};
+
+/// The laid-out glyphs of `line`: the engine keeps each line as one unwrapped row.
+fn glyphs_of(inner: &CosmicBuffer, line: usize) -> &[LayoutGlyph] {
+    inner.lines.get(line)
+        .and_then(|line| line.layout_opt())
+        .and_then(|layout| layout.first())
+        .map_or(&[], |layout| layout.glyphs.as_slice())
+}
 
 /// Wraps a `cosmic_text::Buffer`, tracking cursor/selection state alongside it.
 ///
@@ -16,20 +25,40 @@ pub struct Buffer {
     pub font_system: FontSystem,
     pub cursor: Cursor,
     pub selection: Selection,
-    cursor_pixel: Option<(i32, i32)>,
-    /// `(line, x_start, x_end)` selection highlight rects, one per selected line.
+    /// Which part of which line every screen row shows; see `rows.rs`. All positions below
+    /// are in its terms: a row index, and x relative to where text starts on screen.
+    rows: RowMap,
+    /// Something `rows` is built from changed -- the text or its styling, the folds, the wrap
+    /// setting or width, the metrics -- so the next `sync` rebuilds it. Moving the cursor or
+    /// the selection changes none of those.
+    rows_stale: bool,
+    /// Row and x of the caret; `None` when its line is folded away.
+    caret: Option<(usize, f32)>,
+    /// `(row, x_start, x_end)` selection highlight rects, one per row the selection touches.
     selection_pixels: Vec<(usize, f32, f32)>,
-    /// `(line, x_start, x_end)` rects for the bracket at the cursor and its match, if any
+    /// `(row, x_start, x_end)` rects for the bracket at the cursor and its match, if any
     /// (0 or 2 entries -- same shape as `selection_pixels` so `render.rs` can treat them
     /// alike, just with a different style).
     matched_brackets: Vec<(usize, f32, f32)>,
+    /// Word wrap: lines wider than `wrap_width` continue on further rows.
+    wrap: bool,
+    /// Room for text in the editor widget and the widget's height, as it last reported them.
+    wrap_width: f32,
+    view_height: f32,
+    /// Bumped whenever rows change shape for a reason other than an edit (wrap, width, zoom),
+    /// so the widget can keep the same text at the top of the view.
+    layout_epoch: u64,
+    /// The x that moving up or down aims for, kept while only such moves happen so that
+    /// passing through a shorter row doesn't lose the column.
+    goal_x: Option<f32>,
+    /// Tells this buffer from every other, for the widget's state, which outlives tab switches.
+    id: u64,
     /// Width in pixels of the widest laid-out line, so the widget can bound horizontal scroll.
     content_width: f32,
     undo_stack: Vec<Change>,
     redo_stack: Vec<Change>,
     pub folds: std::collections::BTreeMap<usize, usize>,
     pub collapsed: std::collections::BTreeSet<usize>,
-    visible_lines: Vec<usize>,
     folding_text: String,
     /// Vertical and horizontal scroll as last drawn (`f32` bits), copied from the editor
     /// widget so the app can place popups at the cursor. Atomics keep `Buffer` `Sync`.
@@ -40,8 +69,8 @@ impl Buffer {
     pub fn new(text: &str, metrics: Metrics) -> Self {
         let mut font_system = FontSystem::new();
         let mut inner = CosmicBuffer::new(&mut font_system, metrics);
-        // Code editors don't soft-wrap; this also keeps one `LayoutLine` per `BufferLine`,
-        // which `render.rs` and `cursor_pixel` both assume.
+        // The engine never wraps and is given no size: it lays every line out as one long
+        // row, which `rows` slices into screen rows (see `rows.rs`).
         inner.set_wrap(&mut font_system, Wrap::None);
         inner.set_text(&mut font_system, text, &Attrs::new(), Shaping::Advanced, None);
         let mut buffer = Self {
@@ -49,29 +78,123 @@ impl Buffer {
             font_system,
             cursor: Cursor::default(),
             selection: Selection::None,
-            cursor_pixel: None,
+            rows: RowMap::default(),
+            rows_stale: true,
+            caret: None,
             selection_pixels: Vec::new(),
             matched_brackets: Vec::new(),
+            wrap: false,
+            wrap_width: 0.0,
+            view_height: 0.0,
+            layout_epoch: 0,
+            goal_x: None,
+            id: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             content_width: 0.0,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             folds: Default::default(), collapsed: Default::default(),
-            visible_lines: Vec::new(), folding_text: String::new(),
+            folding_text: String::new(),
             view_scroll: Default::default(),
         };
         buffer.sync();
         buffer
     }
 
-    pub fn visible_count(&self) -> usize { self.visible_lines.len() }
+    /// Number of screen rows.
+    pub fn visible_count(&self) -> usize { self.rows.len() }
 
+    /// The first screen row of `line`; `None` when it is folded away.
     pub fn visual_row(&self, line: usize) -> Option<usize> {
-        self.visible_lines.binary_search(&line).ok()
+        self.rows.first_row(line)
     }
 
+    /// The line shown on screen row `row` (clamped to the last row).
     pub fn source_line(&self, row: usize) -> usize {
-        self.visible_lines.get(row).or_else(|| self.visible_lines.last()).copied().unwrap_or(0)
+        self.rows.line_at(row)
     }
+
+    /// The screen rows `line` occupies: one, several when it wraps, none when folded away.
+    pub fn rows_of(&self, line: usize) -> std::ops::Range<usize> {
+        self.rows.of_line(line)
+    }
+
+    pub fn row(&self, row: usize) -> Option<&Row> {
+        self.rows.get(row)
+    }
+
+    /// The laid-out glyphs of `line`, which a [`Row`] of that line indexes into.
+    pub fn glyphs(&self, line: usize) -> &[LayoutGlyph] {
+        glyphs_of(&self.inner, line)
+    }
+
+    /// Screen row and x (relative to the text origin) of the caret; `None` when its line is
+    /// folded away.
+    pub fn caret(&self) -> Option<(usize, f32)> {
+        self.caret
+    }
+
+    /// Screen row and x of byte `index` on `line`; `None` when the line is folded away.
+    pub fn locate(&self, line: usize, index: usize) -> Option<(usize, f32)> {
+        let row = self.rows.locate(line, index, false)?;
+        Some((row, self.rows.get(row)?.x_of(self.glyphs(line), index)))
+    }
+
+    /// The text position at `x` on screen row `row` (clamped to the last row).
+    pub fn hit(&self, row: usize, x: f32) -> Cursor {
+        let Some(row) = self.rows.get(row.min(self.rows.len().saturating_sub(1))) else { return self.cursor };
+        let text = self.inner.lines.get(row.line).map_or("", |line| line.text());
+        let (index, at_end) = row.hit(self.glyphs(row.line), text, x);
+        // At a wrap point the affinity says which of the two rows the caret shows on.
+        Cursor::new_with_affinity(row.line, index, if at_end { Affinity::Before } else { Affinity::After })
+    }
+
+    /// `(line, byte index)` under `x` on screen row `row`, when that is over text rather
+    /// than the space beside it or below the last row.
+    pub fn hit_text(&self, row: usize, x: f32) -> Option<(usize, usize)> {
+        let row = self.rows.get(row)?;
+        let text = self.inner.lines.get(row.line)?.text();
+        let index = row.hit_glyph(self.glyphs(row.line), text, x)?;
+        (index < text.len()).then_some((row.line, index))
+    }
+
+    pub fn wrapped(&self) -> bool { self.wrap }
+
+    /// Turns word wrap on or off.
+    pub fn set_wrap(&mut self, wrap: bool) {
+        if self.wrap != wrap {
+            self.wrap = wrap;
+            self.layout_epoch += 1;
+            self.rows_stale = true;
+            self.sync();
+        }
+    }
+
+    /// Records the room the editor widget has for text and its height; with word wrap on,
+    /// lines are re-wrapped to a new width.
+    pub fn set_viewport(&mut self, width: f32, height: f32) {
+        let rewrap = self.wrap && width != self.wrap_width;
+        self.wrap_width = width;
+        self.view_height = height;
+        if rewrap {
+            self.layout_epoch += 1;
+            self.rows_stale = true;
+            self.sync();
+        }
+    }
+
+    /// `(text width, height)` as last given to `set_viewport`.
+    pub fn viewport(&self) -> (f32, f32) {
+        (self.wrap_width, self.view_height)
+    }
+
+    /// See the `layout_epoch` field.
+    pub fn layout_epoch(&self) -> u64 { self.layout_epoch }
+
+    /// See the `id` field.
+    pub fn id(&self) -> u64 { self.id }
 
     pub fn toggle_fold(&mut self, line: usize) {
         if !self.folds.contains_key(&line) { return; }
@@ -80,22 +203,7 @@ impl Buffer {
             self.goto_line(line);
             self.collapsed.insert(line);
         }
-        self.rebuild_visible();
-    }
-
-    fn rebuild_visible(&mut self) {
-        self.visible_lines.clear();
-        let mut line = 0;
-        while line < self.line_count() {
-            self.visible_lines.push(line);
-            line = if self.collapsed.contains(&line) {
-                self.folds.get(&line).copied().unwrap_or(line) + 1
-            } else { line + 1 };
-        }
-    }
-
-    pub fn set_size(&mut self, width: f32, height: f32) {
-        self.inner.set_size(&mut self.font_system, Some(width), Some(height));
+        self.rows_stale = true;
         self.sync();
     }
 
@@ -103,6 +211,8 @@ impl Buffer {
     /// re-syncing cached cursor/selection pixel positions to match.
     pub fn set_metrics(&mut self, metrics: Metrics) {
         self.inner.set_metrics(&mut self.font_system, metrics);
+        self.layout_epoch += 1;
+        self.rows_stale = true;
         self.sync();
     }
 
@@ -165,11 +275,6 @@ impl Buffer {
         self.sync();
     }
 
-    /// Pixel position of the top-left corner of the cursor, relative to the buffer origin.
-    pub fn cursor_pixel(&self) -> Option<(i32, i32)> {
-        self.cursor_pixel
-    }
-
     /// Records the editor widget's scroll offsets as it draws; see `view_scroll`.
     pub(super) fn set_view_scroll(&self, scroll: f32, scroll_x: f32) {
         use std::sync::atomic::Ordering;
@@ -183,13 +288,13 @@ impl Buffer {
         (f32::from_bits(self.view_scroll[0].load(Ordering::Relaxed)), f32::from_bits(self.view_scroll[1].load(Ordering::Relaxed)))
     }
 
-    /// `(line, x_start, x_end)` selection highlight rects, one per selected line, relative to
-    /// the buffer origin.
+    /// `(row, x_start, x_end)` selection highlight rects, one per screen row the selection
+    /// touches, x relative to the text origin.
     pub fn selection_pixels(&self) -> &[(usize, f32, f32)] {
         &self.selection_pixels
     }
 
-    /// `(line, x_start, x_end)` rects for the bracket next to the cursor and its match, if
+    /// `(row, x_start, x_end)` rects for the bracket next to the cursor and its match, if
     /// any -- see the `matched_brackets` field doc.
     pub fn matched_brackets(&self) -> &[(usize, f32, f32)] {
         &self.matched_brackets
@@ -200,8 +305,76 @@ impl Buffer {
         self.content_width
     }
 
+    /// Applies a mouse action, whose `x`/`y` are relative to where text starts on screen
+    /// with scrolling added back: `y` counts rows from the first, `x` is within the row.
+    /// These go through the row map rather than the engine, which knows nothing of rows.
+    fn perform_pointer(&mut self, action: &cosmic_text::Action) -> bool {
+        use cosmic_text::Action;
+        let (Action::Click { x, y } | Action::DoubleClick { x, y } | Action::TripleClick { x, y } | Action::Drag { x, y }) = *action else {
+            return false;
+        };
+        let row = (y as f32 / self.inner.metrics().line_height).max(0.0) as usize;
+        let cursor = self.hit(row, x as f32);
+        self.selection = match action {
+            // A drag extends from where the press put the cursor, keeping a word or line
+            // selection started by a double or triple click.
+            Action::Drag { .. } if self.selection == Selection::None => Selection::Normal(self.cursor),
+            Action::Drag { .. } => self.selection,
+            Action::DoubleClick { .. } => Selection::Word(cursor),
+            Action::TripleClick { .. } => Selection::Line(cursor),
+            _ => Selection::None,
+        };
+        self.cursor = cursor;
+        self.sync();
+        true
+    }
+
+    /// Applies the motions that depend on screen rows: up and down by one row or one page,
+    /// and to either end of the row. Like the engine's motions they leave the selection alone.
+    fn perform_row_motion(&mut self, action: &cosmic_text::Action) -> bool {
+        use cosmic_text::{Action, Motion};
+        let Action::Motion(motion) = *action else { return false; };
+        let Some((row, x)) = self.caret else { return false; };
+        let page = ((self.view_height / self.inner.metrics().line_height) as usize).max(1);
+        let down = match motion {
+            Motion::Up => -1,
+            Motion::Down => 1,
+            Motion::PageUp => -(page as isize),
+            Motion::PageDown => page as isize,
+            Motion::Home | Motion::End => {
+                let Some(row) = self.rows.get(row) else { return false; };
+                self.cursor = if motion == Motion::Home {
+                    Cursor::new_with_affinity(row.line, row.start, Affinity::After)
+                } else {
+                    Cursor::new_with_affinity(row.line, row.end, Affinity::Before)
+                };
+                self.sync();
+                return true;
+            }
+            _ => return false,
+        };
+        // Moving through shorter rows and back returns to the x the movement started at.
+        let goal = self.goal_x.unwrap_or(x);
+        let last = self.rows.len().saturating_sub(1);
+        self.cursor = match row.checked_add_signed(down) {
+            // Up from the first row is the start of the text, down from the last its end.
+            None if down == -1 => Cursor::new(self.rows.line_at(0), 0),
+            Some(target) if target > last && down == 1 => {
+                let line = self.rows.line_at(last);
+                Cursor::new(line, self.inner.lines.get(line).map_or(0, |line| line.text().len()))
+            }
+            target => self.hit(target.unwrap_or(0).min(last), goal),
+        };
+        self.sync();
+        self.goal_x = Some(goal);
+        true
+    }
+
     /// Applies a `cosmic_text::Action` (motion, insert, backspace, click, ...) to the buffer.
     pub fn perform(&mut self, action: cosmic_text::Action) {
+        if self.perform_pointer(&action) || self.perform_row_motion(&action) {
+            return;
+        }
         let mut editor = Editor::new(&mut self.inner);
         editor.set_cursor(self.cursor);
         // A click/drag or a shift-motion can leave an empty selection. Cosmic treats
@@ -290,6 +463,8 @@ impl Buffer {
             Shaping::Advanced,
             None,
         );
+        // Styles can change glyph widths (a bold span, say), and with them where lines wrap.
+        self.rows_stale = true;
         self.sync();
     }
 
@@ -421,15 +596,20 @@ impl Buffer {
     }
 
     fn sync(&mut self) {
+        // Anything that gets here other than a move up or down (which sets this again
+        // afterwards) starts a new column to keep.
+        self.goal_x = None;
         let text = self.text();
         if text != self.folding_text {
             self.folds = super::folding::ranges(&text);
             self.folding_text = text;
             // Reopen on edits instead of keeping stale line ranges after insertion/deletion.
             self.collapsed.clear();
+            self.rows_stale = true;
         }
+        let collapsed = self.collapsed.len();
         self.collapsed.retain(|start| !self.folds.get(start).is_some_and(|end| self.cursor.line > *start && self.cursor.line <= *end));
-        self.rebuild_visible();
+        self.rows_stale |= self.collapsed.len() != collapsed;
         self.inner.shape_until_scroll(&mut self.font_system, false);
         self.content_width = self
             .inner
@@ -437,49 +617,80 @@ impl Buffer {
             .iter()
             .filter_map(|line| line.layout_opt().and_then(|lines| lines.first()).map(|line| line.w))
             .fold(0.0, f32::max);
+        if std::mem::take(&mut self.rows_stale) {
+            self.rebuild_rows();
+        }
+
+        let at_end = self.cursor.affinity == Affinity::Before;
+        self.caret = self.rows.locate(self.cursor.line, self.cursor.index, at_end).and_then(|row| {
+            Some((row, self.rows.get(row)?.x_of(glyphs_of(&self.inner, self.cursor.line), self.cursor.index)))
+        });
 
         let selection_bounds = {
             let mut editor = Editor::new(&mut self.inner);
             editor.set_cursor(self.cursor);
             editor.set_selection(self.selection);
-            self.cursor_pixel = editor.cursor_position();
             editor.selection_bounds()
         };
 
         self.selection_pixels.clear();
         if let Some((start, end)) = selection_bounds {
-            // Byte lengths must be read before `Editor::new` takes `&mut self.inner`.
-            let line_lens: Vec<usize> = (start.line..=end.line)
-                .map(|i| self.inner.lines.get(i).map_or(0, |l| l.text().len()))
-                .collect();
-
-            let mut editor = Editor::new(&mut self.inner);
-            for (offset, line_i) in (start.line..=end.line).enumerate() {
-                let line_len = line_lens[offset];
-                let start_index = if line_i == start.line { start.index } else { 0 };
-                let end_index = if line_i == end.line { end.index } else { line_len };
-
-                editor.set_cursor(Cursor::new(line_i, start_index));
-                let x0 = editor.cursor_position().map_or(0.0, |(x, _)| x as f32);
-                editor.set_cursor(Cursor::new(line_i, end_index));
-                let x1 = editor.cursor_position().map_or(x0, |(x, _)| x as f32);
-
-                self.selection_pixels.push((line_i, x0, x1.max(x0)));
+            for line in start.line..=end.line {
+                let glyphs = glyphs_of(&self.inner, line);
+                let from = if line == start.line { start.index } else { 0 };
+                let to = if line == end.line { end.index } else { self.inner.lines.get(line).map_or(0, |l| l.text().len()) };
+                let before = self.selection_pixels.len();
+                for index in self.rows.of_line(line) {
+                    let Some(row) = self.rows.get(index) else { continue };
+                    let (from, to) = (from.max(row.start), to.min(row.end));
+                    if from < to {
+                        let x0 = row.x_of(glyphs, from);
+                        self.selection_pixels.push((index, x0, row.x_of(glyphs, to).max(x0)));
+                    }
+                }
+                // A line the selection only passes through at a point -- an empty line, or
+                // one it ends at the very start of -- still gets a rect, drawn as a sliver.
+                if self.selection_pixels.len() == before {
+                    if let Some(index) = self.rows.locate(line, from, false) {
+                        let x = self.rows.get(index).map_or(0.0, |row| row.x_of(glyphs, from));
+                        self.selection_pixels.push((index, x, x));
+                    }
+                }
             }
         }
 
         self.matched_brackets.clear();
         if self.selection == Selection::None {
             if let Some(positions) = brackets::find_match(&self.inner, self.cursor) {
-                let mut editor = Editor::new(&mut self.inner);
                 for (line, start, end) in positions {
-                    editor.set_cursor(Cursor::new(line, start));
-                    let x0 = editor.cursor_position().map_or(0.0, |(x, _)| x as f32);
-                    editor.set_cursor(Cursor::new(line, end));
-                    let x1 = editor.cursor_position().map_or(x0, |(x, _)| x as f32);
-                    self.matched_brackets.push((line, x0, x1.max(x0)));
+                    let Some(index) = self.rows.locate(line, start, false) else { continue };
+                    let Some(row) = self.rows.get(index) else { continue };
+                    let glyphs = glyphs_of(&self.inner, line);
+                    let x0 = row.x_of(glyphs, start);
+                    self.matched_brackets.push((index, x0, row.x_of(glyphs, end).max(x0)));
                 }
             }
+        }
+    }
+
+    /// Rebuilds the row map from the laid-out lines, the folds and the wrap width.
+    fn rebuild_rows(&mut self) {
+        // No width is known until the widget has been laid out once.
+        let width = (self.wrap && self.wrap_width > 0.0).then_some(self.wrap_width);
+        self.rows.clear();
+        let count = self.inner.lines.len();
+        let mut line = 0;
+        while line < count {
+            self.rows.push_line(glyphs_of(&self.inner, line), self.inner.lines[line].text(), width);
+            let last = if self.collapsed.contains(&line) {
+                self.folds.get(&line).copied().unwrap_or(line).clamp(line, count - 1)
+            } else {
+                line
+            };
+            for _ in line..last {
+                self.rows.push_hidden();
+            }
+            line = last + 1;
         }
     }
 }
@@ -508,6 +719,299 @@ mod folding_tests {
         buffer.perform(cosmic_text::Action::Insert('x'));
         assert!(buffer.collapsed.is_empty());
         assert!(buffer.can_undo());
+    }
+}
+
+/// Where things sit on screen. These hold with word wrap off, whatever fonts are installed;
+/// they were written before the row map existed and pin the behaviour it must keep.
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    const SOURCE: &str = "let x = 1;\n\n    indented\nlast";
+
+    fn buffer() -> Buffer { Buffer::new(SOURCE, Metrics::new(14.0, 20.0)) }
+
+    /// Byte offsets a caret can sit at on `line`.
+    fn boundaries(buffer: &Buffer, line: usize) -> Vec<usize> {
+        let text = buffer.inner.lines[line].text();
+        text.char_indices().map(|(i, _)| i).chain([text.len()]).collect()
+    }
+
+    #[test]
+    fn rows_follow_lines_one_to_one_without_folds() {
+        let buffer = buffer();
+        assert_eq!(buffer.visible_count(), 4);
+        for line in 0..4 {
+            assert_eq!(buffer.visual_row(line), Some(line));
+            assert_eq!(buffer.source_line(line), line);
+        }
+        assert_eq!(buffer.source_line(99), 3, "rows past the end clamp to the last line");
+    }
+
+    #[test]
+    fn caret_sits_on_its_line_and_moves_right_along_it() {
+        let mut buffer = buffer();
+        for line in 0..4 {
+            let mut previous = 0.0;
+            for index in boundaries(&buffer, line) {
+                buffer.goto(line, index);
+                let (row, x) = buffer.caret().unwrap();
+                assert_eq!(row, line);
+                if index == 0 { assert_eq!(x, 0.0); }
+                assert!(x >= previous, "line {line} index {index}: {x} < {previous}");
+                previous = x;
+            }
+        }
+    }
+
+    #[test]
+    fn clicking_where_the_caret_is_puts_the_cursor_back_there() {
+        let mut buffer = buffer();
+        buffer.goto(0, 10);
+        // Without a usable font every glyph has no width and positions can't be told apart.
+        if buffer.caret().unwrap().1 <= 0.0 { return; }
+        for line in [0, 2, 3] {
+            for index in boundaries(&buffer, line) {
+                buffer.goto(line, index);
+                let (row, x) = buffer.caret().unwrap();
+                let hit = buffer.hit(row, x);
+                assert_eq!((hit.line, hit.index), (line, index));
+            }
+        }
+        // Left of the text is the line's start, right of it the line's end.
+        let hit = buffer.hit(0, -50.0);
+        assert_eq!((hit.line, hit.index), (0, 0));
+        let hit = buffer.hit(2, 100_000.0);
+        assert_eq!((hit.line, hit.index), (2, 12));
+        // An empty line has one position.
+        let hit = buffer.hit(1, 40.0);
+        assert_eq!((hit.line, hit.index), (1, 0));
+    }
+
+    #[test]
+    fn mouse_actions_pick_rows_by_height_and_drag_selects() {
+        let mut buffer = buffer();
+        // Rows are 20px tall: y 30 is on the second line, y 70 on the fourth.
+        buffer.perform(cosmic_text::Action::Click { x: 0, y: 30 });
+        assert_eq!((buffer.cursor.line, buffer.cursor.index), (1, 0));
+        assert_eq!(buffer.selection, Selection::None);
+        buffer.perform(cosmic_text::Action::Drag { x: 0, y: 70 });
+        assert_eq!((buffer.cursor.line, buffer.cursor.index), (3, 0));
+        assert_eq!(buffer.copy_selection().as_deref(), Some("\n    indented\n"));
+        // Below the last row is still the last line.
+        buffer.perform(cosmic_text::Action::Click { x: 0, y: 5000 });
+        assert_eq!(buffer.cursor.line, 3);
+        assert_eq!(buffer.copy_selection(), None);
+        assert_eq!(buffer.undo_count(), 0, "mouse actions are not edits");
+        buffer.perform(cosmic_text::Action::TripleClick { x: 0, y: 50 });
+        assert_eq!(buffer.copy_selection().as_deref(), Some("    indented"));
+    }
+
+    #[test]
+    fn selection_rects_cover_each_selected_line_once() {
+        let mut buffer = buffer();
+        buffer.goto(0, 4);
+        let start_x = buffer.caret().unwrap().1;
+        buffer.goto(2, 6);
+        let end_x = buffer.caret().unwrap().1;
+        buffer.select_range(Cursor::new(0, 4), Cursor::new(2, 6));
+        let rects = buffer.selection_pixels().to_vec();
+        assert_eq!(rects.iter().map(|rect| rect.0).collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(rects[0].1, start_x);
+        assert_eq!((rects[1].1, rects[1].2), (0.0, 0.0), "an empty line has an empty rect");
+        assert_eq!((rects[2].1, rects[2].2), (0.0, end_x));
+        assert!(rects.iter().all(|rect| rect.2 >= rect.1));
+        assert!(buffer.has_selection());
+        // A selection that covers nothing is not a selection.
+        buffer.select_range(Cursor::new(0, 4), Cursor::new(0, 4));
+        assert!(!buffer.has_selection());
+    }
+}
+
+/// Word wrap through the real text engine. Where a line breaks depends on the fonts a machine
+/// has, so these assert only what holds for any font, and the exact breaking is tested on
+/// hand-written glyphs in `rows.rs`.
+#[cfg(test)]
+mod wrap_tests {
+    use super::*;
+    use cosmic_text::{Action, Motion};
+
+    const LONG: &str = "    let message = \"a line that is long enough to need several rows when the view is narrow\";";
+
+    fn buffer() -> Buffer {
+        Buffer::new(&format!("fn main() {{\n{LONG}\n}}\n"), Metrics::new(14.0, 20.0))
+    }
+
+    /// A text width about a third of the long line's, or `None` on a machine without a
+    /// usable font, where glyphs have no width and nothing can wrap.
+    fn narrow(buffer: &mut Buffer) -> Option<f32> {
+        buffer.goto(1, LONG.len());
+        let width = buffer.caret()?.1;
+        buffer.goto(0, 0);
+        (width > 0.0).then_some(width / 3.0)
+    }
+
+    fn rows(buffer: &Buffer, line: usize) -> Vec<Row> {
+        buffer.rows_of(line).map(|row| buffer.row(row).unwrap().clone()).collect()
+    }
+
+    #[test]
+    fn wrapping_needs_the_setting_and_a_width_and_can_be_undone() {
+        let mut buffer = buffer();
+        let Some(width) = narrow(&mut buffer) else { return; };
+        // A width alone changes nothing, and doesn't count as a new layout.
+        buffer.set_viewport(width, 200.0);
+        assert_eq!((buffer.visible_count(), buffer.layout_epoch()), (4, 0));
+        assert_eq!(buffer.viewport(), (width, 200.0));
+        buffer.set_wrap(true);
+        assert!(buffer.wrapped());
+        assert!(buffer.rows_of(1).len() >= 3, "{:?}", buffer.rows_of(1));
+        assert_eq!((buffer.rows_of(0).len(), buffer.rows_of(2).len(), buffer.rows_of(3).len()), (1, 1, 1));
+        assert_eq!(buffer.layout_epoch(), 1);
+        // A wider view needs fewer rows; the same width again is not a new layout.
+        let narrow_rows = buffer.visible_count();
+        buffer.set_viewport(width * 2.0, 200.0);
+        assert!(buffer.visible_count() < narrow_rows);
+        assert_eq!(buffer.layout_epoch(), 2);
+        buffer.set_viewport(width * 2.0, 300.0);
+        assert_eq!(buffer.layout_epoch(), 2);
+        buffer.set_wrap(false);
+        assert_eq!(buffer.visible_count(), 4);
+        for line in 0..4 { assert_eq!(buffer.visual_row(line), Some(line)); }
+    }
+
+    #[test]
+    fn wrap_without_a_width_yet_leaves_lines_whole() {
+        let mut buffer = buffer();
+        buffer.set_wrap(true);
+        assert_eq!(buffer.visible_count(), 4);
+    }
+
+    #[test]
+    fn wrapped_rows_cover_the_line_once_and_every_position_round_trips() {
+        let mut buffer = buffer();
+        let Some(width) = narrow(&mut buffer) else { return; };
+        buffer.set_viewport(width, 200.0);
+        buffer.set_wrap(true);
+        let long = rows(&buffer, 1);
+        assert_eq!((long[0].start, long.last().unwrap().end), (0, LONG.len()));
+        assert!(long.windows(2).all(|pair| pair[0].end == pair[1].start));
+        // Rows after the first start at the line's indentation.
+        assert_eq!(long[0].indent, 0.0);
+        assert!(long[1].indent > 0.0);
+        assert!(long[1..].iter().all(|row| row.indent == long[1].indent));
+        let first_row = buffer.visual_row(1).unwrap();
+        for index in 0..=LONG.len() {
+            // `goto` leaves the caret on the earlier row where the line wraps at `index`.
+            buffer.goto(1, index);
+            let (row, x) = buffer.caret().unwrap();
+            let shown = &long[row - first_row];
+            assert!(shown.start <= index && index <= shown.end, "index {index} on row {row}");
+            let hit = buffer.hit(row, x);
+            assert_eq!((hit.line, hit.index), (1, index));
+            // The same position counted from the row that starts there.
+            let (row, x) = buffer.locate(1, index).unwrap();
+            let hit = buffer.hit(row, x);
+            assert_eq!((hit.line, hit.index), (1, index));
+        }
+        // The lines after a wrapped one sit below all its rows.
+        assert_eq!(buffer.visual_row(2), Some(first_row + long.len()));
+        assert_eq!(buffer.source_line(first_row + long.len() - 1), 1);
+    }
+
+    #[test]
+    fn selection_folding_and_edits_follow_wrapped_rows() {
+        let mut buffer = buffer();
+        let Some(width) = narrow(&mut buffer) else { return; };
+        buffer.set_viewport(width, 200.0);
+        buffer.set_wrap(true);
+        // Selecting everything puts one rect on every row, in order.
+        buffer.select_all();
+        let selected: Vec<usize> = buffer.selection_pixels().iter().map(|rect| rect.0).collect();
+        assert_eq!(selected, (0..buffer.visible_count()).collect::<Vec<_>>());
+        // A selection inside one row of the wrapped line touches only that row.
+        let second = rows(&buffer, 1)[1].clone();
+        buffer.select_range(Cursor::new(1, second.start), Cursor::new(1, second.start + 3));
+        assert_eq!(buffer.selection_pixels().len(), 1);
+        assert_eq!(buffer.selection_pixels()[0].0, buffer.visual_row(1).unwrap() + 1);
+        assert_eq!(buffer.selection_pixels()[0].1, second.indent);
+        // Folding the function hides the wrapped line's rows with it.
+        assert!(buffer.folds.contains_key(&0));
+        buffer.toggle_fold(0);
+        assert_eq!(buffer.rows_of(1), 0..0);
+        assert_eq!((buffer.visual_row(1), buffer.visual_row(2)), (None, None));
+        assert_eq!(buffer.visible_count(), 2);
+        buffer.toggle_fold(0);
+        assert!(buffer.rows_of(1).len() >= 3);
+        // Typing makes a short line wrap, and undoing puts it back on one row.
+        buffer.goto(2, 1);
+        for ch in LONG.chars() { buffer.perform(Action::Insert(ch)); }
+        assert!(buffer.rows_of(2).len() >= 3);
+        assert_eq!(buffer.text(), format!("fn main() {{\n{LONG}\n}}{LONG}\n"));
+        while buffer.can_undo() { buffer.undo(); }
+        assert_eq!(buffer.rows_of(2).len(), 1);
+    }
+
+    /// A measurement, not a check: prints what a 50,000-line file costs with wrap on and off.
+    /// `cargo test large_file_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn large_file_timing() {
+        use std::time::Instant;
+        let line = "    let value = compute(first_argument, second_argument) + another_call(third) * 2; // trailing comment";
+        let text = vec![line; 50_000].join("\n");
+        let start = Instant::now();
+        let mut buffer = Buffer::new(&text, Metrics::new(14.0, 20.0));
+        println!("open:                    {:?}", start.elapsed());
+        buffer.set_viewport(400.0, 800.0);
+        let start = Instant::now();
+        buffer.perform(Action::Insert('x'));
+        println!("keystroke, wrap off:     {:?}", start.elapsed());
+        let start = Instant::now();
+        buffer.set_wrap(true);
+        println!("wrap on:                 {:?} ({} rows)", start.elapsed(), buffer.visible_count());
+        let start = Instant::now();
+        buffer.perform(Action::Insert('x'));
+        println!("keystroke, wrap on:      {:?}", start.elapsed());
+        let start = Instant::now();
+        buffer.set_viewport(401.0, 800.0);
+        println!("resize, wrap on:         {:?}", start.elapsed());
+        let start = Instant::now();
+        buffer.perform(Action::Motion(Motion::Down));
+        println!("arrow down, wrap on:     {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn movement_goes_row_by_row_through_a_wrapped_line() {
+        let mut buffer = buffer();
+        let Some(width) = narrow(&mut buffer) else { return; };
+        buffer.set_viewport(width, 200.0);
+        buffer.set_wrap(true);
+        let long = rows(&buffer, 1);
+        let first_row = buffer.visual_row(1).unwrap();
+        // Down from the line above lands on each row of the wrapped line in turn.
+        buffer.goto(0, 0);
+        for step in 0..long.len() {
+            buffer.perform(Action::Motion(Motion::Down));
+            assert_eq!(buffer.cursor.line, 1);
+            assert_eq!(buffer.caret().unwrap().0, first_row + step);
+        }
+        buffer.perform(Action::Motion(Motion::Down));
+        assert_eq!(buffer.cursor.line, 2);
+        buffer.perform(Action::Motion(Motion::Up));
+        assert_eq!(buffer.caret().unwrap().0, first_row + long.len() - 1);
+        // End and Home stay on the row the caret is on.
+        buffer.goto(1, long[1].start + 2);
+        let row = buffer.caret().unwrap().0;
+        buffer.perform(Action::Motion(Motion::End));
+        assert_eq!((buffer.cursor.index, buffer.caret().unwrap().0), (long[1].end, row));
+        buffer.perform(Action::Motion(Motion::Home));
+        assert_eq!((buffer.cursor.index, buffer.caret().unwrap().0), (long[1].start, row));
+        // Clicking on a row of the wrapped line puts the cursor in that row's text.
+        buffer.perform(Action::Click { x: 100_000, y: ((first_row + 1) * 20 + 10) as i32 });
+        assert_eq!((buffer.cursor.line, buffer.cursor.index), (1, long[1].end));
+        assert_eq!(buffer.caret().unwrap().0, first_row + 1);
     }
 }
 
