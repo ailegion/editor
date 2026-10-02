@@ -12,6 +12,7 @@ mod ai_history;
 mod ai_markdown;
 mod ai_mention;
 mod ai_oneshot;
+mod ai_select;
 mod ai_selectable;
 mod inline_edit;
 mod lsp;
@@ -106,6 +107,7 @@ impl Tab {
         }
     }
 
+    #[cfg(test)]
     fn preview_content(&self) -> Option<&iced::widget::markdown::Content> {
         self.preview.as_ref().and_then(|preview| preview.get(0))
     }
@@ -3373,8 +3375,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             editor_column = editor_column.push(scrollable(crumbs.padding([0, 8]))
                 .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())));
         }
-        if let Some(content) = tab.preview_content() {
-            let document = ai_markdown::view_document(content, &state.app_theme.iced, Message::MarkdownPreview);
+        if let Some(document) = tab.preview.as_ref().and_then(|preview| ai_markdown::view_document(preview, &state.app_theme.iced, Message::MarkdownPreview)) {
             editor_column = editor_column.push(scrollable(container(container(document).max_width(860))
                 .center_x(Length::Fill).padding([16, 24])).height(Length::Fill));
             return editor_frame(tab_row, editor_column);

@@ -225,8 +225,6 @@ pub struct AcpState {
     selectable: crate::ai_selectable::Cache,
     /// Replies rendered as Markdown, kept in step with `selectable`.
     markdown: crate::ai_markdown::Cache,
-    /// Replies the user switched to plain selectable text.
-    plain_text: std::collections::HashSet<usize>,
 }
 
 impl Default for AcpState {
@@ -268,7 +266,6 @@ impl Default for AcpState {
             expanded_thinking: Vec::new(),
             selectable: Default::default(),
             markdown: Default::default(),
-            plain_text: Default::default(),
         }
     }
 }
@@ -285,8 +282,6 @@ pub enum Message {
     NewThread,
     History(crate::ai_history::Message),
     ToggleThinking(usize),
-    /// Show reply `usize` as plain selectable text instead of Markdown, or back.
-    TogglePlainText(usize),
     Markdown(crate::ai_markdown::Action),
     /// Open diff `.1` of tool call entry `.0` in the preview pane (handled by the app).
     ViewDiff(usize, usize),
@@ -581,7 +576,6 @@ impl AcpState {
         self.usage_open = false;
         self.stopping = false;
         self.expanded_thinking.clear();
-        self.plain_text.clear();
         self.started = false;
         self.auto_connected = false;
         self.rx = None;
@@ -1030,9 +1024,6 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
             }
             None => {}
         },
-        Message::TogglePlainText(index) => {
-            if !state.plain_text.remove(&index) { state.plain_text.insert(index); }
-        }
         Message::Markdown(crate::ai_markdown::Action::Copy(text)) => return iced::clipboard::write(text),
         Message::Markdown(crate::ai_markdown::Action::Link(url)) => crate::ai_markdown::open_link(&url),
         // Inserting into the editor and opening diffs are the app's to handle.
@@ -1088,18 +1079,16 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
     }
 
     let labeled_copyable = |label: &'static str, index: usize, content: &str, markdown: bool| -> Element<'_, Message> {
-        let plain = state.plain_text.contains(&index);
-        // Replies render as Markdown unless switched to selectable text. Selectable text needs
-        // the cache to have caught up with this entry; plain text is the fallback.
-        let body: Element<'_, Message> = match (state.markdown.get(index), state.selectable.get(index)) {
-            (Some(parsed), _) if markdown && !plain => crate::ai_markdown::view(parsed, composer.theme, Message::Markdown),
+        // Replies render as Markdown, selectable as rendered. Both that and the selectable
+        // text of other entries need their cache to have caught up with this entry; plain
+        // text is the fallback.
+        let rendered = markdown.then(|| crate::ai_markdown::view(&state.markdown, index, composer.theme, Message::Markdown)).flatten();
+        let body: Element<'_, Message> = match (rendered, state.selectable.get(index)) {
+            (Some(rendered), _) => rendered,
             (_, Some(selectable)) => crate::ai_selectable::view(selectable, 13.0, move |action| Message::Selectable(index, action)),
             _ => text(content.to_string()).size(13).into(),
         };
-        let mut heading = row![text(label).size(12), Space::new().width(Length::Fill)].spacing(6).align_y(iced::Alignment::Center);
-        if markdown {
-            heading = heading.push(crate::icon_control(lucide_icons::Icon::TextCursor, if plain { "Show formatted" } else { "Select text" }, Some(Message::TogglePlainText(index)), plain));
-        }
+        let heading = row![text(label).size(12), Space::new().width(Length::Fill)].spacing(6).align_y(iced::Alignment::Center);
         column![
             heading.push(crate::icon_control(lucide_icons::Icon::Copy, "Copy message", Some(Message::Copy(content.to_string())), false)),
             body,

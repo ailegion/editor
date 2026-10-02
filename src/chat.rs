@@ -186,8 +186,6 @@ pub struct ChatState {
     selectable: crate::ai_selectable::Cache,
     /// Replies rendered as Markdown, kept in step with `selectable`.
     markdown: crate::ai_markdown::Cache,
-    /// Replies the user switched to plain selectable text.
-    plain_text: std::collections::HashSet<usize>,
 }
 
 impl Default for ChatState {
@@ -218,7 +216,6 @@ impl Default for ChatState {
             files_changed: false,
             selectable: Default::default(),
             markdown: Default::default(),
-            plain_text: Default::default(),
         }
     }
 }
@@ -239,8 +236,6 @@ pub enum Message {
     ToggleSettings,
     NewConversation,
     History(crate::ai_history::Message),
-    /// Show reply `usize` as plain selectable text instead of Markdown, or back.
-    TogglePlainText(usize),
     Markdown(crate::ai_markdown::Action),
     /// Open the edit made by tool message `usize` in the preview pane (handled by the app).
     ViewDiff(usize),
@@ -321,7 +316,6 @@ impl ChatState {
             }
         }
         self.messages = self.threads[self.active_thread].messages.clone();
-        self.plain_text.clear();
     }
 
     fn threads_path(&self, cwd: &Path) -> Option<PathBuf> {
@@ -374,7 +368,6 @@ impl ChatState {
         self.messages = self.threads[self.active_thread].messages.clone();
         self.attachments.clear();
         self.session_grants.clear();
-        self.plain_text.clear();
         if let Some(cwd) = self.cwd.clone() { self.persist(&cwd); }
     }
 
@@ -388,7 +381,6 @@ impl ChatState {
             self.active_thread = self.threads.len() - 1;
             self.messages = self.threads[self.active_thread].messages.clone();
             self.session_grants.clear();
-            self.plain_text.clear();
         } else if index < self.active_thread {
             self.active_thread -= 1;
         }
@@ -629,9 +621,6 @@ pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Mes
             }
             None => {}
         },
-        Message::TogglePlainText(index) => {
-            if !state.plain_text.remove(&index) { state.plain_text.insert(index); }
-        }
         Message::Markdown(crate::ai_markdown::Action::Copy(text)) => return iced::clipboard::write(text),
         Message::Markdown(crate::ai_markdown::Action::Link(url)) => crate::ai_markdown::open_link(&url),
         // Inserting into the editor and opening diffs are the app's to handle.
@@ -812,19 +801,17 @@ pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>)
             continue;
         }
         let formatted = message.role == Role::Assistant;
-        let plain = state.plain_text.contains(&i);
-        // Replies render as Markdown unless switched to selectable text. Selectable text needs
-        // the cache to have caught up with this message; plain text is the fallback.
-        let body: Element<'a, Message> = match (state.markdown.get(i), state.selectable.get(i)) {
-            (Some(parsed), _) if formatted && !plain => crate::ai_markdown::view(parsed, composer.theme, Message::Markdown),
+        // Replies render as Markdown, selectable as rendered. Both that and the selectable
+        // text of other messages need their cache to have caught up with this message;
+        // plain text is the fallback.
+        let rendered = formatted.then(|| crate::ai_markdown::view(&state.markdown, i, composer.theme, Message::Markdown)).flatten();
+        let body: Element<'a, Message> = match (rendered, state.selectable.get(i)) {
+            (Some(rendered), _) => rendered,
             (_, Some(selectable)) => crate::ai_selectable::view(selectable, 13.0, move |action| Message::Selectable(i, action)),
             _ => text(message.content.clone()).size(13).into(),
         };
-        let mut heading = row![text(message.role.label()).size(12), Space::new().width(Length::Fill)]
+        let heading = row![text(message.role.label()).size(12), Space::new().width(Length::Fill)]
             .spacing(6).align_y(iced::Alignment::Center);
-        if formatted {
-            heading = heading.push(crate::icon_control(lucide_icons::Icon::TextCursor, if plain { "Show formatted" } else { "Select text" }, Some(Message::TogglePlainText(i)), plain));
-        }
         let mut entry = column![
             heading.push(crate::icon_control(lucide_icons::Icon::Copy, "Copy message", Some(Message::Copy(message.content.clone())), false)),
             body,
