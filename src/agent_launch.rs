@@ -28,6 +28,11 @@ pub fn node_missing() -> bool {
     LAUNCH.get().is_some_and(|launch| launch.npx.is_none())
 }
 
+/// True once the lookup has finished and found `npx`, so an agent can be started.
+pub fn node_found() -> bool {
+    LAUNCH.get().is_some_and(|launch| launch.npx.is_some())
+}
+
 /// The agent for `package`, started with `npx` from the user's `PATH`.
 pub fn agent(package: &str) -> Result<AcpAgent, String> {
     let launch = launch();

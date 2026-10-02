@@ -1806,13 +1806,25 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     if let Some(tree) = &mut state.tree {
                         task = tree.update(DirectoryTreeEvent::Toggled(path.clone())).map(Message::Tree);
                     }
+                    let changed = state.root.as_deref() != Some(path.as_path());
                     state.root = Some(path);
+                    // Shells left in the previous project would run commands against it.
+                    if changed {
+                        let focused = state.terminal.focused();
+                        state.terminal.shutdown();
+                        if state.terminal_visible {
+                            state.terminal.ensure_started(&state.root_or_cwd());
+                            state.terminal.set_focused(focused);
+                        }
+                    }
                 }
             }
             FileAction::CloseFolder => {
                 state.show_editor();
                 state.root = None;
                 state.tree = None;
+                state.terminal.shutdown();
+                if state.terminal_visible { task = update(state, Message::TerminalToggle); }
                 if let Some(path) = last_project_path() {
                     let _ = std::fs::remove_file(path);
                 }
@@ -2531,6 +2543,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.codex.ensure_loaded(&cwd);
             // Only a Claude or Codex chat needs the shell PATH, so look it up once one is open.
             if state.ai_visible && matches!(state.ai_mode, AiMode::Acp | AiMode::Codex) { agent_launch::warm_up(); }
+            // Connect as soon as the panel shows, so it names the model in use straight away.
+            if state.ai_visible {
+                match state.ai_mode {
+                    AiMode::Acp => state.acp.connect_for_display(&cwd),
+                    AiMode::Codex => state.codex.connect_for_display(&cwd),
+                    _ => {}
+                }
+            }
             state.chat.poll();
             state.acp.poll();
             state.codex.poll();

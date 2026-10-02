@@ -82,6 +82,29 @@ mod tests {
         assert_eq!(panel.active, None);
     }
 
+    #[test]
+    fn shutdown_ends_every_session_so_none_outlives_its_project() {
+        let mut panel = Panel::default();
+        let mut sessions = Vec::new();
+        for id in [1, 2] {
+            let mut terminal = Terminal::default();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            terminal.input = Some(tx);
+            sessions.push(rx);
+            panel.tabs.push(Tab { id, name: "Test".into(), terminal });
+        }
+        panel.active = Some(2);
+        panel.set_focused(true);
+        panel.shutdown();
+        assert!(panel.tabs.is_empty());
+        assert_eq!(panel.active, None);
+        assert!(!panel.focused());
+        // The worker stops when its command channel closes.
+        for rx in sessions {
+            assert_eq!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected));
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn detected_powershell_profiles_accept_commands() {

@@ -154,3 +154,39 @@ fn preceded_by_word_char(buffer: &Buffer) -> bool {
     brackets::prev_char(&buffer.inner, buffer.cursor.line, buffer.cursor.index)
         .is_some_and(|(_, _, ch)| ch.is_alphanumeric() || ch == '_')
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keyboard::key::Named;
+
+    fn press(buffer: &mut Buffer, key: Named, modifiers: Modifiers) {
+        assert!(handle_key(buffer, &Key::Named(key), modifiers));
+    }
+
+    #[test]
+    fn shift_arrows_select_and_plain_arrows_collapse() {
+        let mut buffer = Buffer::new("hello\nworld", cosmic_text::Metrics::new(14.0, 20.0));
+        press(&mut buffer, Named::ArrowRight, Modifiers::SHIFT);
+        press(&mut buffer, Named::ArrowRight, Modifiers::SHIFT);
+        assert_eq!(buffer.copy_selection().as_deref(), Some("he"));
+        press(&mut buffer, Named::ArrowDown, Modifiers::SHIFT);
+        assert_eq!(buffer.copy_selection().as_deref(), Some("hello\nwo"));
+        // A plain arrow drops the selection and moves on from the cursor.
+        press(&mut buffer, Named::ArrowRight, Modifiers::empty());
+        assert_eq!(buffer.copy_selection(), None);
+        assert_eq!((buffer.cursor.line, buffer.cursor.index), (1, 3));
+        // Backwards, then back onto the anchor: nothing is selected and Backspace still deletes.
+        press(&mut buffer, Named::ArrowLeft, Modifiers::SHIFT);
+        assert_eq!(buffer.copy_selection().as_deref(), Some("r"));
+        press(&mut buffer, Named::ArrowRight, Modifiers::SHIFT);
+        assert_eq!(buffer.copy_selection(), None);
+        press(&mut buffer, Named::Backspace, Modifiers::empty());
+        assert_eq!(buffer.text(), "hello\nwold");
+        // Typing replaces what Shift+Home selected.
+        press(&mut buffer, Named::Home, Modifiers::SHIFT);
+        assert_eq!(buffer.copy_selection().as_deref(), Some("wo"));
+        assert!(handle_key(&mut buffer, &Key::Character("x".into()), Modifiers::empty()));
+        assert_eq!(buffer.text(), "hello\nxld");
+    }
+}

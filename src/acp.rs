@@ -202,6 +202,8 @@ pub struct AcpState {
     model_tx: Option<tokio::sync::mpsc::UnboundedSender<(Setting, String, String)>>,
     streaming: bool,
     started: bool,
+    /// The session was already started for display once; see `connect_for_display`.
+    auto_connected: bool,
     usage: Option<Usage>,
     models: Option<ModelOptions>,
     models_reported: bool,
@@ -246,6 +248,7 @@ impl Default for AcpState {
             model_tx: None,
             streaming: false,
             started: false,
+            auto_connected: false,
             usage: None,
             models: None,
             models_reported: false,
@@ -580,6 +583,7 @@ impl AcpState {
         self.expanded_thinking.clear();
         self.plain_text.clear();
         self.started = false;
+        self.auto_connected = false;
         self.rx = None;
         self.prompt_tx = None;
         self.cancel_tx = None;
@@ -860,6 +864,32 @@ impl AcpState {
             .get(self.active_thread)
             .and_then(|t| t.session_id.clone());
         self.start(cwd, resume_session_id);
+    }
+
+    /// Starts the session while the panel is merely showing, so the model in use is known
+    /// before the first prompt. Done once per conversation: a start that failed is retried
+    /// by sending or opening the model menu, not on every tick.
+    pub fn connect_for_display(&mut self, cwd: &Path) {
+        // Not before `npx` is known to exist: without it the start would only add an error.
+        if crate::agent_launch::node_found() && self.claim_auto_connect() {
+            self.connect(cwd.to_path_buf());
+        }
+    }
+
+    fn claim_auto_connect(&mut self) -> bool {
+        !self.started && !std::mem::replace(&mut self.auto_connected, true)
+    }
+
+    /// What the model button shows: the session's model, else the saved choice it will get.
+    fn model_label(&self) -> String {
+        if self.model_switching { return "Switching…".into(); }
+        let name = match (&self.models, &self.preferred_model) {
+            (Some(models), _) => models.current_name(),
+            (None, Some(preferred)) => preferred.clone(),
+            (None, None) if self.started && !self.models_reported => "Connecting…".into(),
+            (None, None) => "Model".into(),
+        };
+        format!("{name} ▾")
     }
 
     fn select_model(&mut self, value: String) {
@@ -1232,7 +1262,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
         bottom = bottom.push(dropdown(choice_buttons(effort, Message::SelectEffort)));
     }
     let model_name = state.models.as_ref().map(ModelOptions::current_name);
-    let model_button = button(text(if state.model_switching { "Switching…".into() } else { format!("{} ▾", model_name.clone().unwrap_or_else(|| "Model".into())) }).size(12))
+    let model_button = button(text(state.model_label()).size(12))
         .padding([2, 6]).style(crate::flat_button_style).on_press(Message::ToggleModelMenu);
     let effort_button = effort.map(|effort| {
         button(text(if state.effort_switching { "Switching…".into() } else { format!("{} ▾", effort.current_name()) }).size(12))
@@ -1522,6 +1552,32 @@ mod tests {
         assert_eq!(state.models.as_ref().unwrap().current, "deep");
         assert_eq!(state.preferred_model.as_deref(), Some("deep"));
         assert!(state.entries.iter().any(|entry| matches!(entry, Entry::Assistant { content } if content.contains("rejected"))));
+    }
+
+    #[test]
+    fn model_button_names_the_model_before_and_after_the_agent_reports_it() {
+        let mut state = AcpState::default();
+        assert_eq!(state.model_label(), "Model ▾");
+        // The panel being shown starts the session once; a failed start is not retried each tick.
+        assert!(state.claim_auto_connect());
+        assert!(!state.claim_auto_connect());
+        state.started = true;
+        assert_eq!(state.model_label(), "Connecting… ▾");
+        state.preferred_model = Some("deep".into());
+        assert_eq!(state.model_label(), "deep ▾");
+        let (tx, rx) = mpsc::channel();
+        state.rx = Some(rx);
+        tx.send(Event::Config(SessionConfig { model: Some(ModelOptions { config_id: "model".into(), current: "deep".into(), choices: vec![("deep".into(), "Deep model".into())] }), effort: None })).unwrap();
+        state.poll();
+        assert_eq!(state.model_label(), "Deep model ▾");
+        state.model_switching = true;
+        assert_eq!(state.model_label(), "Switching…");
+        // A new conversation gets its own session, so it connects again; a running one doesn't.
+        state.reset_connection();
+        assert!(state.claim_auto_connect());
+        state.reset_connection();
+        state.started = true;
+        assert!(!state.claim_auto_connect());
     }
 
     #[test]

@@ -153,11 +153,8 @@ impl<'a, Message> CodeEditor<'a, Message> {
         let (x, y) = (x as f32, y as f32);
         let line_height = self.style.line_height;
         let mut changed = false;
-        if y < state.scroll {
-            state.scroll = y;
-            changed = true;
-        } else if y + line_height > state.scroll + viewport.height {
-            state.scroll = y + line_height - viewport.height;
+        if let Some(scroll) = reveal_row(state.scroll, y, line_height, viewport.height) {
+            state.scroll = scroll;
             changed = true;
         }
         // Keep a small margin so the cursor never sits flush against either edge.
@@ -185,7 +182,7 @@ impl<'a, Message> CodeEditor<'a, Message> {
                 let gutter = self.style.gutter_width(self.content.line_count());
                 (gutter, (bounds.width - gutter).max(0.0), self.content.content_width() + H_SCROLL_PAD)
             }
-            Axis::Y => (0.0, bounds.height, self.content.visible_count() as f32 * self.style.line_height),
+            Axis::Y => (0.0, bounds.height, self.content.visible_count() as f32 * self.style.line_height + V_SCROLL_PAD),
         }
     }
 
@@ -221,6 +218,27 @@ const H_SCROLL_PAD: f32 = 40.0;
 
 /// Scrollbar thickness. The bars overlay the text along the right and bottom edges.
 pub(super) const BAR: f32 = 12.0;
+
+/// Space kept below the last line, so the horizontal scrollbar never covers it.
+const V_SCROLL_PAD: f32 = BAR + 4.0;
+
+/// Furthest vertical scroll for `rows` lines: the last one ends `V_SCROLL_PAD` above the
+/// bottom edge.
+fn max_scroll(rows: usize, line_height: f32, view_height: f32) -> f32 {
+    (rows as f32 * line_height + V_SCROLL_PAD - view_height).max(0.0)
+}
+
+/// The scroll that brings the line at `y` fully into view, clear of the horizontal
+/// scrollbar; `None` when it already is.
+fn reveal_row(scroll: f32, y: f32, line_height: f32, view_height: f32) -> Option<f32> {
+    if y < scroll {
+        Some(y)
+    } else if y + line_height + V_SCROLL_PAD > scroll + view_height {
+        Some(y + line_height + V_SCROLL_PAD - view_height)
+    } else {
+        None
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Axis { X, Y }
@@ -291,8 +309,7 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
         // animation tick, see `render::draw`'s blinking cursor) as a chance to notice the
         // cursor drifted outside the visible window and correct `scroll` to bring it back in.
         if let Event::Window(iced::window::Event::RedrawRequested(_)) = event {
-            let max_scroll = (self.content.visible_count() as f32 * self.style.line_height - bounds.height).max(0.0);
-            state.scroll = state.scroll.min(max_scroll);
+            state.scroll = state.scroll.min(max_scroll(self.content.visible_count(), self.style.line_height, bounds.height));
             state.scroll_x = state.scroll_x.min(self.max_scroll_x(bounds));
             if !state.hover_sent && state.hover_since.is_some_and(|since| since.elapsed() >= HOVER_DELAY) {
                 if let (Some((line, index)), Some(on_probe)) = (state.hover_cell, self.on_probe.as_ref()) {
@@ -421,9 +438,7 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
                 if state.shift && dx == 0.0 {
                     (dx, dy) = (dy, 0.0);
                 }
-                let max_scroll = (self.content.visible_count() as f32 * self.style.line_height
-                    - bounds.height)
-                    .max(0.0);
+                let max_scroll = max_scroll(self.content.visible_count(), self.style.line_height, bounds.height);
                 state.scroll = (state.scroll - dy).clamp(0.0, max_scroll);
                 state.scroll_x = (state.scroll_x - dx).clamp(0.0, self.max_scroll_x(bounds));
                 // The text moved under a stationary mouse: whatever was hovered is gone.
@@ -492,4 +507,28 @@ where
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_line_stays_clear_of_the_horizontal_scrollbar() {
+        let (line_height, view) = (20.0, 205.0);
+        // Scrolled as far as it goes, the last of 100 lines ends above the bar.
+        let scroll = max_scroll(100, line_height, view);
+        assert!(100.0 * line_height - scroll <= view - BAR);
+        // Content shorter than the view doesn't scroll.
+        assert_eq!(max_scroll(3, line_height, view), 0.0);
+        // Moving the cursor onto the last line scrolls it clear of the bar too, within range.
+        let y = 99.0 * line_height;
+        let revealed = reveal_row(0.0, y, line_height, view).unwrap();
+        assert!(y + line_height - revealed <= view - BAR);
+        assert!(revealed <= scroll);
+        assert_eq!(reveal_row(revealed, y, line_height, view), None);
+        // A line above the view scrolls up to it; one already in view leaves the scroll alone.
+        assert_eq!(reveal_row(400.0, 100.0, line_height, view), Some(100.0));
+        assert_eq!(reveal_row(400.0, 440.0, line_height, view), None);
+    }
 }

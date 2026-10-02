@@ -135,14 +135,11 @@ impl Buffer {
         (self.cursor.line + 1, col + 1)
     }
 
-    /// Selects the entire document, cursor ending at the very end. `perform` only reads
-    /// `self.selection` back into the transient `Editor` at the start of each call, so setting
-    /// it directly between the two motions (rather than via an `Action`) sticks -- matching
-    /// how `input::handle_key` anchors shift-selections.
+    /// Selects the entire document, cursor ending at the very end.
     pub fn select_all(&mut self) {
-        self.perform(cosmic_text::Action::Motion(cosmic_text::Motion::BufferStart));
-        self.selection = Selection::Normal(self.cursor);
         self.perform(cosmic_text::Action::Motion(cosmic_text::Motion::BufferEnd));
+        self.selection = Selection::Normal(Cursor::new(0, 0));
+        self.sync();
     }
 
     /// Moves the cursor to `line` (0-indexed), first collapsing any active selection.
@@ -209,10 +206,12 @@ impl Buffer {
         editor.set_cursor(self.cursor);
         // A click/drag or a shift-motion can leave an empty selection. Cosmic treats
         // deleting it as a completed edit, swallowing Backspace/Delete. Affinity can
-        // differ at syntax span boundaries, so compare text positions only.
+        // differ at syntax span boundaries, so compare text positions only. Other actions
+        // keep it: a shift-motion starts from an anchor placed on the cursor.
+        let deleting = matches!(action, cosmic_text::Action::Backspace | cosmic_text::Action::Delete);
         let selection = match self.selection {
             Selection::Normal(anchor)
-                if anchor.line == self.cursor.line && anchor.index == self.cursor.index => Selection::None,
+                if deleting && anchor.line == self.cursor.line && anchor.index == self.cursor.index => Selection::None,
             selection => selection,
         };
         editor.set_selection(selection);
@@ -530,6 +529,27 @@ mod clipboard_tests {
         assert_eq!(buffer.text(), " world");
         buffer.undo();
         assert_eq!(buffer.text(), "hello world");
+    }
+
+    #[test]
+    fn select_all_selects_the_whole_document_from_anywhere() {
+        let source = "first\nsecond\n\nlast";
+        let mut buffer = Buffer::new(source, Metrics::new(14.0, 20.0));
+        buffer.select_all();
+        assert_eq!(buffer.copy_selection().as_deref(), Some(source));
+        assert_eq!((buffer.cursor.line, buffer.cursor.index), (3, 4));
+        assert!(buffer.has_selection());
+        // Again from the middle, over an existing selection.
+        buffer.select_range(Cursor::new(1, 1), Cursor::new(1, 3));
+        buffer.select_all();
+        assert_eq!(buffer.copy_selection().as_deref(), Some(source));
+        // Selecting all is not an edit, and typing then replaces everything.
+        assert_eq!(buffer.undo_count(), 0);
+        buffer.perform(cosmic_text::Action::Insert('x'));
+        assert_eq!(buffer.text(), "x");
+        let mut empty = Buffer::new("", Metrics::new(14.0, 20.0));
+        empty.select_all();
+        assert_eq!(empty.copy_selection(), None);
     }
 
     #[test]
