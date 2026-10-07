@@ -288,6 +288,9 @@ enum Message {
     /// Open a new GitHub issue in the browser.
     FileBugReport,
     Git(git::Message),
+    /// A file or folder dropped on the window outside the AI composer: a file opens in a tab,
+    /// a folder opens as the project.
+    PathDropped(PathBuf),
     DiscardGitConfirmed(PathBuf, Vec<git::ChangedFile>),
     DiscardGitFinished(Vec<(PathBuf, String)>, git::Message),
     GitPanelToggle,
@@ -1816,6 +1819,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
 
+        Message::PathDropped(path) => {
+            if path.is_dir() {
+                task = open_folder(state, path);
+            } else {
+                task = state.open_path(path);
+                state.focus = Focus::Editor;
+            }
+        }
         Message::FileAction(action) => match action {
             FileAction::OpenFile => {
                 if let Some(path) = rfd::FileDialog::new().pick_file() {
@@ -1825,23 +1836,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             FileAction::OpenFolder => {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    save_last_project(&path);
-                    state.tree = Some(file_tree(path.clone()));
-                    state.show_editor();
-                    if let Some(tree) = &mut state.tree {
-                        task = tree.update(DirectoryTreeEvent::Toggled(path.clone())).map(Message::Tree);
-                    }
-                    let changed = state.root.as_deref() != Some(path.as_path());
-                    state.root = Some(path);
-                    // Shells left in the previous project would run commands against it.
-                    if changed {
-                        let focused = state.terminal.focused();
-                        state.terminal.shutdown();
-                        if state.terminal_visible {
-                            state.terminal.ensure_started(&state.root_or_cwd());
-                            state.terminal.set_focused(focused);
-                        }
-                    }
+                    task = open_folder(state, path);
                 }
             }
             FileAction::CloseFolder => {
@@ -2801,6 +2796,29 @@ pub(crate) mod tree_focus {
 }
 
 #[cfg(test)]
+mod drop_tests {
+    use super::*;
+
+    fn dropped(path: &str) -> iced::Event {
+        iced::Event::Window(iced::window::Event::FileDropped(PathBuf::from(path)))
+    }
+
+    #[test]
+    fn drops_open_in_the_editor_unless_a_widget_took_them() {
+        use iced::event::Status;
+        let window = iced::window::Id::unique();
+        assert!(matches!(
+            handle_raw_drop_event(dropped("notes.md"), Status::Ignored, window),
+            Some(Message::PathDropped(path)) if path == PathBuf::from("notes.md")
+        ));
+        // The AI composer captures drops on itself; they must not also open a tab.
+        assert!(handle_raw_drop_event(dropped("notes.md"), Status::Captured, window).is_none());
+        let hovered = iced::Event::Window(iced::window::Event::FileHovered(PathBuf::from("notes.md")));
+        assert!(handle_raw_drop_event(hovered, Status::Ignored, window).is_none());
+    }
+}
+
+#[cfg(test)]
 mod layer_tests {
     use super::*;
     use iced::widget::text_editor;
@@ -3598,8 +3616,47 @@ fn handle_raw_key_event(
     }
 }
 
+/// Opens `path` as the project: remembers it, shows its tree and points the shells at it.
+fn open_folder(state: &mut State, path: PathBuf) -> Task<Message> {
+    let mut task = Task::none();
+    save_last_project(&path);
+    state.tree = Some(file_tree(path.clone()));
+    state.show_editor();
+    if let Some(tree) = &mut state.tree {
+        task = tree.update(DirectoryTreeEvent::Toggled(path.clone())).map(Message::Tree);
+    }
+    let changed = state.root.as_deref() != Some(path.as_path());
+    state.root = Some(path);
+    // Shells left in the previous project would run commands against it.
+    if changed {
+        let focused = state.terminal.focused();
+        state.terminal.shutdown();
+        if state.terminal_visible {
+            state.terminal.ensure_started(&state.root_or_cwd());
+            state.terminal.set_focused(focused);
+        }
+    }
+    task
+}
+
+/// Files dropped on the window open in the editor, unless a widget took the drop first: the
+/// AI composer captures drops on itself to attach them (`ai_composer::DropTarget`).
+fn handle_raw_drop_event(
+    event: iced::Event,
+    status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Window(iced::window::Event::FileDropped(path)) if status == iced::event::Status::Ignored => {
+            Some(Message::PathDropped(path))
+        }
+        _ => None,
+    }
+}
+
 fn subscription(state: &State) -> Subscription<Message> {
     let keys = iced::event::listen_with(handle_raw_key_event);
+    let drops = iced::event::listen_with(handle_raw_drop_event);
     let tick = iced::time::every(Duration::from_millis(50)).map(|_| Message::Tick);
     let window_events = iced::window::events().map(|(id, event)| match event {
         iced::window::Event::CloseRequested => Message::Exit,
@@ -3623,7 +3680,7 @@ fn subscription(state: &State) -> Subscription<Message> {
         iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape), .. }) => Some(Message::TreeDragCancel),
         _ => None,
     });
-    Subscription::batch([keys, tick, window_events, first_frame, drag_cleanup])
+    Subscription::batch([keys, drops, tick, window_events, first_frame, drag_cleanup])
 }
 
 /// `HOME` is unset on native Windows launches outside Git Bash/pwsh7, so use

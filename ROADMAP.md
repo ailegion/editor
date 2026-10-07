@@ -31,6 +31,8 @@ for a "minimal, no-bloat" positioning.
   path/relative path, reveal in file manager, refresh, drag onto a folder to move (asks
   first, never overwrites; open tabs follow)
 - Quick Open (Cmd+P): fuzzy file finder, recently opened files first
+- Drag from the OS onto the window: a file opens in a tab, a folder opens as the project
+  (dropping on the AI message box attaches instead)
 - Command Palette (Cmd+Shift+P), Go to Line (Cmd+G)
 - Find in Project (Cmd+Shift+F): case-insensitive search, plain or regex (`.*` toggle), up to
   500 results, skipping `.git`/`target`/`node_modules`/etc.
@@ -117,7 +119,7 @@ for a "minimal, no-bloat" positioning.
 | Inline AI edit | ✅ (VS Code, Zed, JetBrains) | ✅ Cmd+K (done) |
 | Settings UI / config file | ✅ | ⚠️ many individual flat files under `~/.config/editor/`; no unified settings UI beyond AI connections |
 | Extensions / plugins | ✅ | ❌ intentionally out of scope |
-| Drag-and-drop to open files | ✅ | ❌ dropped files only attach to the AI chat input |
+| Drag-and-drop to open files | ✅ | ✅ files open in tabs, folders open as the project; drops on the AI input still attach (done) |
 | Move files by dragging in the tree | ✅ | ✅ with confirmation; never overwrites (done) |
 | Recent files list | ✅ | ✅ recently opened files in Quick Open (done) |
 | Auto-save | ✅ (optional) | ❌ manual save; unsaved edits survive restarts via the recovery session |
@@ -130,7 +132,8 @@ Ordered by (impact on daily editing) ÷ (implementation cost). Completed phases 
 
 ### Done
 - **Navigation:** Quick Open, Command Palette, Go to Line, recent files
-  (`quick_open.rs`, `command_palette.rs`, `goto_line.rs`, `recent_files.rs`)
+  (`quick_open.rs`, `command_palette.rs`, `goto_line.rs`, `recent_files.rs`), drag-and-drop
+  from the OS to open files and folders (`handle_raw_drop_event` in `main.rs`)
 - **Editing polish:** bracket matching/auto-close (`code_editor/brackets.rs`), regex
   find/replace (`code_editor/search.rs`), code folding (`code_editor/folding.rs`), word wrap
   (`code_editor/rows.rs`; design and history in `docs/WORD_WRAP_PLAN.md`)
@@ -153,7 +156,6 @@ Ordered by (impact on daily editing) ÷ (implementation cost). Completed phases 
 
 ### Next — Files and search
 5. **Project search: `.gitignore`** — skip ignored files instead of a fixed directory list.
-6. **Drag-and-drop to open files** from the OS.
 
 ### Next — Layout and settings
 7. **Split editor panes** — two `PaneKind::Main`-equivalent editors side by side.
