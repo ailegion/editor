@@ -802,23 +802,75 @@ mod construction_tests {
         assert_eq!(shape(&mut shared), shape(&mut fresh));
     }
 
-    /// A measurement, not a check: what opening a 4,000-line file costs each way.
-    /// `cargo test open_timing -- --ignored --nocapture`
+}
+
+/// Speed measurements. These never fail: each prints how long an operation took next to the
+/// time expected of it, and flags it as a WARNING when slower, so a slowdown shows up in the
+/// test output without blocking anything. The expected times are from a debug build on the
+/// maintainer's machine (2026-10-08, Windows 11), with the rest of the suite running alongside;
+/// other machines will differ.
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+    use cosmic_text::Action;
+    use std::time::{Duration, Instant};
+
+    /// Runs `op` once and reports its time against `expected`. Written straight to the
+    /// process's stderr, which the test harness doesn't capture, so it shows in a plain
+    /// `cargo test` run.
+    fn timed(name: &str, expected: Duration, op: impl FnOnce()) {
+        use std::io::Write;
+        let start = Instant::now();
+        op();
+        let took = start.elapsed();
+        let line = if took > expected {
+            format!("WARNING: {name}: expected {expected:?}, took {took:?} ({:.1}x slower)\n", took.as_secs_f64() / expected.as_secs_f64())
+        } else {
+            format!("timing: {name}: expected {expected:?}, took {took:?}\n")
+        };
+        let _ = std::io::stderr().write_all(line.as_bytes());
+    }
+
+    const LINE: &str = "    let value = compute(first_argument, second_argument) + another_call(third) * 2; // trailing comment";
+
+    fn source() -> String { vec![LINE; 4_000].join("\n") }
+
+    fn open(text: &str, highlighter: &Highlighter, theme: &crate::theme::EditorTheme) -> Buffer {
+        Buffer::highlighted(text, Metrics::new(14.0, 20.0), highlighter, "rs", &theme.syntax)
+    }
+
     #[test]
-    #[ignore]
-    fn open_timing() {
-        use std::time::Instant;
-        let line = "    let value = compute(first_argument, second_argument) + another_call(third) * 2; // trailing comment";
-        let text = vec![line; 4_000].join("\n");
-        let highlighter = Highlighter::new();
-        let theme = crate::theme::EditorTheme::default_dark();
-        let start = Instant::now();
-        let mut buffer = Buffer::new(&text, Metrics::new(14.0, 20.0));
-        buffer.highlight(&highlighter, "rs", &theme.syntax);
-        println!("new + highlight:         {:?}", start.elapsed());
-        let start = Instant::now();
-        let _ = Buffer::highlighted(&text, Metrics::new(14.0, 20.0), &highlighter, "rs", &theme.syntax);
-        println!("highlighted:             {:?}", start.elapsed());
+    fn open_4000_lines() {
+        let (text, highlighter, theme) = (source(), Highlighter::new(), crate::theme::EditorTheme::default_dark());
+        timed("open 4,000 lines", Duration::from_millis(651), || { let _ = open(&text, &highlighter, &theme); });
+    }
+
+    #[test]
+    fn keystroke_in_4000_lines() {
+        let (text, highlighter, theme) = (source(), Highlighter::new(), crate::theme::EditorTheme::default_dark());
+        let mut buffer = open(&text, &highlighter, &theme);
+        buffer.set_viewport(400.0, 800.0);
+        timed("keystroke in 4,000 lines (edit and layout)", Duration::from_millis(6), || buffer.perform(Action::Insert('x')));
+    }
+
+    #[test]
+    fn rehighlight_4000_lines() {
+        let (text, highlighter, theme) = (source(), Highlighter::new(), crate::theme::EditorTheme::default_dark());
+        let mut buffer = open(&text, &highlighter, &theme);
+        timed("re-highlight 4,000 lines (after an edit or a theme change)", Duration::from_millis(571), || buffer.highlight(&highlighter, "rs", &theme.syntax));
+    }
+
+    #[test]
+    fn word_wrap_on_4000_lines() {
+        let (text, highlighter, theme) = (source(), Highlighter::new(), crate::theme::EditorTheme::default_dark());
+        let mut buffer = open(&text, &highlighter, &theme);
+        buffer.set_viewport(400.0, 800.0);
+        timed("word wrap on, 4,000 lines", Duration::from_millis(22), || buffer.set_wrap(true));
+    }
+
+    #[test]
+    fn empty_buffer() {
+        timed("empty buffer (font system from the shared database)", Duration::from_millis(23), || { let _ = Buffer::new("", Metrics::new(14.0, 20.0)); });
     }
 }
 
