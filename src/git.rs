@@ -418,12 +418,14 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
     }
     let files_list = scrollable(files_col).height(Length::Fill);
 
-    let mut bottom = column![].spacing(4);
+    // Keyed, so the message box keeps its widget state (focus) when the error above it comes or goes.
+    let mut bottom = iced::widget::keyed::Column::new().spacing(4);
     if let Some(err) = &state.error {
-        bottom = bottom.push(scrollable(text(err.clone()).size(12).font(iced::Font::MONOSPACE).style(iced::widget::text::danger)).height(Length::Shrink));
+        bottom = bottom.push("error", scrollable(text(err.clone()).size(12).font(iced::Font::MONOSPACE).style(iced::widget::text::danger)).height(Length::Shrink));
     }
     let has_staged = state.status.files.iter().any(ChangedFile::staged);
     bottom = bottom.push(
+        "message",
         text_editor(&state.commit_message)
             .placeholder("Describe your changes (Cmd/Ctrl+Enter to commit)")
             .on_action(Message::CommitMessageEdited)
@@ -441,7 +443,7 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
             }),
     );
     // The AI button stays disabled while a message is being written; the box fills in when done.
-    bottom = bottom.push(row![
+    bottom = bottom.push("actions", row![
         Space::new().width(Length::Fill),
         crate::icon_control(lucide_icons::Icon::Sparkles, "Write message with AI from staged changes",
             (has_staged && !state.generating && !state.committing).then_some(Message::GenerateMessage), false),
@@ -688,6 +690,14 @@ fn stage_files(cwd: &Path, files: &[ChangedFile], stage: bool, unborn: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_error_coming_or_going_keeps_the_commit_message_focused() {
+        let plain = GitState::default();
+        let failed = GitState { error: Some("fatal: not a git repository".into()), ..GitState::default() };
+        assert!(crate::tree_focus::keeps_focus(view(&plain, None), view(&failed, None)));
+        assert!(crate::tree_focus::keeps_focus(view(&failed, None), view(&plain, None)));
+    }
 
     fn git(root: &Path, args: &[&str]) -> String {
         String::from_utf8(cli::run(root, args, None, Access::Write).unwrap()).unwrap()

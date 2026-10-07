@@ -2698,8 +2698,8 @@ fn view(state: &State) -> Element<'_, Message> {
     .on_resize(10, Message::PaneResized)
     .height(Length::Fill);
 
-    let mut base: Element<'_, Message> = column![top_bar, panes, status_bar].into();
-    if let Some((message, _)) = &state.notice {
+    let base: Element<'_, Message> = column![top_bar, panes, status_bar].into();
+    let toast: Option<Element<'_, Message>> = state.notice.as_ref().map(|(message, _)| {
         let toast = container(row![text(message).size(13),
             button("×").style(flat_button_style).on_press(Message::DismissNotice),
         ].spacing(12).align_y(iced::Alignment::Center))
@@ -2712,10 +2712,9 @@ fn view(state: &State) -> Element<'_, Message> {
                     ..Default::default()
                 }
             });
-        base = iced::widget::stack![base, container(toast).padding(16)
-            .align_right(Length::Fill).align_bottom(Length::Fill)].into();
-    }
-    if let Some(server) = state.lsp_prompt {
+        container(toast).padding(16).align_right(Length::Fill).align_bottom(Length::Fill).into()
+    });
+    let prompt: Option<Element<'_, Message>> = state.lsp_prompt.map(|server| {
         let prompt = container(column![
             text(format!("{} provides diagnostics for this file type but isn't installed.", server.name)).size(13),
             row![
@@ -2732,35 +2731,98 @@ fn view(state: &State) -> Element<'_, Message> {
                 ..Default::default()
             }
         });
-        base = iced::widget::stack![base, container(prompt).padding(16)
-            .align_left(Length::Fill).align_bottom(Length::Fill)].into();
-    }
+        container(prompt).padding(16).align_left(Length::Fill).align_bottom(Length::Fill).into()
+    });
 
-    if state.theme_install.visible {
-        iced::widget::stack![base, theme_install::view(&state.theme_install).map(Message::ThemeInstall)].into()
+    let overlay: Option<Element<'_, Message>> = if state.theme_install.visible {
+        Some(theme_install::view(&state.theme_install).map(Message::ThemeInstall))
     } else if state.quick_open.visible {
-        iced::widget::stack![
-            base,
-            quick_open::view(&state.quick_open, state.root.as_deref()).map(Message::QuickOpen),
-        ]
-        .into()
+        Some(quick_open::view(&state.quick_open, state.root.as_deref()).map(Message::QuickOpen))
     } else if state.command_palette.visible {
-        iced::widget::stack![
-            base,
-            command_palette::view(&state.command_palette).map(Message::CommandPalette),
-        ]
-        .into()
+        Some(command_palette::view(&state.command_palette).map(Message::CommandPalette))
     } else if state.goto_line.visible {
         let line_count = state.tabs.get(state.active_tab).map(|t| t.content.line_count()).unwrap_or(0);
-        iced::widget::stack![
-            base,
-            goto_line::view(&state.goto_line, line_count).map(Message::GotoLine),
-        ]
-        .into()
+        Some(goto_line::view(&state.goto_line, line_count).map(Message::GotoLine))
     } else if state.about.visible {
-        iced::widget::stack![base, about::view(&state.about, &state.app_theme.iced).map(Message::About)].into()
+        Some(about::view(&state.about, &state.app_theme.iced).map(Message::About))
     } else {
-        base
+        None
+    };
+    layered(base, toast, prompt, overlay)
+}
+
+/// Lays the toast, the language-server prompt and the open overlay over `base` as four layers
+/// that are always present. iced matches widget state by position in the tree, so wrapping
+/// `base` in a `stack` only while a layer was visible rebuilt the whole tree each time a toast
+/// came or went (it auto-dismisses after 8 seconds), which dropped the focus of the commit
+/// message and AI message boxes mid-typing.
+fn layered<'a, M: 'a>(
+    base: Element<'a, M>, toast: Option<Element<'a, M>>, prompt: Option<Element<'a, M>>, overlay: Option<Element<'a, M>>,
+) -> Element<'a, M> {
+    let slot = |layer: Option<Element<'a, M>>| layer.unwrap_or_else(|| Space::new().into());
+    iced::widget::stack![base, slot(toast), slot(prompt), slot(overlay)].into()
+}
+
+/// iced keeps a text editor's focus in widget-tree state, which a view change that rebuilds the
+/// editor's subtree silently drops. Reads and sets that state on a `Tree`, with no renderer.
+#[cfg(test)]
+pub(crate) mod tree_focus {
+    use iced::advanced::text::highlighter::PlainText;
+    use iced::advanced::widget::operation::Focusable;
+    use iced::advanced::widget::{tree::Tag, Tree};
+    use iced::widget::text_editor;
+    use iced::Element;
+
+    type EditorState = text_editor::State<PlainText>;
+
+    fn editor(tree: &mut Tree) -> Option<&mut EditorState> {
+        if tree.tag == Tag::of::<EditorState>() {
+            return Some(tree.state.downcast_mut());
+        }
+        tree.children.iter_mut().find_map(editor)
+    }
+
+    /// Every node's tag and child count match: the state each widget will find is its own.
+    fn same_shape(a: &Tree, b: &Tree) -> bool {
+        a.tag == b.tag && a.children.len() == b.children.len()
+            && a.children.iter().zip(&b.children).all(|(a, b)| same_shape(a, b))
+    }
+
+    /// Whether the first text editor in `before` is still focused once the view is `after`.
+    /// Panics if the diffed tree no longer matches `after`, since a widget handed another
+    /// widget's state panics at runtime.
+    pub(crate) fn keeps_focus<M>(before: Element<'_, M>, after: Element<'_, M>) -> bool {
+        let mut tree = Tree::new(&before);
+        editor(&mut tree).expect("the view has a text editor").focus();
+        tree.diff(&after);
+        assert!(same_shape(&tree, &Tree::new(&after)), "the diffed widget tree does not match the new view");
+        editor(&mut tree).is_some_and(|state| state.is_focused())
+    }
+}
+
+#[cfg(test)]
+mod layer_tests {
+    use super::*;
+    use iced::widget::text_editor;
+
+    fn base(content: &text_editor::Content) -> Element<'_, Message> {
+        iced::widget::column![text_editor(content)].into()
+    }
+
+    fn layer<'a>() -> Element<'a, Message> {
+        container(text("layer")).into()
+    }
+
+    #[test]
+    fn layers_coming_and_going_keep_the_editor_focused() {
+        let content = text_editor::Content::new();
+        let with = |toast: bool, prompt: bool, overlay: bool| {
+            layered(base(&content), toast.then(layer), prompt.then(layer), overlay.then(layer))
+        };
+        for (toast, prompt, overlay) in [(true, false, false), (false, true, false), (false, false, true), (true, true, true)] {
+            assert!(tree_focus::keeps_focus(with(false, false, false), with(toast, prompt, overlay)));
+            assert!(tree_focus::keeps_focus(with(toast, prompt, overlay), with(false, false, false)));
+        }
     }
 }
 

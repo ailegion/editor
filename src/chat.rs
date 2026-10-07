@@ -829,7 +829,10 @@ pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>)
     }
     let messages = scrollable(messages_col.spacing(16)).anchor_bottom().height(Length::Fill);
 
-    let mut bottom = column![].spacing(4);
+    // Everything above the composer is one column, present only when it has something in it,
+    // so the keyed column only ever gains or loses its first child: the one change iced's
+    // keyed diff handles while keeping the input's widget state (its focus).
+    let mut extras: Vec<Element<'a, Message>> = Vec::new();
     if let Some(pending) = &state.pending_permission {
         use crate::ai_approval::{Card, Choice, ChoiceKind};
         let (title, mut details) = pending.label.split_once('(').map(|(name, args)| {
@@ -839,7 +842,7 @@ pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>)
         }).unwrap_or_else(|| ("Review tool request".into(), pending.label.clone()));
         // A file write reads better as the change it makes than as the file's full new text.
         if let Some(diff) = &pending.diff { details = diff.review_text(); }
-        bottom = bottom.push(crate::ai_approval::view(Card {
+        extras.push(crate::ai_approval::view(Card {
             title, details: details.clone(),
             choices: vec![
                 Choice { label: "Reject".into(), message: Message::PermissionChosen(false), kind: ChoiceKind::Reject },
@@ -849,8 +852,12 @@ pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>)
             copy: Message::Copy(details),
         }));
     }
-    if !state.session_grants.is_empty() { bottom = bottom.push(button("Reset session approvals").style(crate::flat_button_style).on_press(Message::ResetPermissions)); }
-    bottom = bottom.push(crate::ai_composer::view(
+    if !state.session_grants.is_empty() { extras.push(button("Reset session approvals").style(crate::flat_button_style).on_press(Message::ResetPermissions).into()); }
+    let mut bottom = iced::widget::keyed::Column::new().spacing(4);
+    if !extras.is_empty() {
+        bottom = bottom.push("extras", iced::widget::column(extras).spacing(4));
+    }
+    bottom = bottom.push("composer", crate::ai_composer::view(
         column![
             text_editor(&state.input)
                 .size(13)
@@ -1491,6 +1498,31 @@ fn truncate(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_reset_approvals_button_coming_or_going_keeps_the_input_focused() {
+        let theme = iced::Theme::Dark;
+        let composer = crate::ai_composer::Context { sources: &[], can_reference: false, theme: &theme, mentions: &[] };
+        let plain = ChatState::default();
+        let mut granted = ChatState::default();
+        granted.session_grants.insert("write_file".into());
+        assert!(crate::tree_focus::keeps_focus(view(&plain, composer), view(&granted, composer)));
+        assert!(crate::tree_focus::keeps_focus(view(&granted, composer), view(&plain, composer)));
+    }
+
+    /// Allowing a request for the session swaps the card for the reset button in one frame.
+    #[test]
+    fn answering_a_permission_for_the_session_keeps_the_input_focused() {
+        let theme = iced::Theme::Dark;
+        let composer = crate::ai_composer::Context { sources: &[], can_reference: false, theme: &theme, mentions: &[] };
+        let mut pending = ChatState::default();
+        let (respond, _reply) = mpsc::channel();
+        pending.pending_permission = Some(PendingPermission { remember: true, label: "write_file({})".into(), diff: None, respond });
+        let mut granted = ChatState::default();
+        granted.session_grants.insert("write_file".into());
+        assert!(crate::tree_focus::keeps_focus(view(&pending, composer), view(&granted, composer)));
+        assert!(crate::tree_focus::keeps_focus(view(&ChatState::default(), composer), view(&pending, composer)));
+    }
 
     #[test]
     fn remembering_a_rejected_request_does_not_grant_permission() {

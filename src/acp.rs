@@ -1195,7 +1195,10 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
     }
     let messages = scrollable(messages).anchor_bottom().height(Length::Fill);
 
-    let mut bottom = column![];
+    // Everything above the composer is one column, present only when it has something in it,
+    // so the keyed column only ever gains or loses its first child: the one change iced's
+    // keyed diff handles while keeping the input's widget state (its focus).
+    let mut extras: Vec<Element<'a, Message>> = Vec::new();
     if let Some(pending) = &state.pending_permission {
         use crate::ai_approval::{Card, Choice, ChoiceKind};
         let mut choices: Vec<_> = pending.options.iter().map(|(id, name, kind)| {
@@ -1207,14 +1210,14 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
             Choice { label, kind: style, message: Message::PermissionChosen(id.clone()) }
         }).collect();
         choices.sort_by_key(|choice| match choice.kind { ChoiceKind::Reject => 0, ChoiceKind::Allow => 1, ChoiceKind::Other => 2 });
-        bottom = bottom.push(crate::ai_approval::view(Card {
+        extras.push(crate::ai_approval::view(Card {
             title: pending.title.clone(), details: pending.details.clone(), choices,
             remember: (pending.allow_once.is_some() && pending.scope.is_some()).then_some((pending.remember, Message::RememberPermission)),
             copy: Message::Copy(pending.details.clone()),
         }));
     }
     if !state.session_grants.is_empty() {
-        bottom = bottom.push(button("Reset session approvals").style(crate::flat_button_style).on_press(Message::ResetPermissions));
+        extras.push(button("Reset session approvals").style(crate::flat_button_style).on_press(Message::ResetPermissions).into());
     }
     let can_switch = !state.streaming && !state.model_switching && !state.effort_switching;
     let choice_buttons = |options: &'a ModelOptions, select: fn(String) -> Message| {
@@ -1243,12 +1246,16 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
                 column![text(format!("{} did not report any selectable models.", state.provider)).size(12).style(iced::widget::text::secondary)]
             }
         };
-        bottom = bottom.push(dropdown(menu));
+        extras.push(dropdown(menu).into());
     }
     // Only the levels the agent reports for the current model; nothing when it reports none.
     let effort = state.effort.as_ref().filter(|effort| !effort.choices.is_empty());
     if let (true, Some(effort)) = (state.effort_menu_open, effort) {
-        bottom = bottom.push(dropdown(choice_buttons(effort, Message::SelectEffort)));
+        extras.push(dropdown(choice_buttons(effort, Message::SelectEffort)).into());
+    }
+    let mut bottom = iced::widget::keyed::Column::new();
+    if !extras.is_empty() {
+        bottom = bottom.push("extras", iced::widget::column(extras).spacing(6));
     }
     let model_name = state.models.as_ref().map(ModelOptions::current_name);
     let model_button = button(text(state.model_label()).size(12))
@@ -1270,7 +1277,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
         crate::icon_control(lucide_icons::Icon::SendHorizonal, "Send message (Cmd/Ctrl+Enter)",
             (!state.model_switching && !state.effort_switching && !awaiting_permission && (!state.input.text().trim().is_empty() || !state.attachments.is_empty())).then_some(Message::Send), false)
     };
-    bottom = bottom.push(crate::ai_composer::view(
+    bottom = bottom.push("composer", crate::ai_composer::view(
         column![
             text_editor(&state.input)
                 .size(13)
@@ -1391,6 +1398,23 @@ fn select_options(option: &agent_client_protocol::schema::v1::SessionConfigOptio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_model_menu_opening_or_closing_keeps_the_input_focused() {
+        let theme = iced::Theme::Dark;
+        let composer = crate::ai_composer::Context { sources: &[], can_reference: false, theme: &theme, mentions: &[] };
+        let plain = AcpState::default();
+        let menu = AcpState { model_menu_open: true, ..AcpState::default() };
+        assert!(crate::tree_focus::keeps_focus(view(&plain, PathBuf::from("."), composer), view(&menu, PathBuf::from("."), composer)));
+        assert!(crate::tree_focus::keeps_focus(view(&menu, PathBuf::from("."), composer), view(&plain, PathBuf::from("."), composer)));
+        // With the reset button already shown, the menu opens between it and the composer.
+        let mut granted = AcpState::default();
+        granted.session_grants.insert("write_file".into());
+        let mut granted_menu = AcpState { model_menu_open: true, ..AcpState::default() };
+        granted_menu.session_grants.insert("write_file".into());
+        assert!(crate::tree_focus::keeps_focus(view(&granted, PathBuf::from("."), composer), view(&granted_menu, PathBuf::from("."), composer)));
+        assert!(crate::tree_focus::keeps_focus(view(&granted_menu, PathBuf::from("."), composer), view(&granted, PathBuf::from("."), composer)));
+    }
 
     #[test]
     fn model_metadata_is_read_from_session_configuration() {

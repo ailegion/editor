@@ -64,9 +64,12 @@ pub fn view<'a, M: Clone + 'a>(
             text(&attachment.name).size(12), iced::widget::tooltip::Position::Top,
         ));
     }
-    let mut content = column![].spacing(6);
+    // Everything above the input is one column, present only when it has something in it, so
+    // the keyed column only ever gains or loses its first child: the one change iced's keyed
+    // diff handles while keeping the input's widget state (its focus).
+    let mut extras: Vec<Element<'a, M>> = Vec::new();
     if !attachments.is_empty() {
-        content = content.push(container(scrollable(chips)).max_height(110));
+        extras.push(container(scrollable(chips)).max_height(110).into());
     }
     if !context.mentions.is_empty() {
         let mut suggestions = column![text("Attach file").size(11).style(iced::widget::text::secondary)].spacing(1);
@@ -75,9 +78,13 @@ pub fn view<'a, M: Clone + 'a>(
                 .width(Length::Fill).padding([2, 6]).style(crate::flat_button_style)
                 .on_press(on_action(Action::Mention(path.clone()))));
         }
-        content = content.push(container(suggestions).padding(4).width(Length::Fill).style(container::rounded_box));
+        extras.push(container(suggestions).padding(4).width(Length::Fill).style(container::rounded_box).into());
     }
-    content = content.push(input).push(row![
+    let mut content = iced::widget::keyed::Column::new().spacing(6);
+    if !extras.is_empty() {
+        content = content.push("extras", iced::widget::column(extras).spacing(6));
+    }
+    content = content.push("input", input).push("controls", row![
         crate::icon_control(lucide_icons::Icon::Paperclip, "Attach image or file", Some(on_action(Action::Attach)), false),
         crate::icon_control(lucide_icons::Icon::Code, "Reference selection or active file", context.can_reference.then(|| on_action(Action::Reference)), false),
         text(if context.sources.is_empty() { "Drop files or images here" } else { "Drop to add to this message" }).size(11).style(iced::widget::text::secondary),
@@ -159,6 +166,41 @@ impl<M> Widget<M, Theme, Renderer> for DropTarget<'_, M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The input as the AI panels build it: the editor over a row of controls.
+    fn composer<'a>(
+        input: &'a iced::widget::text_editor::Content, mentions: &'a [String], attachments: &'a [Attachment], theme: &'a iced::Theme,
+    ) -> Element<'a, ()> {
+        let context = Context { sources: &[], can_reference: false, theme, mentions };
+        let input = iced::widget::column![iced::widget::text_editor(input), row![text("Ready")]].into();
+        view(input, attachments, context, |_| ())
+    }
+
+    #[test]
+    fn mention_suggestions_or_attachments_coming_or_going_keep_the_input_focused() {
+        let input = iced::widget::text_editor::Content::new();
+        let theme = iced::Theme::Dark;
+        let mentions = vec!["src/main.rs".to_string()];
+        let attachments = vec![Attachment { name: "notes.txt".into(), content: String::new(), mime: None }];
+        let plain = || composer(&input, &[], &[], &theme);
+        assert!(crate::tree_focus::keeps_focus(plain(), composer(&input, &mentions, &[], &theme)));
+        assert!(crate::tree_focus::keeps_focus(composer(&input, &mentions, &[], &theme), plain()));
+        assert!(crate::tree_focus::keeps_focus(plain(), composer(&input, &[], &attachments, &theme)));
+        assert!(crate::tree_focus::keeps_focus(composer(&input, &[], &attachments, &theme), plain()));
+    }
+
+    /// Typing `@` with an attachment already shown inserts the suggestions between it and the input.
+    #[test]
+    fn mention_suggestions_below_attachments_keep_the_input_focused() {
+        let input = iced::widget::text_editor::Content::new();
+        let theme = iced::Theme::Dark;
+        let mentions = vec!["src/main.rs".to_string()];
+        let attachments = vec![Attachment { name: "notes.txt".into(), content: String::new(), mime: None }];
+        let attached = || composer(&input, &[], &attachments, &theme);
+        assert!(crate::tree_focus::keeps_focus(attached(), composer(&input, &mentions, &attachments, &theme)));
+        assert!(crate::tree_focus::keeps_focus(composer(&input, &mentions, &attachments, &theme), attached()));
+    }
+
     #[test]
     fn only_drops_inside_the_composer_attach_files() {
         let sources = vec![PathBuf::from("src/main.rs"), PathBuf::from("image.png")];
