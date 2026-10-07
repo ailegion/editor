@@ -613,10 +613,9 @@ impl State {
                 tasks.push(state.open_path(path.clone()));
             }
             for recovery in session.recovery {
-                let mut content = code_editor::Buffer::new(&recovery.text, code_editor::metrics_for_zoom(state.zoom));
-                content.set_wrap(state.word_wrap);
                 let extension = recovery.path.as_ref().and_then(|path| path.extension()).and_then(|ext| ext.to_str()).unwrap_or("txt");
-                content.highlight(&state.highlighter, extension, &state.app_theme.syntax);
+                let mut content = code_editor::Buffer::highlighted(&recovery.text, code_editor::metrics_for_zoom(state.zoom), &state.highlighter, extension, &state.app_theme.syntax);
+                content.set_wrap(state.word_wrap);
                 if let Some(path) = &recovery.path { state.lsp.open(path, recovery.text.clone()); }
                 let mut tab = Tab {
                     path: recovery.path.clone(), content, dirty: true,
@@ -751,10 +750,8 @@ impl State {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 if text != tab.content.text() {
                     let extension = tab.extension();
-                    tab.content =
-                        code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
+                    tab.content = code_editor::Buffer::highlighted(&text, code_editor::metrics_for_zoom(self.zoom), &self.highlighter, &extension, &self.app_theme.syntax);
                     tab.content.set_wrap(self.word_wrap);
-                    tab.content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
                     tab.blame.clear();
                     self.lsp.changed(&path);
                     tasks.push(load_diff_task(repo.clone(), self.root.as_deref(), path, text));
@@ -807,9 +804,8 @@ impl State {
             .unwrap_or("txt")
             .to_string();
         let line_ending = LineEnding::detect(&text);
-        let mut content = code_editor::Buffer::new(&text, code_editor::metrics_for_zoom(self.zoom));
+        let mut content = code_editor::Buffer::highlighted(&text, code_editor::metrics_for_zoom(self.zoom), &self.highlighter, &extension, &self.app_theme.syntax);
         content.set_wrap(self.word_wrap);
-        content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
         recent_files::record(&mut self.recent_files, path.clone());
         self.lsp.set_root(&self.root_or_cwd());
         self.lsp.open(&path, text.clone());

@@ -45,10 +45,21 @@ impl Highlighter {
         extension: &str,
         theme: &Theme,
     ) -> Vec<(String, Attrs<'static>)> {
+        self.highlight_lines(text.split('\n'), extension, theme)
+    }
+
+    /// [`Self::highlight`] for text already split into lines (none containing `'\n'`), so a
+    /// buffer need not join its lines into one string first.
+    pub fn highlight_lines<'a>(
+        &self,
+        lines: impl Iterator<Item = &'a str>,
+        extension: &str,
+        theme: &Theme,
+    ) -> Vec<(String, Attrs<'static>)> {
         let syntax = self.syntax_for(extension);
         let mut highlighter = HighlightLines::new(syntax, theme);
 
-        let lines: Vec<&str> = text.split('\n').collect();
+        let lines: Vec<&str> = lines.collect();
         let last = lines.len().saturating_sub(1);
 
         let mut spans = Vec::new();

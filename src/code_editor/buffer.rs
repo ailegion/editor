@@ -1,6 +1,6 @@
 use cosmic_text::{
-    Affinity, Attrs, Buffer as CosmicBuffer, Change, Cursor, Edit, Editor, FontSystem, LayoutGlyph,
-    Metrics, Selection, Shaping, Wrap,
+    Affinity, Attrs, AttrsList, Buffer as CosmicBuffer, BufferLine, Change, Cursor, Edit, Editor, FontSystem,
+    LayoutGlyph, LineEnding, LineIter, Metrics, Selection, Shaping, Wrap,
 };
 
 use super::brackets;
@@ -65,15 +65,49 @@ pub struct Buffer {
     view_scroll: [std::sync::atomic::AtomicU32; 2],
 }
 
+/// A `FontSystem` as `FontSystem::new` builds it, except that the system fonts are scanned once
+/// per process and each buffer starts from a copy of that database.
+fn font_system() -> FontSystem {
+    static FONTS: std::sync::OnceLock<(String, cosmic_text::fontdb::Database)> = std::sync::OnceLock::new();
+    let (locale, db) = FONTS.get_or_init(|| FontSystem::new().into_locale_and_db());
+    FontSystem::new_with_locale_and_db(locale.clone(), db.clone())
+}
+
 impl Buffer {
     pub fn new(text: &str, metrics: Metrics) -> Self {
-        let mut font_system = FontSystem::new();
+        let mut buffer = Self::unshaped(text, metrics);
+        buffer.sync();
+        buffer
+    }
+
+    /// `new` followed by `highlight`, shaping the text once, coloured, rather than once plain
+    /// and then again coloured.
+    pub fn highlighted(
+        text: &str, metrics: Metrics, highlighter: &Highlighter, extension: &str, theme: &syntect::highlighting::Theme,
+    ) -> Self {
+        let mut buffer = Self::unshaped(text, metrics);
+        buffer.highlight(highlighter, extension, theme);
+        buffer
+    }
+
+    /// The lines of `text` exactly as `cosmic_text::Buffer::set_text` builds them, but not yet
+    /// shaped: the engine is given no size (see below), so `set_text` would shape every line
+    /// of the file right here. The first `sync` or `highlight` shapes them instead.
+    fn unshaped(text: &str, metrics: Metrics) -> Self {
+        let mut font_system = font_system();
         let mut inner = CosmicBuffer::new(&mut font_system, metrics);
         // The engine never wraps and is given no size: it lays every line out as one long
         // row, which `rows` slices into screen rows (see `rows.rs`).
         inner.set_wrap(&mut font_system, Wrap::None);
-        inner.set_text(&mut font_system, text, &Attrs::new(), Shaping::Advanced, None);
-        let mut buffer = Self {
+        inner.lines.clear();
+        for (range, ending) in LineIter::new(text) {
+            inner.lines.push(BufferLine::new(&text[range], ending, AttrsList::new(&Attrs::new()), Shaping::Advanced));
+        }
+        // Ensure there is an ending line with no line ending, as `set_text` does.
+        if inner.lines.last().map(|line| line.ending()).unwrap_or_default() != LineEnding::None {
+            inner.lines.push(BufferLine::new("", LineEnding::None, AttrsList::new(&Attrs::new()), Shaping::Advanced));
+        }
+        Self {
             inner,
             font_system,
             cursor: Cursor::default(),
@@ -98,9 +132,7 @@ impl Buffer {
             folds: Default::default(), collapsed: Default::default(),
             folding_text: String::new(),
             view_scroll: Default::default(),
-        };
-        buffer.sync();
-        buffer
+        }
     }
 
     /// Number of screen rows.
@@ -454,8 +486,7 @@ impl Buffer {
     /// `set_rich_text`. Cursor/selection (line, byte index) are unaffected since this only
     /// re-styles the existing text rather than editing it.
     pub fn highlight(&mut self, highlighter: &Highlighter, extension: &str, theme: &syntect::highlighting::Theme) {
-        let text = self.text();
-        let spans = highlighter.highlight(&text, extension, theme);
+        let spans = highlighter.highlight_lines(self.inner.lines.iter().map(|line| line.text()), extension, theme);
         self.inner.set_rich_text(
             &mut self.font_system,
             spans.iter().map(|(chunk, attrs)| (chunk.as_str(), attrs.clone())),
@@ -692,6 +723,102 @@ impl Buffer {
             }
             line = last + 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod construction_tests {
+    use super::*;
+
+    const SOURCE: &str = "fn main() {\r\n    let s = \"héllo\";\t// ünïcode -> != ff\n\n}\n\rtrailing\rlast";
+
+    fn glyphs(line: &BufferLine) -> Option<Vec<(usize, usize, u16, u32, u32)>> {
+        line.layout_opt().map(|layout| {
+            layout.iter().flat_map(|row| row.glyphs.iter().map(|g| (g.start, g.end, g.glyph_id, g.x.to_bits(), g.w.to_bits()))).collect()
+        })
+    }
+
+    /// `highlighted` leaves a buffer in exactly the state `new` + `highlight` did.
+    #[test]
+    fn highlighted_matches_new_then_highlight() {
+        let highlighter = Highlighter::new();
+        let theme = crate::theme::EditorTheme::default_dark();
+        for (source, wrap) in [(SOURCE, false), (SOURCE, true), ("", false), ("one line, no ending", false), ("\n\n", true)] {
+            let mut old = Buffer::new(source, Metrics::new(14.0, 20.0));
+            old.set_wrap(wrap);
+            old.highlight(&highlighter, "rs", &theme.syntax);
+            let mut new = Buffer::highlighted(source, Metrics::new(14.0, 20.0), &highlighter, "rs", &theme.syntax);
+            new.set_wrap(wrap);
+
+            assert_eq!(new.text(), old.text());
+            assert_eq!(new.inner.lines.len(), old.inner.lines.len());
+            for (a, b) in new.inner.lines.iter().zip(&old.inner.lines) {
+                assert_eq!(a.text(), b.text());
+                assert_eq!(a.ending(), b.ending());
+                assert_eq!(a.attrs_list(), b.attrs_list());
+                assert_eq!(glyphs(a), glyphs(b));
+                assert!(glyphs(a).is_some(), "every line is laid out");
+            }
+            assert_eq!(new.visible_count(), old.visible_count());
+            for row in 0..old.visible_count() {
+                assert_eq!(new.row(row), old.row(row));
+            }
+            assert_eq!(new.content_width().to_bits(), old.content_width().to_bits());
+            assert_eq!(new.caret(), old.caret());
+            assert_eq!(new.folds, old.folds);
+            assert_eq!(new.layout_epoch(), old.layout_epoch());
+            assert_eq!(new.inner.lines.iter().any(|line| !line.attrs_list().spans().is_empty()), !source.trim().is_empty(), "the text is coloured");
+        }
+    }
+
+    /// `highlight` feeds the buffer's lines straight to syntect; the result must be what
+    /// highlighting the joined text gave.
+    #[test]
+    fn highlighting_lines_matches_highlighting_the_joined_text() {
+        let highlighter = Highlighter::new();
+        let theme = crate::theme::EditorTheme::default_dark();
+        let buffer = Buffer::new(SOURCE, Metrics::new(14.0, 20.0));
+        let from_lines = highlighter.highlight_lines(buffer.inner.lines.iter().map(|line| line.text()), "rs", &theme.syntax);
+        let from_text = highlighter.highlight(&buffer.text(), "rs", &theme.syntax);
+        assert_eq!(from_lines, from_text);
+    }
+
+    /// The shared font database shapes text exactly as a freshly built `FontSystem` does.
+    #[test]
+    fn shared_font_database_shapes_like_a_fresh_font_system() {
+        let mut fresh = FontSystem::new();
+        let mut shared = font_system();
+        assert_eq!(shared.locale(), fresh.locale());
+        assert_eq!(shared.db().len(), fresh.db().len());
+        for family in [cosmic_text::Family::Monospace, cosmic_text::Family::SansSerif, cosmic_text::Family::Serif] {
+            assert_eq!(shared.db().family_name(&family), fresh.db().family_name(&family));
+        }
+        let shape = |font_system: &mut FontSystem| {
+            let mut buffer = CosmicBuffer::new(font_system, Metrics::new(14.0, 20.0));
+            buffer.set_wrap(font_system, Wrap::None);
+            buffer.set_text(font_system, SOURCE, &Attrs::new(), Shaping::Advanced, None);
+            buffer.lines.iter().map(glyphs).collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&mut shared), shape(&mut fresh));
+    }
+
+    /// A measurement, not a check: what opening a 4,000-line file costs each way.
+    /// `cargo test open_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn open_timing() {
+        use std::time::Instant;
+        let line = "    let value = compute(first_argument, second_argument) + another_call(third) * 2; // trailing comment";
+        let text = vec![line; 4_000].join("\n");
+        let highlighter = Highlighter::new();
+        let theme = crate::theme::EditorTheme::default_dark();
+        let start = Instant::now();
+        let mut buffer = Buffer::new(&text, Metrics::new(14.0, 20.0));
+        buffer.highlight(&highlighter, "rs", &theme.syntax);
+        println!("new + highlight:         {:?}", start.elapsed());
+        let start = Instant::now();
+        let _ = Buffer::highlighted(&text, Metrics::new(14.0, 20.0), &highlighter, "rs", &theme.syntax);
+        println!("highlighted:             {:?}", start.elapsed());
     }
 }
 
