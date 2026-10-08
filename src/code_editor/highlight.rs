@@ -1,9 +1,23 @@
 //! Syntect-driven syntax highlighting; colors come from the current theme's `syntax`.
 
 use cosmic_text::{Attrs, Color as CosmicColor};
-use syntect::easy::HighlightLines;
-use syntect::highlighting::Theme;
-use syntect::parsing::{SyntaxReference, SyntaxSet};
+use syntect::highlighting::{HighlightIterator, HighlightState, Highlighter as ThemeHighlighter, Style, Theme};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
+
+/// The parser's and the styler's state at a line boundary. Highlighting can resume from it,
+/// and when two passes reach the same boundary in the same state, the lines after it come
+/// out identical -- which is what lets an edit re-highlight only the lines around it.
+#[derive(Clone, PartialEq)]
+pub struct LineState {
+    parse: ParseState,
+    style: HighlightState,
+}
+
+/// The text attributes for a syntect style: its foreground colour.
+pub fn attrs_for(style: Style) -> Attrs<'static> {
+    let fg = style.foreground;
+    Attrs::new().color(CosmicColor::rgba(fg.r, fg.g, fg.b, fg.a))
+}
 
 /// Loads syntax definitions once and turns source text into `cosmic_text` rich-text spans,
 /// so `Buffer` can feed them straight into `Buffer::set_rich_text`.
@@ -38,7 +52,9 @@ impl Highlighter {
 
     /// Highlights `text`, returning a flat sequence of `(chunk, attrs)` spans covering the
     /// whole document (line breaks embedded as `"\n"` chunks), ready for
-    /// `cosmic_text::Buffer::set_rich_text`.
+    /// `cosmic_text::Buffer::set_rich_text`. Tests use it to check the line-by-line
+    /// colouring the editor does against this older way of applying colours.
+    #[cfg(test)]
     pub fn highlight(
         &self,
         text: &str,
@@ -48,35 +64,51 @@ impl Highlighter {
         self.highlight_lines(text.split('\n'), extension, theme)
     }
 
-    /// [`Self::highlight`] for text already split into lines (none containing `'\n'`), so a
-    /// buffer need not join its lines into one string first.
+    /// [`Self::highlight`] for text already split into lines (none containing `'\n'`).
+    #[cfg(test)]
     pub fn highlight_lines<'a>(
         &self,
         lines: impl Iterator<Item = &'a str>,
         extension: &str,
         theme: &Theme,
     ) -> Vec<(String, Attrs<'static>)> {
-        let syntax = self.syntax_for(extension);
-        let mut highlighter = HighlightLines::new(syntax, theme);
+        let styles = ThemeHighlighter::new(theme);
+        let mut state = self.start(extension, theme);
 
         let lines: Vec<&str> = lines.collect();
         let last = lines.len().saturating_sub(1);
 
         let mut spans = Vec::new();
         for (i, line) in lines.into_iter().enumerate() {
-            let ranges = highlighter
-                .highlight_line(line, &self.syntax_set)
-                .unwrap_or_default();
-            for (style, piece) in ranges {
-                let fg = style.foreground;
-                let attrs = Attrs::new().color(CosmicColor::rgba(fg.r, fg.g, fg.b, fg.a));
-                spans.push((piece.to_string(), attrs));
+            for (style, piece) in self.highlight_line(&mut state, &styles, line) {
+                spans.push((piece.to_string(), attrs_for(style)));
             }
             if i != last {
                 spans.push(("\n".to_string(), Attrs::new()));
             }
         }
         spans
+    }
+
+    /// The state a document starts in. This is what `syntect::easy::HighlightLines::new`
+    /// sets up.
+    pub fn start(&self, extension: &str, theme: &Theme) -> LineState {
+        let styles = ThemeHighlighter::new(theme);
+        LineState {
+            parse: ParseState::new(self.syntax_for(extension)),
+            style: HighlightState::new(&styles, ScopeStack::new()),
+        }
+    }
+
+    /// Highlights one line (no line break in it) from `state`, leaving `state` at the line's
+    /// end. `styles` is `syntect::highlighting::Highlighter::new` of the theme `state` was
+    /// started with. This is what `syntect::easy::HighlightLines::highlight_line` does; like
+    /// it, a line the parser rejects yields nothing.
+    pub fn highlight_line<'t>(&self, state: &mut LineState, styles: &ThemeHighlighter<'_>, line: &'t str) -> Vec<(Style, &'t str)> {
+        let Ok(ops) = state.parse.parse_line(line, &self.syntax_set) else {
+            return Vec::new();
+        };
+        HighlightIterator::new(&mut state.style, &ops, line, styles).collect()
     }
 }
 

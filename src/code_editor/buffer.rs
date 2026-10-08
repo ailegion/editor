@@ -4,8 +4,43 @@ use cosmic_text::{
 };
 
 use super::brackets;
-use super::highlight::Highlighter;
+use super::highlight::{self, Highlighter, LineState};
 use super::rows::{Row, RowMap};
+use syntect::highlighting::{Highlighter as ThemeHighlighter, Theme};
+
+/// Parser state is kept entering every this-many-th line, so an edit resumes highlighting
+/// from the snapshot before it and usually stops at the first snapshot after it, once the
+/// state there matches what it was: about twice this many lines, whatever the file's size.
+const SNAPSHOT_EVERY: usize = 32;
+
+/// What the last `highlight` left behind, so the next one can redo only the lines an edit
+/// affected: the lines as it coloured them, and the parser state entering some of them.
+struct HighlightCache {
+    /// Syntax name and theme the colours are for; anything else means a full pass.
+    syntax: String,
+    theme: Theme,
+    lines: Vec<String>,
+    /// `(line, state entering that line)`, ascending by line, always starting at line 0.
+    snapshots: Vec<(usize, LineState)>,
+    /// Lines the last `highlight` recomputed, for tests and measurements.
+    recomputed: usize,
+}
+
+/// One line's attributes from its highlighted pieces: spans only where the attributes differ
+/// from the defaults, and none for empty pieces.
+fn attrs_list_for(pieces: &[(syntect::highlighting::Style, &str)]) -> AttrsList {
+    let mut list = AttrsList::new(&Attrs::new());
+    let mut end = 0;
+    for (style, piece) in pieces {
+        let start = end;
+        end += piece.len();
+        let attrs = highlight::attrs_for(*style);
+        if start < end && attrs != list.defaults() {
+            list.add_span(start..end, &attrs);
+        }
+    }
+    list
+}
 
 /// The laid-out glyphs of `line`: the engine keeps each line as one unwrapped row.
 fn glyphs_of(inner: &CosmicBuffer, line: usize) -> &[LayoutGlyph] {
@@ -63,6 +98,7 @@ pub struct Buffer {
     /// Vertical and horizontal scroll as last drawn (`f32` bits), copied from the editor
     /// widget so the app can place popups at the cursor. Atomics keep `Buffer` `Sync`.
     view_scroll: [std::sync::atomic::AtomicU32; 2],
+    highlight_cache: Option<HighlightCache>,
 }
 
 /// A `FontSystem` as `FontSystem::new` builds it, except that the system fonts are scanned once
@@ -132,6 +168,7 @@ impl Buffer {
             folds: Default::default(), collapsed: Default::default(),
             folding_text: String::new(),
             view_scroll: Default::default(),
+            highlight_cache: None,
         }
     }
 
@@ -482,21 +519,99 @@ impl Buffer {
         }
     }
 
-    /// Re-derives syntax-highlight colors for the current text and re-applies them via
-    /// `set_rich_text`. Cursor/selection (line, byte index) are unaffected since this only
-    /// re-styles the existing text rather than editing it.
-    pub fn highlight(&mut self, highlighter: &Highlighter, extension: &str, theme: &syntect::highlighting::Theme) {
-        let spans = highlighter.highlight_lines(self.inner.lines.iter().map(|line| line.text()), extension, theme);
-        self.inner.set_rich_text(
-            &mut self.font_system,
-            spans.iter().map(|(chunk, attrs)| (chunk.as_str(), attrs.clone())),
-            &Attrs::new(),
-            Shaping::Advanced,
-            None,
-        );
+    /// Re-derives syntax-highlight colors for the current text and re-applies them, line by
+    /// line. Only colours change: the text, the lines and the cursor stay exactly as they
+    /// are. After an edit, only the lines around it are redone (see `HighlightCache`); the
+    /// first pass, a new theme or a new syntax mean a full pass.
+    pub fn highlight(&mut self, highlighter: &Highlighter, extension: &str, theme: &Theme) {
+        let syntax = highlighter.language_name(extension);
+        if self.highlight_cache.as_ref().is_some_and(|cache| cache.syntax == syntax && cache.theme == *theme) {
+            self.highlight_changed_lines(highlighter);
+        } else {
+            self.highlight_all(highlighter, extension, theme);
+        }
+        // Every line keeps the default ending, and the engine's own scroll stays at the top,
+        // as `set_rich_text` (which used to apply the colours) left them.
+        for line in &mut self.inner.lines {
+            line.set_ending(LineEnding::default());
+        }
+        self.inner.set_scroll(cosmic_text::Scroll::default());
         // Styles can change glyph widths (a bold span, say), and with them where lines wrap.
         self.rows_stale = true;
         self.sync();
+    }
+
+    /// Highlights every line.
+    fn highlight_all(&mut self, highlighter: &Highlighter, extension: &str, theme: &Theme) {
+        let styles = ThemeHighlighter::new(theme);
+        let mut state = highlighter.start(extension, theme);
+        let mut snapshots = Vec::new();
+        for (i, line) in self.inner.lines.iter_mut().enumerate() {
+            if i % SNAPSHOT_EVERY == 0 {
+                snapshots.push((i, state.clone()));
+            }
+            let attrs = attrs_list_for(&highlighter.highlight_line(&mut state, &styles, line.text()));
+            line.set_attrs_list(attrs);
+        }
+        self.highlight_cache = Some(HighlightCache {
+            syntax: highlighter.language_name(extension).to_string(),
+            theme: theme.clone(),
+            lines: self.inner.lines.iter().map(|line| line.text().to_string()).collect(),
+            snapshots,
+            recomputed: self.inner.lines.len(),
+        });
+    }
+
+    /// Re-highlights the lines an edit changed, from the snapshot before the first changed
+    /// line until the parser state at a snapshot after the last one matches what it was.
+    /// Lines whose colours didn't change keep their shaping.
+    fn highlight_changed_lines(&mut self, highlighter: &Highlighter) {
+        let cache = self.highlight_cache.as_mut().expect("the caller checked there is a cache");
+        let lines = &mut self.inner.lines;
+        let (old_len, new_len) = (cache.lines.len(), lines.len());
+        let prefix = cache.lines.iter().zip(lines.iter()).take_while(|(old, new)| old.as_str() == new.text()).count();
+        let suffix = cache.lines.iter().rev().zip(lines.iter().rev())
+            .take(old_len.min(new_len) - prefix)
+            .take_while(|(old, new)| old.as_str() == new.text())
+            .count();
+        if prefix == old_len && old_len == new_len {
+            cache.recomputed = 0;
+            return;
+        }
+        let styles = ThemeHighlighter::new(&cache.theme);
+        // Snapshots in the unchanged tail stay valid, at their lines' new numbers.
+        let shift = new_len as isize - old_len as isize;
+        let after_edit: Vec<(usize, LineState)> = cache.snapshots.iter()
+            .filter(|(line, _)| *line >= old_len - suffix)
+            .map(|(line, state)| ((*line as isize + shift) as usize, state.clone()))
+            .collect();
+        let (start, mut state) = cache.snapshots.iter().rev()
+            .find(|(line, _)| *line <= prefix)
+            .map(|(line, state)| (*line, state.clone()))
+            .expect("line 0 always has a snapshot");
+        cache.snapshots.retain(|(line, _)| *line <= start);
+        let mut converged = None;
+        for i in start..new_len {
+            if i >= new_len - suffix {
+                if let Some((_, resumed)) = after_edit.iter().find(|(line, _)| *line == i) {
+                    if *resumed == state {
+                        converged = Some(i);
+                        break;
+                    }
+                }
+            }
+            if i > start && i % SNAPSHOT_EVERY == 0 {
+                cache.snapshots.push((i, state.clone()));
+            }
+            let line = &mut lines[i];
+            let attrs = attrs_list_for(&highlighter.highlight_line(&mut state, &styles, line.text()));
+            line.set_attrs_list(attrs);
+        }
+        cache.recomputed = converged.unwrap_or(new_len) - start;
+        if let Some(from) = converged {
+            cache.snapshots.extend(after_edit.into_iter().filter(|(line, _)| *line >= from));
+        }
+        cache.lines = lines.iter().map(|line| line.text().to_string()).collect();
     }
 
     /// Selects `start..end`, moving the cursor to `end` (matching how a mouse drag would
@@ -726,17 +841,21 @@ impl Buffer {
     }
 }
 
+/// A line's laid-out glyphs as comparable values: byte range, glyph id, x and width.
+#[cfg(test)]
+fn glyph_layout(line: &BufferLine) -> Option<Vec<(usize, usize, u16, u32, u32)>> {
+    line.layout_opt().map(|layout| {
+        layout.iter().flat_map(|row| row.glyphs.iter().map(|g| (g.start, g.end, g.glyph_id, g.x.to_bits(), g.w.to_bits()))).collect()
+    })
+}
+
 #[cfg(test)]
 mod construction_tests {
     use super::*;
 
     const SOURCE: &str = "fn main() {\r\n    let s = \"héllo\";\t// ünïcode -> != ff\n\n}\n\rtrailing\rlast";
 
-    fn glyphs(line: &BufferLine) -> Option<Vec<(usize, usize, u16, u32, u32)>> {
-        line.layout_opt().map(|layout| {
-            layout.iter().flat_map(|row| row.glyphs.iter().map(|g| (g.start, g.end, g.glyph_id, g.x.to_bits(), g.w.to_bits()))).collect()
-        })
-    }
+    fn glyphs(line: &BufferLine) -> Option<Vec<(usize, usize, u16, u32, u32)>> { glyph_layout(line) }
 
     /// `highlighted` leaves a buffer in exactly the state `new` + `highlight` did.
     #[test]
@@ -804,6 +923,163 @@ mod construction_tests {
 
 }
 
+#[cfg(test)]
+mod incremental_highlight_tests {
+    use super::*;
+    use cosmic_text::Action;
+
+    fn metrics() -> Metrics { Metrics::new(14.0, 20.0) }
+
+    /// 480 lines of Rust, so edits land well inside the snapshot grid.
+    fn source() -> String {
+        (0..120)
+            .map(|i| format!("fn item{i}(x: u32) -> u32 {{\n    let s = \"text {i}\"; // note\n    x + {i}\n}}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn type_text(buffer: &mut Buffer, text: &str) {
+        for c in text.chars() {
+            buffer.perform(if c == '\n' { Action::Enter } else { Action::Insert(c) });
+        }
+    }
+
+    fn recomputed(buffer: &Buffer) -> usize {
+        buffer.highlight_cache.as_ref().expect("highlighted at least once").recomputed
+    }
+
+    /// Line for line, `buffer` must be what a fresh full highlight of the same text gives:
+    /// text, line ending, attributes and glyph layout.
+    fn assert_like_fresh(buffer: &Buffer, highlighter: &Highlighter, extension: &str, theme: &Theme) {
+        let fresh = Buffer::highlighted(&buffer.text(), metrics(), highlighter, extension, theme);
+        assert_eq!(buffer.inner.lines.len(), fresh.inner.lines.len());
+        for (i, (a, b)) in buffer.inner.lines.iter().zip(&fresh.inner.lines).enumerate() {
+            assert_eq!(a.text(), b.text(), "line {i}");
+            assert_eq!(a.ending(), b.ending(), "line {i}");
+            assert_eq!(a.attrs_list(), b.attrs_list(), "line {i}");
+            assert_eq!(glyph_layout(a), glyph_layout(b), "line {i}");
+        }
+        assert_eq!(buffer.visible_count(), fresh.visible_count());
+        assert_eq!(buffer.content_width().to_bits(), fresh.content_width().to_bits());
+    }
+
+    #[test]
+    fn edits_rehighlight_like_a_fresh_pass_and_only_the_lines_around_them() {
+        let highlighter = Highlighter::new();
+        let dark = crate::theme::EditorTheme::default_dark();
+        let mut buffer = Buffer::highlighted(&source(), metrics(), &highlighter, "rs", &dark.syntax);
+        let lines = buffer.line_count();
+        assert!(lines > 4 * SNAPSHOT_EVERY);
+
+        // Typing inside a line.
+        buffer.goto(200, 8);
+        type_text(&mut buffer, "yz");
+        buffer.highlight(&highlighter, "rs", &dark.syntax);
+        assert_like_fresh(&buffer, &highlighter, "rs", &dark.syntax);
+        assert!(recomputed(&buffer) <= 2 * SNAPSHOT_EVERY, "{} lines for a keystroke", recomputed(&buffer));
+
+        // Splitting a line moves everything below it down; joining moves it back up.
+        buffer.perform(Action::Enter);
+        buffer.highlight(&highlighter, "rs", &dark.syntax);
+        assert_eq!(buffer.line_count(), lines + 1);
+        assert_like_fresh(&buffer, &highlighter, "rs", &dark.syntax);
+        assert!(recomputed(&buffer) <= 2 * SNAPSHOT_EVERY, "{} lines for a line split", recomputed(&buffer));
+        buffer.perform(Action::Backspace);
+        buffer.highlight(&highlighter, "rs", &dark.syntax);
+        assert_eq!(buffer.line_count(), lines);
+        assert_like_fresh(&buffer, &highlighter, "rs", &dark.syntax);
+
+        // Nothing changed: nothing to redo.
+        buffer.highlight(&highlighter, "rs", &dark.syntax);
+        assert_eq!(recomputed(&buffer), 0);
+        assert_like_fresh(&buffer, &highlighter, "rs", &dark.syntax);
+
+        // Opening a block comment recolours everything after it, to the end of the file.
+        buffer.goto(40, 0);
+        type_text(&mut buffer, "/*");
+        buffer.highlight(&highlighter, "rs", &dark.syntax);
+        assert_like_fresh(&buffer, &highlighter, "rs", &dark.syntax);
+        assert!(recomputed(&buffer) >= lines - 40, "{} lines for an unclosed comment", recomputed(&buffer));
+        // Closing it far below recolours the lines between, and the rest converges.
+        buffer.goto(300, 0);
+        type_text(&mut buffer, "*/");
+        buffer.highlight(&highlighter, "rs", &dark.syntax);
+        assert_like_fresh(&buffer, &highlighter, "rs", &dark.syntax);
+        assert!(recomputed(&buffer) < lines - 40, "{} lines for a closed comment", recomputed(&buffer));
+        // Undoing both.
+        for _ in 0..4 { buffer.undo(); }
+        buffer.highlight(&highlighter, "rs", &dark.syntax);
+        assert_like_fresh(&buffer, &highlighter, "rs", &dark.syntax);
+        assert_eq!(buffer.line_count(), lines);
+
+        // Deleting a block of lines, then pasting lines with Windows endings (which the
+        // editor's line endings are normalised away from, as before).
+        buffer.replace_range(Cursor::new(10, 0), Cursor::new(30, 0), "");
+        buffer.highlight(&highlighter, "rs", &dark.syntax);
+        assert_eq!(buffer.line_count(), lines - 20);
+        assert_like_fresh(&buffer, &highlighter, "rs", &dark.syntax);
+        buffer.replace_range(Cursor::new(5, 0), Cursor::new(5, 0), "let a = 1;\r\nlet b = \"two\";\r\n");
+        buffer.highlight(&highlighter, "rs", &dark.syntax);
+        assert_eq!(buffer.line_count(), lines - 18);
+        assert_like_fresh(&buffer, &highlighter, "rs", &dark.syntax);
+
+        // A new theme or syntax is a full pass.
+        let light = crate::theme::EditorTheme::default_light();
+        buffer.highlight(&highlighter, "rs", &light.syntax);
+        assert_eq!(recomputed(&buffer), buffer.line_count());
+        assert_like_fresh(&buffer, &highlighter, "rs", &light.syntax);
+        buffer.highlight(&highlighter, "txt", &light.syntax);
+        assert_eq!(recomputed(&buffer), buffer.line_count());
+        assert_like_fresh(&buffer, &highlighter, "txt", &light.syntax);
+    }
+
+    /// Colours applied line by line are exactly what applying them through
+    /// `cosmic_text::Buffer::set_rich_text` (the previous way) produced.
+    #[test]
+    fn per_line_colours_match_set_rich_text() {
+        let highlighter = Highlighter::new();
+        let dark = crate::theme::EditorTheme::default_dark();
+        let mixed = "fn main() {\r\n    let s = \"héllo\";\t// ünïcode -> != ff\n\n}\n\rtrailing\rlast";
+        for text in [source(), mixed.to_string(), String::new()] {
+            let mut old_way = Buffer::new(&text, metrics());
+            let spans = highlighter.highlight_lines(old_way.inner.lines.iter().map(|line| line.text()), "rs", &dark.syntax);
+            old_way.inner.set_rich_text(&mut old_way.font_system, spans.iter().map(|(chunk, attrs)| (chunk.as_str(), attrs.clone())), &Attrs::new(), Shaping::Advanced, None);
+            old_way.rows_stale = true;
+            old_way.sync();
+            let new_way = Buffer::highlighted(&text, metrics(), &highlighter, "rs", &dark.syntax);
+            assert_eq!(new_way.inner.lines.len(), old_way.inner.lines.len());
+            for (i, (a, b)) in new_way.inner.lines.iter().zip(&old_way.inner.lines).enumerate() {
+                assert_eq!(a.text(), b.text(), "line {i}");
+                assert_eq!(a.ending(), b.ending(), "line {i}");
+                assert_eq!(a.attrs_list(), b.attrs_list(), "line {i}");
+                assert_eq!(glyph_layout(a), glyph_layout(b), "line {i}");
+            }
+            assert_eq!(new_way.visible_count(), old_way.visible_count());
+            assert_eq!(new_way.content_width().to_bits(), old_way.content_width().to_bits());
+        }
+    }
+
+    /// Pasting a Unicode paragraph separator inside a line: no crash, the character stays
+    /// in its line, and the colours are right. (Applying colours through `set_rich_text`
+    /// used to split the line there and crash on the cursor left past its end.)
+    #[test]
+    fn a_paragraph_separator_stays_in_its_line() {
+        let highlighter = Highlighter::new();
+        let dark = crate::theme::EditorTheme::default_dark();
+        let mut buffer = Buffer::highlighted(&source(), metrics(), &highlighter, "rs", &dark.syntax);
+        let lines = buffer.line_count();
+        buffer.goto(0, 8);
+        buffer.perform(Action::Insert('\u{2029}'));
+        buffer.highlight(&highlighter, "rs", &dark.syntax);
+        assert_eq!(buffer.line_count(), lines);
+        assert!(buffer.inner.lines[0].text().contains('\u{2029}'));
+        assert_like_fresh(&buffer, &highlighter, "rs", &dark.syntax);
+        buffer.perform(Action::Insert('x'));
+        buffer.highlight(&highlighter, "rs", &dark.syntax);
+        assert_like_fresh(&buffer, &highlighter, "rs", &dark.syntax);
+    }
+}
+
 /// Speed measurements. These never fail: each prints how long an operation took next to the
 /// time expected of it, and flags it as a WARNING when slower, so a slowdown shows up in the
 /// test output without blocking anything. The expected times are from a debug build on the
@@ -854,10 +1130,20 @@ mod timing_tests {
     }
 
     #[test]
-    fn rehighlight_4000_lines() {
+    fn rehighlight_4000_lines_after_a_theme_change() {
         let (text, highlighter, theme) = (source(), Highlighter::new(), crate::theme::EditorTheme::default_dark());
         let mut buffer = open(&text, &highlighter, &theme);
-        timed("re-highlight 4,000 lines (after an edit or a theme change)", Duration::from_millis(571), || buffer.highlight(&highlighter, "rs", &theme.syntax));
+        let light = crate::theme::EditorTheme::default_light();
+        timed("re-highlight 4,000 lines (theme change)", Duration::from_millis(571), || buffer.highlight(&highlighter, "rs", &light.syntax));
+    }
+
+    #[test]
+    fn rehighlight_4000_lines_after_a_keystroke() {
+        let (text, highlighter, theme) = (source(), Highlighter::new(), crate::theme::EditorTheme::default_dark());
+        let mut buffer = open(&text, &highlighter, &theme);
+        buffer.goto(2_000, 4);
+        buffer.perform(Action::Insert('x'));
+        timed("re-highlight 4,000 lines (after a keystroke)", Duration::from_millis(12), || buffer.highlight(&highlighter, "rs", &theme.syntax));
     }
 
     #[test]
