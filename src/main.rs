@@ -427,6 +427,7 @@ struct State {
     last_session_write: std::time::Instant,
     closed_tabs: Vec<PathBuf>,
     notice: Option<(String, std::time::Instant)>,
+    git_status: Option<(String, std::time::Instant)>,
     reveal_generation: u64,
     reveal_queue: std::collections::VecDeque<PathBuf>,
     reveal_target: Option<PathBuf>,
@@ -554,6 +555,7 @@ impl State {
             last_session_write: std::time::Instant::now() - Duration::from_secs(1),
             closed_tabs: Vec::new(),
             notice: None,
+            git_status: None,
             reveal_generation: 0,
             reveal_queue: std::collections::VecDeque::new(),
             reveal_target: None,
@@ -654,6 +656,18 @@ impl State {
 
     fn notify(&mut self, message: impl Into<String>) {
         self.notice = Some((message.into(), std::time::Instant::now()));
+    }
+
+    fn git_info(&mut self, message: impl Into<String>) {
+        self.git_status = Some((message.into(), std::time::Instant::now()));
+    }
+
+    fn notify_git(&mut self, message: &git::Message) {
+        match git_notification(message) {
+            Some(Ok(info)) => self.git_info(info),
+            Some(Err(error)) => self.notify(error),
+            None => {}
+        }
     }
 
     fn persist_session(&mut self) {
@@ -1381,6 +1395,23 @@ fn update_and_sync_preview(state: &mut State, message: Message) -> Task<Message>
     task
 }
 
+/// Routine Git feedback belongs in the status bar; failures keep the alert.
+fn git_notification(message: &git::Message) -> Option<Result<String, String>> {
+    match message {
+        git::Message::Committed(Ok(())) => Some(Ok("Commit created".into())),
+        git::Message::Staged(Ok(())) => Some(Ok("Staging updated".into())),
+        git::Message::Discarded(Ok(())) => Some(Ok("Unstaged changes discarded".into())),
+        git::Message::BranchDone(Ok(())) => Some(Ok("Switched branch".into())),
+        git::Message::SyncDone(sync, Ok(())) => Some(Ok(sync.done().into())),
+        git::Message::Committed(Err(error)) | git::Message::Staged(Err(error))
+        | git::Message::Discarded(Err(error)) | git::Message::Refreshed(Err(error))
+        | git::Message::BranchDone(Err(error)) | git::Message::BranchesLoaded(Err(error))
+        | git::Message::SyncDone(_, Err(error)) => Some(Err(format!("Git: {error}"))),
+        git::Message::MessageGenerated(Err(error)) => Some(Err(format!("Could not write a commit message: {error}"))),
+        _ => None,
+    }
+}
+
 fn update(state: &mut State, message: Message) -> Task<Message> {
     if matches!(&message, Message::TabClosed(_) | Message::CloseTabs(_, _) | Message::CloseTabConfirmed(_) | Message::CloseTabsConfirmed(_, _) | Message::TabSelected(_) | Message::FileAction(_) | Message::ReopenClosedTab)
         || matches!(&message, Message::KeyPressed(_, modifiers) if modifiers.command()) {
@@ -1638,7 +1669,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::CloseGitPreview => state.git_preview = None,
         Message::GitGraphOpen => {
             if state.git.repo().is_none() {
-                state.notify("This folder is not inside a Git repository.");
+                state.git_info("This folder is not inside a Git repository.");
             } else {
                 let (graph, load) = git_graph::Graph::open(state.root_or_cwd());
                 state.git_preview = None;
@@ -1702,29 +1733,19 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     }
                 }
                 task = Task::batch([state.reload_open_tabs(), state.reload_git_views()]);
-                state.notify("Unstaged changes discarded");
             }
-            if let git::Message::Discarded(Err(err)) = &msg { state.notify(format!("Git: {err}")); }
+            state.notify_git(&msg);
             let cwd = state.root_or_cwd();
             task = Task::batch([task, git::update(&mut state.git, msg, cwd).map(Message::Git)]);
         }
         Message::Git(msg) => {
-            match &msg {
-                git::Message::Committed(Ok(())) => state.notify("Commit created"),
-                git::Message::Staged(Ok(())) => state.notify("Staging updated"),
-                git::Message::Committed(Err(err)) | git::Message::Staged(Err(err)) | git::Message::Refreshed(Err(err)) => state.notify(format!("Git: {err}")),
-                git::Message::MessageGenerated(Err(err)) => state.notify(format!("Could not write a commit message: {err}")),
-                git::Message::BranchDone(Err(err)) | git::Message::BranchesLoaded(Err(err)) | git::Message::SyncDone(_, Err(err)) => state.notify(format!("Git: {err}")),
-                git::Message::SyncDone(sync, Ok(())) => state.notify(sync.done()),
-                _ => {},
-            }
+            state.notify_git(&msg);
             let cwd = state.root_or_cwd();
             if matches!(msg, git::Message::Refresh) {
                 task = state.reload_git_views();
             }
             // The checkout rewrote files: tabs without unsaved edits follow it, as after an AI edit.
             if matches!(msg, git::Message::BranchDone(Ok(()))) {
-                state.notify("Switched branch");
                 task = Task::batch([state.reload_open_tabs(), state.reload_git_views()]);
             }
             // A pull rewrites files too, and a failed one can leave conflict markers.
@@ -2606,6 +2627,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             state.terminal.poll();
             if state.notice.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(8)) { state.notice = None; }
+            if state.git_status.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(8)) { state.git_status = None; }
             let cwd = state.root_or_cwd();
             state.lsp.set_root(&cwd);
             task = Task::batch([task, state.poll_lsp()]);
@@ -2876,6 +2898,42 @@ mod drop_tests {
         assert!(handle_raw_drop_event(dropped("notes.md"), Status::Captured, window).is_none());
         let hovered = iced::Event::Window(iced::window::Event::FileHovered(PathBuf::from("notes.md")));
         assert!(handle_raw_drop_event(hovered, Status::Ignored, window).is_none());
+    }
+}
+
+#[cfg(test)]
+mod git_notification_tests {
+    use super::*;
+
+    #[test]
+    fn successful_git_operations_use_status_messages() {
+        let mut messages = vec![
+            (git::Message::Committed(Ok(())), "Commit created"),
+            (git::Message::Staged(Ok(())), "Staging updated"),
+            (git::Message::Discarded(Ok(())), "Unstaged changes discarded"),
+            (git::Message::BranchDone(Ok(())), "Switched branch"),
+        ];
+        for sync in git::remote::Sync::ALL { messages.push((git::Message::SyncDone(sync, Ok(())), sync.done())); }
+        for (message, expected) in messages {
+            assert_eq!(git_notification(&message), Some(Ok(expected.into())));
+        }
+        assert_eq!(git_notification(&git::Message::Refresh), None);
+        assert_eq!(git_notification(&git::Message::Refreshed(Ok(Default::default()))), None);
+        assert_eq!(git_notification(&git::Message::CommitMessageEdited(iced::widget::text_editor::Action::Edit(
+            iced::widget::text_editor::Edit::Insert('a')))), None);
+    }
+
+    #[test]
+    fn git_failures_keep_alerts() {
+        let error = "operation failed".to_string();
+        let mut messages = vec![
+            git::Message::Committed(Err(error.clone())), git::Message::Staged(Err(error.clone())),
+            git::Message::Discarded(Err(error.clone())), git::Message::Refreshed(Err(error.clone())),
+            git::Message::BranchDone(Err(error.clone())), git::Message::BranchesLoaded(Err(error.clone())),
+        ];
+        for sync in git::remote::Sync::ALL { messages.push(git::Message::SyncDone(sync, Err(error.clone()))); }
+        for message in messages { assert_eq!(git_notification(&message), Some(Err("Git: operation failed".into()))); }
+        assert_eq!(git_notification(&git::Message::MessageGenerated(Err(error))), Some(Err("Could not write a commit message: operation failed".into())));
     }
 }
 
@@ -3269,7 +3327,9 @@ fn view_status_bar(state: &State) -> Element<'_, Message> {
         icon_control(lucide_icons::Icon::Folder, "Toggle files", Some(Message::SidebarToggle), state.sidebar_visible && state.sidebar_mode == SidebarMode::Tree),
         icon_control(lucide_icons::Icon::GitBranch, "Toggle source control", Some(Message::GitPanelToggle), state.sidebar_visible && state.sidebar_mode == SidebarMode::Git),
         icon_control(lucide_icons::Icon::Search, "Search project", Some(Message::ToggleProjectSearch), state.sidebar_visible && state.sidebar_mode == SidebarMode::ProjectSearch),
-        Space::new().width(Length::Fill),
+        text(state.git_status.as_ref().map_or("", |(message, _)| message.as_str()))
+            .size(12).width(Length::Fill).wrapping(iced::widget::text::Wrapping::None)
+            .style(iced::widget::text::secondary),
     ].spacing(6);
 
     if state.updater.enabled {
