@@ -661,6 +661,82 @@ pub fn conversation_controls(state: &ChatState) -> Element<'_, Message> {
     ].spacing(4).into()
 }
 
+fn settings_view(state: &ChatState) -> Element<'_, Message> {
+    use lucide_icons::Icon;
+    let label = |name: &'static str| text(name).size(12).style(iced::widget::text::secondary);
+    let mut connections = column![].spacing(2);
+    for (index, connection) in state.connections.iter().enumerate() {
+        let selected = connection.name == state.connection_name
+            && connection.base_url == state.base_url && connection.model == state.model;
+        let details = if connection.model.is_empty() { connection.base_url.clone() }
+            else { format!("{} · {}", connection.base_url, connection.model) };
+        connections = connections.push(row![
+            button(column![
+                text(&connection.name).size(13),
+                text(details).size(11).style(iced::widget::text::secondary),
+            ].spacing(3))
+                .width(Length::Fill).padding(8)
+                .style(move |theme, status| crate::quick_open::result_style(theme, status, selected))
+                .on_press(Message::LoadConnection(index)),
+            crate::icon_control(Icon::Trash2, "Delete connection", Some(Message::DeleteConnection(index)), false),
+        ].spacing(4).align_y(iced::Alignment::Center));
+    }
+    if state.connections.is_empty() {
+        connections = connections.push(text("No saved connections yet").size(12).style(iced::widget::text::secondary));
+    }
+    let model: Element<'_, Message> = if state.models.is_empty() {
+        text_input("Model name", &state.model).size(13).padding(8)
+            .on_input(Message::ModelChanged).into()
+    } else {
+        pick_list(state.models.as_slice(), Some(state.model.clone()), Message::ModelSelected)
+            .text_size(13).padding(8).width(Length::Fill).into()
+    };
+    let status = match &state.connection_status {
+        ConnectionStatus::Idle => "Test the connection to discover available models.".into(),
+        ConnectionStatus::Testing => "Testing connection…".into(),
+        ConnectionStatus::Connected => format!("Connected · {} models available", state.models.len()),
+        ConnectionStatus::Failed(error) => format!("Connection failed: {error}"),
+    };
+    let status = text(status).size(12).style(move |theme: &iced::Theme| {
+        let palette = theme.extended_palette();
+        iced::widget::text::Style { color: Some(match &state.connection_status {
+            ConnectionStatus::Connected => palette.success.base.color,
+            ConnectionStatus::Failed(_) => palette.danger.base.color,
+            _ => palette.background.weak.text,
+        }) }
+    });
+    let fields = column![
+        column![label("Connection name"), text_input("My local model", &state.connection_name)
+            .size(13).padding(8).on_input(Message::ConnectionNameChanged)].spacing(4),
+        column![label("Base URL"), text_input("http://localhost:11434/v1", &state.base_url)
+            .size(13).padding(8).on_input(Message::BaseUrlChanged)].spacing(4),
+        column![label("API key"), text_input("Optional for local models", &state.api_key)
+            .size(13).padding(8).secure(true).on_input(Message::ApiKeyChanged)].spacing(4),
+        column![label("Model"), model].spacing(4),
+        row![
+            button(text("Test connection").size(12)).padding([6, 10])
+                .style(crate::flat_button_style).on_press(Message::TestConnection),
+            Space::new().width(Length::Fill),
+            button(text("Save connection").size(12)).padding([6, 10]).on_press(Message::SaveConnection),
+        ].spacing(6).align_y(iced::Alignment::Center),
+        status,
+    ].spacing(12);
+    let form = column![
+        row![text("Model settings").size(14), Space::new().width(Length::Fill),
+            crate::icon_control(Icon::X, "Close model settings", Some(Message::ToggleSettings), false),
+        ].align_y(iced::Alignment::Center),
+        row![label("Saved connections"), Space::new().width(Length::Fill),
+            button(text("Use Ollama").size(12)).padding([4, 8])
+                .style(crate::flat_button_style).on_press(Message::OllamaPreset),
+        ].align_y(iced::Alignment::Center).spacing(6),
+        connections,
+        iced::widget::rule::horizontal(1),
+        fields,
+    ].spacing(12).padding(12);
+    container(scrollable(form).height(Length::Shrink))
+        .width(Length::Fill).max_height(480).style(crate::overlay_style).into()
+}
+
 pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>) -> Element<'a, Message> {
     let mut header = column![].spacing(4);
     if state.history.open {
@@ -668,101 +744,7 @@ pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>)
     }
 
     if state.settings_open {
-        let field = |label: &'static str| text(label).width(Length::Fixed(70.0));
-
-        let mut cards = column![].spacing(2);
-        for (i, conn) in state.connections.iter().enumerate() {
-            cards = cards.push(
-                row![
-                    button(
-                        column![
-                            text(conn.name.clone()),
-                            text(format!("{} -- {}", conn.base_url, conn.model)).size(11),
-                        ]
-                        .spacing(1)
-                    )
-                    .width(Length::Fill)
-                    .padding([4, 8])
-                    .style(crate::flat_button_style)
-                    .on_press(Message::LoadConnection(i)),
-                    button(text("x"))
-                        .padding([4, 8])
-                        .style(crate::flat_button_style)
-                        .on_press(Message::DeleteConnection(i)),
-                ]
-                .spacing(4)
-                .align_y(iced::Alignment::Center),
-            );
-        }
-
-        let status_text = match &state.connection_status {
-            ConnectionStatus::Idle => String::new(),
-            ConnectionStatus::Testing => "Testing...".to_string(),
-            ConnectionStatus::Connected => format!("Connected -- {} model(s) found", state.models.len()),
-            ConnectionStatus::Failed(err) => format!("Failed: {err}"),
-        };
-
-        let model_row = if state.models.is_empty() {
-            row![
-                field("Model"),
-                text_input("", &state.model).on_input(Message::ModelChanged),
-            ]
-        } else {
-            row![
-                field("Model"),
-                pick_list(state.models.as_slice(), Some(state.model.clone()), Message::ModelSelected)
-                    .width(Length::Fill),
-            ]
-        }
-        .spacing(6)
-        .align_y(iced::Alignment::Center);
-
-        let form = column![
-            button("Use local Ollama").style(crate::flat_button_style).on_press(Message::OllamaPreset),
-            cards,
-            row![field("Name"), text_input("", &state.connection_name).on_input(Message::ConnectionNameChanged)]
-                .spacing(6)
-                .align_y(iced::Alignment::Center),
-            row![field("Base URL"), text_input("", &state.base_url).on_input(Message::BaseUrlChanged)]
-                .spacing(6)
-                .align_y(iced::Alignment::Center),
-            row![
-                field("API Key"),
-                text_input("optional", &state.api_key)
-                    .on_input(Message::ApiKeyChanged)
-                    .secure(true)
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center),
-            row![
-                Space::new().width(Length::Fixed(70.0)),
-                button(text("Test Connection"))
-                    .style(crate::flat_button_style)
-                    .on_press(Message::TestConnection),
-                text(status_text).size(12),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center),
-            model_row,
-            row![
-                Space::new().width(Length::Fixed(70.0)),
-                button(text("Save"))
-                    .style(crate::flat_button_style)
-                    .on_press(Message::SaveConnection),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center),
-        ]
-        .spacing(6);
-
-        header = header.push(container(form).padding(8).style(|theme: &iced::Theme| {
-            let palette = theme.extended_palette();
-            iced::widget::container::Style {
-                background: Some(palette.background.weak.color.into()),
-                border: iced::Border::default().rounded(6.0),
-                ..iced::widget::container::Style::default()
-            }
-        }));
+        header = header.push(settings_view(state));
     }
 
     let mut messages_col = column![].spacing(6);
@@ -1495,6 +1477,43 @@ fn truncate(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_updates_keep_the_connection_name_focused() {
+        use iced::advanced::widget::{tree::Tag, Tree};
+        type InputState = text_input::State<<iced::Renderer as iced::advanced::text::Renderer>::Paragraph>;
+        fn input(tree: &mut Tree) -> Option<&mut InputState> {
+            if tree.tag == Tag::of::<InputState>() { return Some(tree.state.downcast_mut()); }
+            tree.children.iter_mut().find_map(input)
+        }
+        let mut state = ChatState { connections: Vec::new(), ..Default::default() };
+        let mut tree = Tree::new(&settings_view(&state));
+        input(&mut tree).unwrap().focus();
+        for status in [ConnectionStatus::Testing, ConnectionStatus::Connected, ConnectionStatus::Failed("offline".into()), ConnectionStatus::Idle] {
+            state.connection_status = status;
+            tree.diff(&settings_view(&state));
+            assert!(input(&mut tree).unwrap().is_focused());
+        }
+        state.models = vec!["local-model".into()];
+        state.connections.push(SavedConnection { name: "Local".into(), base_url: "http://example.invalid/v1".into(), api_key: "secret".into(), model: "local-model".into() });
+        tree.diff(&settings_view(&state));
+        assert!(input(&mut tree).unwrap().is_focused());
+        state.connections.clear();
+        state.models.clear();
+        tree.diff(&settings_view(&state));
+        assert!(input(&mut tree).unwrap().is_focused());
+    }
+
+    #[test]
+    fn settings_results_keep_the_chat_composer_focused() {
+        let theme = iced::Theme::Dark;
+        let composer = crate::ai_composer::Context { sources: &[], can_reference: false, theme: &theme, mentions: &[] };
+        let plain = ChatState { settings_open: true, connections: Vec::new(), ..Default::default() };
+        let connected = ChatState { settings_open: true, connections: Vec::new(), models: vec!["local-model".into()],
+            connection_status: ConnectionStatus::Connected, ..Default::default() };
+        assert!(crate::tree_focus::keeps_focus(view(&plain, composer), view(&connected, composer)));
+        assert!(crate::tree_focus::keeps_focus(view(&connected, composer), view(&plain, composer)));
+    }
 
     #[test]
     fn the_reset_approvals_button_coming_or_going_keeps_the_input_focused() {
