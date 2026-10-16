@@ -181,6 +181,7 @@ pub struct ChatState {
     pending_permission: Option<PendingPermission>,
     streaming: bool,
     settings_open: bool,
+    connection_form_open: bool,
     files_changed: bool,
     /// Selectable copies of `messages`' text, kept in step by `sync_selectable`.
     selectable: crate::ai_selectable::Cache,
@@ -213,6 +214,7 @@ impl Default for ChatState {
             pending_permission: None,
             streaming: false,
             settings_open: false,
+            connection_form_open: false,
             files_changed: false,
             selectable: Default::default(),
             markdown: Default::default(),
@@ -234,6 +236,7 @@ pub enum Message {
     DeleteConnection(usize),
     InputChanged(text_editor::Action),
     ToggleSettings,
+    ToggleConnectionForm,
     NewConversation,
     History(crate::ai_history::Message),
     Markdown(crate::ai_markdown::Action),
@@ -627,15 +630,21 @@ pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Mes
         Message::Markdown(crate::ai_markdown::Action::Insert(_)) | Message::ViewDiff(_) => {}
         Message::UsePrompt(prompt) => state.set_input(&prompt),
         Message::ToggleSettings => state.settings_open = !state.settings_open,
+        Message::ToggleConnectionForm => {
+            state.connection_form_open = !state.connection_form_open;
+            if state.connection_form_open { return reveal_connection_form(); }
+        }
         Message::Send => state.send(cwd),
         Message::Stop => state.stop(),
         Message::Copy(text) => return iced::clipboard::write(text),
         Message::OllamaPreset => {
+            state.connection_form_open = true;
             state.session_grants.clear();
             state.base_url = "http://localhost:11434/v1".into();
             state.api_key.clear();
             state.connection_name = "Ollama".into();
             state.test_connection();
+            return reveal_connection_form();
         }
         Message::ResetPermissions => state.session_grants.clear(),
         Message::RememberPermission(remember) => {
@@ -659,6 +668,13 @@ pub fn conversation_controls(state: &ChatState) -> Element<'_, Message> {
         crate::icon_control(lucide_icons::Icon::History, "Conversation history", Some(Message::History(crate::ai_history::Message::Toggle)), state.history.open),
         crate::icon_control(lucide_icons::Icon::Settings, "Model settings", Some(Message::ToggleSettings), state.settings_open),
     ].spacing(4).into()
+}
+
+fn reveal_connection_form() -> Task<Message> {
+    Task::batch([
+        iced::widget::operation::scroll_to("local-ai-settings-scroll", iced::widget::operation::AbsoluteOffset { x: None, y: Some(0.0) }),
+        iced::widget::operation::focus("local-ai-connection-name"),
+    ])
 }
 
 fn settings_view(state: &ChatState) -> Element<'_, Message> {
@@ -707,7 +723,7 @@ fn settings_view(state: &ChatState) -> Element<'_, Message> {
     });
     let fields = column![
         column![label("Connection name"), text_input("My local model", &state.connection_name)
-            .size(13).padding(8).on_input(Message::ConnectionNameChanged)].spacing(4),
+            .id("local-ai-connection-name").size(13).padding(8).on_input(Message::ConnectionNameChanged)].spacing(4),
         column![label("Base URL"), text_input("http://localhost:11434/v1", &state.base_url)
             .size(13).padding(8).on_input(Message::BaseUrlChanged)].spacing(4),
         column![label("API key"), text_input("Optional for local models", &state.api_key)
@@ -721,19 +737,21 @@ fn settings_view(state: &ChatState) -> Element<'_, Message> {
         ].spacing(6).align_y(iced::Alignment::Center),
         status,
     ].spacing(12);
-    let form = column![
+    let form_slot: Element<'_, Message> = if state.connection_form_open {
+        column![fields, iced::widget::rule::horizontal(1)].spacing(12).into()
+    } else { Space::new().height(0).into() };
+    let content = column![container(form_slot), connections].spacing(12).padding([0, 12]);
+    let header = column![
         row![text("Model settings").size(14), Space::new().width(Length::Fill),
             crate::icon_control(Icon::X, "Close model settings", Some(Message::ToggleSettings), false),
         ].align_y(iced::Alignment::Center),
         row![label("Saved connections"), Space::new().width(Length::Fill),
             button(text("Use Ollama").size(12)).padding([4, 8])
                 .style(crate::flat_button_style).on_press(Message::OllamaPreset),
+            crate::icon_control(if state.connection_form_open { Icon::Minus } else { Icon::Plus }, "Add or edit connection", Some(Message::ToggleConnectionForm), state.connection_form_open),
         ].align_y(iced::Alignment::Center).spacing(6),
-        connections,
-        iced::widget::rule::horizontal(1),
-        fields,
-    ].spacing(12).padding(12);
-    container(scrollable(form).height(Length::Shrink))
+    ].spacing(8).padding(12);
+    container(column![header, scrollable(content).id("local-ai-settings-scroll").height(Length::Shrink)])
         .width(Length::Fill).max_height(480).style(crate::overlay_style).into()
 }
 
@@ -1479,6 +1497,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn connection_form_toggle_preserves_draft_and_saved_providers() {
+        let mut state = ChatState { connection_name: "Draft".into(), api_key: "secret".into(), connections: Vec::new(), ..Default::default() };
+        for index in 0..30 {
+            state.connections.push(SavedConnection { name: format!("Provider {index}"), base_url: "http://example.invalid/v1".into(), api_key: String::new(), model: "model".into() });
+        }
+        assert!(!state.connection_form_open);
+        let _ = update(&mut state, Message::ToggleConnectionForm, PathBuf::from("project"));
+        assert!(state.connection_form_open);
+        let _ = update(&mut state, Message::ToggleConnectionForm, PathBuf::from("project"));
+        assert!(!state.connection_form_open);
+        assert_eq!(state.connection_name, "Draft");
+        assert_eq!(state.api_key, "secret");
+        assert_eq!(state.connections.len(), 30);
+    }
+
+    #[test]
+    fn opening_and_closing_connection_form_keeps_chat_composer_focused() {
+        let theme = iced::Theme::Dark;
+        let composer = crate::ai_composer::Context { sources: &[], can_reference: false, theme: &theme, mentions: &[] };
+        let closed = ChatState { settings_open: true, connections: Vec::new(), ..Default::default() };
+        let open = ChatState { settings_open: true, connection_form_open: true, connections: Vec::new(), ..Default::default() };
+        assert!(crate::tree_focus::keeps_focus(view(&closed, composer), view(&open, composer)));
+        assert!(crate::tree_focus::keeps_focus(view(&open, composer), view(&closed, composer)));
+    }
+
+    #[test]
     fn settings_updates_keep_the_connection_name_focused() {
         use iced::advanced::widget::{tree::Tag, Tree};
         type InputState = text_input::State<<iced::Renderer as iced::advanced::text::Renderer>::Paragraph>;
@@ -1486,7 +1530,7 @@ mod tests {
             if tree.tag == Tag::of::<InputState>() { return Some(tree.state.downcast_mut()); }
             tree.children.iter_mut().find_map(input)
         }
-        let mut state = ChatState { connections: Vec::new(), ..Default::default() };
+        let mut state = ChatState { connection_form_open: true, connections: Vec::new(), ..Default::default() };
         let mut tree = Tree::new(&settings_view(&state));
         input(&mut tree).unwrap().focus();
         for status in [ConnectionStatus::Testing, ConnectionStatus::Connected, ConnectionStatus::Failed("offline".into()), ConnectionStatus::Idle] {
