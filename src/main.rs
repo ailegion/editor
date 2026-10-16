@@ -2914,7 +2914,6 @@ fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
         AiMode::Acp => acp::conversation_controls(&state.acp).map(Message::Acp),
     };
     let mode_row = row![
-        text("Assistant").size(14),
         iced::widget::pick_list([AiMode::Http, AiMode::Acp, AiMode::Codex, AiMode::Grok, AiMode::Cursor], Some(state.ai_mode), Message::AiModeSelected).text_size(12),
         Space::new().width(Length::Fill),
         controls
