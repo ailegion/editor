@@ -657,15 +657,12 @@ pub fn conversation_controls(state: &ChatState) -> Element<'_, Message> {
     row![
         crate::icon_control(lucide_icons::Icon::Plus, "New conversation", (!state.streaming && !state.messages.is_empty()).then_some(Message::NewConversation), false),
         crate::icon_control(lucide_icons::Icon::History, "Conversation history", Some(Message::History(crate::ai_history::Message::Toggle)), state.history.open),
+        crate::icon_control(lucide_icons::Icon::Settings, "Model settings", Some(Message::ToggleSettings), state.settings_open),
     ].spacing(4).into()
 }
 
 pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>) -> Element<'a, Message> {
-    let mut header = column![row![
-        text("Conversation").size(12),
-        Space::new().width(Length::Fill),
-        crate::icon_control(lucide_icons::Icon::Settings, "Model settings", Some(Message::ToggleSettings), state.settings_open),
-    ]].spacing(4);
+    let mut header = column![].spacing(4);
     if state.history.open {
         header = header.push(crate::ai_history::view(&state.history, state.history_items(), state.active_thread, !state.streaming).map(Message::History));
     }
