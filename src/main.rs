@@ -3325,17 +3325,22 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
     .close_on_background_click(true)
     .close_on_background_click_global(true);
 
-    let project = state.root.as_ref().and_then(|path| path.file_name())
-        .map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Editor".into());
-    // On Windows this row is the title bar: its empty middle drags the window (see `titlebar`).
+    let update: Element<'_, Message> = if state.updater.enabled {
+        let action = if state.updater.ready() { Message::RestartUpdate } else { Message::CheckUpdate };
+        let mut control = button(text(&state.updater.label).size(12)).style(flat_button_style);
+        if !state.updater.busy() { control = control.on_press(action); }
+        iced::widget::tooltip(
+            control, text(&state.updater.detail).size(12), iced::widget::tooltip::Position::Bottom,
+        ).into()
+    } else { Space::new().width(0).into() };
+    // Keep interactive controls outside the draggable caption region on Windows.
     let custom = titlebar::custom();
-    let caption = titlebar::caption(row![
-        Space::new().width(Length::Fill),
-        text(project).size(12).style(iced::widget::text::secondary),
-    ].align_y(iced::Alignment::Center).width(Length::Fill).height(if custom { Length::Fill } else { Length::Shrink }));
+    let caption = titlebar::caption(Space::new().width(Length::Fill)
+        .height(if custom { Length::Fill } else { Length::Shrink }));
     let bar = container(row![
         mb,
         caption,
+        update,
         icon_control(lucide_icons::Icon::Search, "Find a file", Some(Message::ToggleQuickOpen), false),
         icon_control(lucide_icons::Icon::Command, "Command palette", Some(Message::ToggleCommandPalette), false),
     ].spacing(4).align_y(iced::Alignment::Center).height(if custom { Length::Fill } else { Length::Shrink }))
@@ -3356,14 +3361,6 @@ fn view_status_bar(state: &State) -> Element<'_, Message> {
             .style(iced::widget::text::secondary),
     ].spacing(6);
 
-    if state.updater.enabled {
-        let action = if state.updater.ready() { Message::RestartUpdate } else { Message::CheckUpdate };
-        let mut control = button(text(&state.updater.label).size(12)).style(flat_button_style);
-        if !state.updater.busy() { control = control.on_press(action); }
-        bar = bar.push(iced::widget::tooltip(
-            control, text(&state.updater.detail).size(12), iced::widget::tooltip::Position::Top,
-        ));
-    }
 
     if let Some(tab) = state.tabs.get(state.active_tab).filter(|tab| tab.image.is_none()) {
         let (line, col) = tab.content.cursor_line_col();
