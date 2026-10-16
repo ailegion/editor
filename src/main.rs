@@ -17,6 +17,7 @@ mod ai_selectable;
 mod inline_edit;
 mod lsp;
 mod acp;
+mod grok_auth;
 mod terminal;
 mod chat;
 mod code_editor;

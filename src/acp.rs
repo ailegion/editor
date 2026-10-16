@@ -168,6 +168,7 @@ enum Event {
     Config(SessionConfig),
     SettingChanged(Setting, Result<SessionConfig, String>),
     SessionId(String),
+    Auth(crate::grok_auth::Update),
     Permission(PendingPermission),
     ToolCall {
         id: String,
@@ -187,6 +188,9 @@ enum Event {
 pub struct AcpState {
     pub attachments: Vec<crate::ai_context::Attachment>,
     provider: &'static str,
+    auth: Option<crate::grok_auth::Update>,
+    auth_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::grok_auth::Command>>,
+    auth_code: String,
     /// Where conversations are saved; `None` keeps them in memory only (tests).
     store_dir: Option<PathBuf>,
     session_grants: std::collections::HashSet<String>,
@@ -232,6 +236,9 @@ impl Default for AcpState {
         Self {
             attachments: Vec::new(),
             provider: "Claude",
+            auth: None,
+            auth_tx: None,
+            auth_code: String::new(),
             store_dir: None,
             session_grants: Default::default(),
             loaded: false,
@@ -273,6 +280,11 @@ impl Default for AcpState {
 #[derive(Debug, Clone)]
 pub enum Message {
     Composer(crate::ai_composer::Action),
+    SignIn,
+    CancelSignIn,
+    AuthCode(String),
+    SubmitAuthCode,
+    OpenSignIn,
     ToggleUsage,
     CloseUsage,
     ToggleModelMenu,
@@ -387,6 +399,10 @@ impl AcpState {
                     self.usage = Some(Usage { used, size, cost });
                 }
                 Event::SessionId(id) => new_session_id = Some(id),
+                Event::Auth(update) => {
+                    if update == crate::grok_auth::Update::SignedIn { self.auth = None; self.auth_code.clear(); }
+                    else { self.auth = Some(update); }
+                }
                 Event::Permission(pending) => {
                     if self.stopping || finished { continue; }
                     if pending.scope.as_ref().is_some_and(|scope| self.session_grants.contains(scope)) && pending.allow_once.is_some() {
@@ -415,6 +431,8 @@ impl AcpState {
         if self.pending_permission.is_none() { self.pending_permission = self.permission_queue.pop_front(); }
         let disconnected = self.prompt_tx.as_ref().is_some_and(|tx| tx.is_closed());
         if disconnected {
+            self.auth_tx = None;
+            if self.auth.is_some() { self.auth = Some(crate::grok_auth::Update::Failed("Connection closed. Try signing in again.".into())); }
             self.model_switching = false;
             self.effort_switching = false;
             self.session_grants.clear();
@@ -565,6 +583,9 @@ impl AcpState {
     }
 
     fn reset_connection(&mut self) {
+        self.auth = None;
+        self.auth_tx = None;
+        self.auth_code.clear();
         self.session_grants.clear();
         self.models = None;
         self.models_reported = false;
@@ -592,6 +613,8 @@ impl AcpState {
             return;
         }
         self.started = true;
+        let (auth_tx, mut auth_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.auth_tx = Some(auth_tx);
 
         let (tx, rx): (Sender<Event>, Receiver<Event>) = mpsc::channel();
         self.rx = Some(rx);
@@ -738,6 +761,11 @@ impl AcpState {
                             .block_task()
                             .await?;
 
+                        if provider == "Grok" {
+                            crate::grok_auth::authenticate(&connection, &init_response, Some(&mut auth_rx), |update| {
+                                let _ = loop_tx.send(Event::Auth(update));
+                            }).await?;
+                        }
                         let mut loaded_session_id = None;
                         let mut config_options = Vec::new();
                         if init_response.agent_capabilities.load_session {
@@ -991,6 +1019,29 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
     state.ensure_loaded(&cwd);
     state.cwd = Some(cwd.clone());
     match message {
+        Message::SignIn => {
+            if state.auth_tx.as_ref().is_none_or(|tx| tx.is_closed()) { state.reset_connection(); state.connect(cwd); }
+            if let Some(tx) = &state.auth_tx { let _ = tx.send(crate::grok_auth::Command::SignIn); }
+        }
+        Message::CancelSignIn => {
+            if let Some(tx) = &state.auth_tx { let _ = tx.send(crate::grok_auth::Command::Cancel); }
+            // Drop queued prompts with this attempt so they cannot run after a later sign-in.
+            state.reset_connection();
+            state.auth = Some(crate::grok_auth::Update::Required);
+            state.auto_connected = true;
+        }
+        Message::AuthCode(code) => state.auth_code = code,
+        Message::SubmitAuthCode => {
+            let code = std::mem::take(&mut state.auth_code);
+            if !code.trim().is_empty() {
+                if let Some(tx) = &state.auth_tx { let _ = tx.send(crate::grok_auth::Command::Submit(code.trim().into())); }
+            }
+        }
+        Message::OpenSignIn => {
+            if let Some(crate::grok_auth::Update::Link { url, .. }) = &state.auth {
+                if url.starts_with("https://") || url.starts_with("http://") { crate::open_url(url); }
+            }
+        }
         Message::Composer(_) => {},
         Message::ToggleUsage => state.usage_open = !state.usage_open,
         Message::CloseUsage => state.usage_open = false,
@@ -1077,6 +1128,34 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
     header = header.push(text(format!("Project · {project}")).size(12).style(iced::widget::text::secondary));
     if let Some(missing) = crate::agent_launch::provider_missing(state.provider) {
         header = header.push(container(text(missing).size(12)).padding(8).width(Length::Fill).style(container::danger));
+    }
+
+    if let Some(auth) = &state.auth {
+        use crate::grok_auth::Update;
+        let mut login = column![].spacing(6);
+        match auth {
+            Update::Required | Update::Failed(_) => {
+                login = login.push(text("Sign in to Grok to start chatting.").size(13));
+                if let Update::Failed(error) = auth { login = login.push(text(error).size(12)); }
+                login = login.push(button("Sign in with Grok").on_press(Message::SignIn));
+            }
+            Update::Waiting | Update::Link { .. } => {
+                login = login.push(text("Complete sign-in in your browser. Chat will continue automatically.").size(13));
+                if let Update::Link { url, can_paste } = auth {
+                    login = login.push(text(url).size(12));
+                    if url.starts_with("https://") || url.starts_with("http://") {
+                        login = login.push(row![button("Open sign-in page").on_press(Message::OpenSignIn), button("Copy link").on_press(Message::Copy(url.clone()))].spacing(6));
+                    }
+                    if *can_paste {
+                        login = login.push(iced::widget::text_input("Paste code or callback URL if needed", &state.auth_code).secure(true).on_input(Message::AuthCode).on_submit(Message::SubmitAuthCode));
+                        login = login.push(button("Complete sign-in").on_press(Message::SubmitAuthCode));
+                    }
+                }
+                login = login.push(button("Cancel sign-in").on_press(Message::CancelSignIn));
+            }
+            Update::SignedIn => {}
+        }
+        header = header.push(container(login).padding(8).width(Length::Fill).style(container::bordered_box));
     }
 
     let labeled_copyable = |label: &'static str, index: usize, content: &str, markdown: bool| -> Element<'_, Message> {
@@ -1399,6 +1478,48 @@ fn select_options(option: &agent_client_protocol::schema::v1::SessionConfigOptio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grok_sign_in_state_routes_codes_and_cancels_queued_prompts() {
+        let project = PathBuf::from("project");
+        let (auth_tx, mut auth_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cancel_tx, cancel) = tokio::sync::oneshot::channel();
+        prompt_tx.send(PendingPrompt { content: vec![ContentBlock::Text(TextContent::new("queued"))], cancel }).unwrap();
+        let mut state = AcpState { provider: "Grok", auth: Some(crate::grok_auth::Update::Required),
+            auth_tx: Some(auth_tx), prompt_tx: Some(prompt_tx), cancel_tx: Some(cancel_tx),
+            streaming: true, started: true, ..Default::default() };
+        let _ = update(&mut state, Message::SignIn, project.clone());
+        assert!(matches!(auth_rx.try_recv().unwrap(), crate::grok_auth::Command::SignIn));
+        let _ = update(&mut state, Message::AuthCode(" test-code ".into()), project.clone());
+        let _ = update(&mut state, Message::SubmitAuthCode, project.clone());
+        assert!(matches!(auth_rx.try_recv().unwrap(), crate::grok_auth::Command::Submit(code) if code == "test-code"));
+        assert!(state.auth_code.is_empty());
+        let _ = update(&mut state, Message::CancelSignIn, project);
+        assert!(matches!(auth_rx.try_recv().unwrap(), crate::grok_auth::Command::Cancel));
+        assert!(auth_rx.is_closed());
+        assert!(prompt_rx.is_closed());
+        assert!(prompt_rx.try_recv().is_ok(), "the old queue belongs to the discarded connection");
+        assert!(!state.streaming && !state.started);
+        assert!(!state.claim_auto_connect(), "cancel must not immediately start a new attempt");
+        assert_eq!(state.auth, Some(crate::grok_auth::Update::Required));
+    }
+
+    #[test]
+    fn grok_authentication_success_clears_only_sign_in_state() {
+        let mut state = AcpState { provider: "Grok", auth: Some(crate::grok_auth::Update::Waiting), auth_code: "sensitive-code".into(), ..Default::default() };
+        state.entries.push(Entry::User { content: "question".into() });
+        let (tx, rx) = mpsc::channel();
+        state.rx = Some(rx);
+        tx.send(Event::Auth(crate::grok_auth::Update::SignedIn)).unwrap();
+        state.poll();
+        assert!(state.auth.is_none() && state.auth_code.is_empty());
+        assert!(matches!(&state.entries[..], [Entry::User { content }] if content == "question"));
+        state.auth = Some(crate::grok_auth::Update::Required);
+        state.auth_code = "another-code".into();
+        state.reset_connection();
+        assert!(state.auth.is_none() && state.auth_tx.is_none() && state.auth_code.is_empty());
+    }
 
     #[test]
     fn the_model_menu_opening_or_closing_keeps_the_input_focused() {

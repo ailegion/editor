@@ -37,6 +37,12 @@ the editor's Node/npm launcher and tool approval controls. Configure the agent's
 credentials before chatting. Codex adapter setup: https://github.com/agentclientprotocol/codex-acp.
 The first launch may download the agent. Connection errors appear in the conversation.
 
+For Grok, click **Sign in with Grok** in the chat panel, then **Open sign-in page**
+and finish in your browser. Chat continues automatically. If the browser cannot
+return to the editor, paste the code or callback URL into **Complete sign-in**.
+Grok saves the credentials; subsequent chats, inline edits, and commit messages
+reuse them. You can cancel or retry sign-in in the panel.
+
 - Drag project-tree files or external files/images onto the AI message composer.
   The composer highlights while dragging; drops elsewhere do not attach files.
   A paperclip in the composer opens the file picker as a fallback.

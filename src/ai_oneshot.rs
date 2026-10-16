@@ -14,7 +14,7 @@ use agent_client_protocol::{Agent, ConnectionTo};
 pub enum Backend {
     /// An OpenAI-compatible chat completions endpoint.
     Http { base_url: String, api_key: String, model: String },
-    /// A fresh Claude or Codex agent session; it may read the project but not change it.
+    /// A fresh ACP agent session; it may read the project but not change it.
     Agent { provider: &'static str, model: Option<String> },
 }
 
@@ -64,7 +64,7 @@ fn http_reply(body: &str) -> Result<String, String> {
 async fn ask_agent(provider: &'static str, model: Option<String>, cwd: PathBuf, prompt: String) -> Result<String, String> {
     let agent = crate::agent_launch::provider_agent(provider)?;
     let reply = Arc::new(Mutex::new(String::new()));
-    connect(agent, reply.clone(), cwd, prompt, model).await.map_err(|err| crate::agent_launch::describe(&err))?;
+    connect(agent, reply.clone(), cwd, prompt, model, provider).await.map_err(|err| crate::agent_launch::describe(&err))?;
     let reply = reply.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
     Ok(reply)
 }
@@ -73,7 +73,7 @@ async fn ask_agent(provider: &'static str, model: Option<String>, cwd: PathBuf, 
 /// one-off answer must not edit the project behind the user's back.
 async fn connect(
     agent: impl agent_client_protocol::ConnectTo<agent_client_protocol::Client> + 'static,
-    reply: Arc<Mutex<String>>, cwd: PathBuf, prompt: String, model: Option<String>,
+    reply: Arc<Mutex<String>>, cwd: PathBuf, prompt: String, model: Option<String>, provider: &'static str,
 ) -> agent_client_protocol::Result<()> {
     agent_client_protocol::Client.builder()
         .on_receive_notification(async move |notification: SessionNotification, _cx| {
@@ -87,12 +87,13 @@ async fn connect(
         .on_receive_request(async move |_request: RequestPermissionRequest, responder, _cx| {
             responder.respond(RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled))
         }, agent_client_protocol::on_receive_request!())
-        .connect_with(agent, async move |connection: ConnectionTo<Agent>| prompt_once(&connection, cwd, prompt, model).await)
+        .connect_with(agent, async move |connection: ConnectionTo<Agent>| prompt_once(&connection, cwd, prompt, model, provider).await)
         .await
 }
 
-async fn prompt_once(connection: &ConnectionTo<Agent>, cwd: PathBuf, prompt: String, model: Option<String>) -> agent_client_protocol::Result<()> {
-    connection.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
+async fn prompt_once(connection: &ConnectionTo<Agent>, cwd: PathBuf, prompt: String, model: Option<String>, provider: &str) -> agent_client_protocol::Result<()> {
+    let init = connection.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
+    if provider == "Grok" { crate::grok_auth::authenticate(connection, &init, None, |_| {}).await?; }
     let session = connection.send_request(NewSessionRequest::new(cwd)).block_task().await?;
     // Use the model picked in the panel when the agent offers it; otherwise its default.
     if let (Some(model), Some(options)) = (model, crate::acp::model_from_options(&session.config_options.unwrap_or_default())) {
@@ -170,7 +171,7 @@ mod tests {
                 })
             }, agent_client_protocol::on_receive_request!());
         let reply = Arc::new(Mutex::new(String::new()));
-        let run = connect(agent, reply.clone(), PathBuf::from("."), "Write a commit message".into(), None);
+        let run = connect(agent, reply.clone(), PathBuf::from("."), "Write a commit message".into(), None, "Claude");
         tokio::time::timeout(std::time::Duration::from_secs(5), run).await.unwrap().unwrap();
         assert_eq!(*reply.lock().unwrap(), "Add login check");
         assert_eq!(*declined.lock().unwrap(), Some(true));
