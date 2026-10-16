@@ -97,6 +97,8 @@ async fn prompt_once(connection: &ConnectionTo<Agent>, cwd: PathBuf, prompt: Str
     let request = NewSessionRequest::new(cwd);
     let session = if provider == "Cursor" {
         crate::cursor_auth::session(connection, &init, request, None, |_| {}).await?
+    } else if provider == "Codex" {
+        crate::codex_auth::session(connection, &init, request, None, |_| {}).await?
     } else { connection.send_request(request).block_task().await? };
     // Use the model picked in the panel when the agent offers it; otherwise its default.
     if let (Some(model), Some(options)) = (model, crate::acp::model_from_options(&session.config_options.unwrap_or_default())) {
@@ -178,5 +180,27 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), run).await.unwrap().unwrap();
         assert_eq!(*reply.lock().unwrap(), "Add login check");
         assert_eq!(*declined.lock().unwrap(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn codex_one_off_uses_saved_login_and_never_starts_interactive_authentication() {
+        for signed_in in [true, false] {
+            let agent = Agent.builder()
+                .on_receive_request(async |_: InitializeRequest, responder, _cx| {
+                    use agent_client_protocol::schema::v1::{AuthMethod, AuthMethodAgent};
+                    responder.respond(InitializeResponse::new(ProtocolVersion::V1)
+                        .auth_methods(vec![AuthMethod::Agent(AuthMethodAgent::new("chat-gpt", "ChatGPT"))]))
+                }, agent_client_protocol::on_receive_request!())
+                .on_receive_request(async move |_: NewSessionRequest, responder, _cx| {
+                    if signed_in { responder.respond(NewSessionResponse::new("saved-login")) }
+                    else { responder.respond_with_error(agent_client_protocol::Error::auth_required()) }
+                }, agent_client_protocol::on_receive_request!())
+                .on_receive_request(async |_: PromptRequest, responder, _cx| {
+                    responder.respond(PromptResponse::new(StopReason::EndTurn))
+                }, agent_client_protocol::on_receive_request!());
+            let result = connect(agent, Arc::new(Mutex::new(String::new())), PathBuf::from("project"), "Explain".into(), None, "Codex").await;
+            if signed_in { result.unwrap(); }
+            else { assert!(crate::agent_launch::describe(&result.unwrap_err()).contains("Sign in to Codex in the AI chat panel")); }
+        }
     }
 }

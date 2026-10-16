@@ -20,6 +20,7 @@ mod acp;
 mod grok_auth;
 mod cursor_agent;
 mod cursor_auth;
+mod codex_auth;
 mod terminal;
 mod chat;
 mod code_editor;

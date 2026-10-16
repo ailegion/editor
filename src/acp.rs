@@ -776,6 +776,10 @@ impl AcpState {
                                     crate::cursor_auth::session(&connection, &init_response, request, Some(&mut auth_rx), |update| {
                                         let _ = loop_tx.send(Event::Auth(update));
                                     }).await
+                                } else if provider == "Codex" {
+                                    crate::codex_auth::session(&connection, &init_response, request, Some(&mut auth_rx), |update| {
+                                        let _ = loop_tx.send(Event::Auth(update));
+                                    }).await
                                 } else { connection.send_request(request).block_task().await };
                                 if let Ok(loaded) = loaded {
                                     config_options = loaded.config_options.unwrap_or_default();
@@ -790,6 +794,10 @@ impl AcpState {
                                 let request = NewSessionRequest::new(cwd);
                                 let session = if provider == "Cursor" {
                                     crate::cursor_auth::session(&connection, &init_response, request, Some(&mut auth_rx), |update| {
+                                        let _ = loop_tx.send(Event::Auth(update));
+                                    }).await?
+                                } else if provider == "Codex" {
+                                    crate::codex_auth::session(&connection, &init_response, request, Some(&mut auth_rx), |update| {
                                         let _ = loop_tx.send(Event::Auth(update));
                                     }).await?
                                 } else { connection.send_request(request).block_task().await? };

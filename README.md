@@ -37,6 +37,14 @@ the editor's Node/npm launcher and tool approval controls. Configure the agent's
 credentials before chatting. Codex adapter setup: https://github.com/agentclientprotocol/codex-acp.
 The first launch may download the agent. Connection errors appear in the conversation.
 
+For **Codex ACP**, existing Codex CLI authentication is reused. If sign-in is
+required, click **Sign in with Codex** and finish in the browser opened by the
+Codex ACP adapter. The editor sends only the adapter's advertised `chat-gpt`
+authentication request; the official Codex process handles OAuth and credentials.
+Sign-in can be cancelled or retried. Inline edits and commit messages reuse the
+saved login and direct unsigned users to the chat panel. Claude authentication
+continues to be configured in its CLI.
+
 For Grok, click **Sign in with Grok** in the chat panel, then **Open sign-in page**
 and finish in your browser. Chat continues automatically. If the browser cannot
 return to the editor, paste the code or callback URL into **Complete sign-in**.
