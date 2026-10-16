@@ -18,6 +18,8 @@ mod inline_edit;
 mod lsp;
 mod acp;
 mod grok_auth;
+mod cursor_agent;
+mod cursor_auth;
 mod terminal;
 mod chat;
 mod code_editor;
@@ -226,11 +228,12 @@ enum AiMode {
     Acp,
     Codex,
     Grok,
+    Cursor,
 }
 
 impl std::fmt::Display for AiMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self { Self::Http => "Local / Ollama / API", Self::Acp => "Claude ACP", Self::Codex => "Codex ACP", Self::Grok => "Grok ACP" })
+        f.write_str(match self { Self::Http => "Local / Ollama / API", Self::Acp => "Claude ACP", Self::Codex => "Codex ACP", Self::Grok => "Grok ACP", Self::Cursor => "Cursor ACP" })
     }
 }
 
@@ -385,6 +388,7 @@ enum Message {
     GoToDefinition,
     Codex(acp::Message),
     Grok(acp::Message),
+    Cursor(acp::Message),
     Chat(chat::Message),
     Acp(acp::Message),
     Tick,
@@ -493,6 +497,7 @@ struct State {
     acp: acp::AcpState,
     codex: acp::AcpState,
     grok: acp::AcpState,
+    cursor: acp::AcpState,
     terminal: terminal::panel::Panel,
     terminal_visible: bool,
 }
@@ -598,6 +603,7 @@ impl State {
             acp: acp::AcpState::claude(),
             codex: acp::AcpState::codex(),
             grok: acp::AcpState::grok(),
+            cursor: acp::AcpState::cursor(),
             terminal: terminal::panel::Panel::default(),
             terminal_visible: false,
         }
@@ -1121,6 +1127,7 @@ impl State {
         match self.ai_mode {
             AiMode::Http => self.chat.input_text(),
             AiMode::Acp => self.acp.input_text(),
+            AiMode::Cursor => self.cursor.input_text(),
             AiMode::Grok => self.grok.input_text(),
             AiMode::Codex => self.codex.input_text(),
         }
@@ -1130,6 +1137,7 @@ impl State {
         match self.ai_mode {
             AiMode::Http => self.chat.set_input(text),
             AiMode::Acp => self.acp.set_input(text),
+            AiMode::Cursor => self.cursor.set_input(text),
             AiMode::Grok => self.grok.set_input(text),
             AiMode::Codex => self.codex.set_input(text),
         }
@@ -1140,6 +1148,7 @@ impl State {
         match self.ai_mode {
             AiMode::Http => &mut self.chat.attachments,
             AiMode::Acp => &mut self.acp.attachments,
+            AiMode::Cursor => &mut self.cursor.attachments,
             AiMode::Grok => &mut self.grok.attachments,
             AiMode::Codex => &mut self.codex.attachments,
         }
@@ -1153,6 +1162,7 @@ impl State {
                 .map(|(base_url, api_key, model)| ai_oneshot::Backend::Http { base_url, api_key, model })
                 .ok_or_else(|| "Choose a model in the AI panel's settings first".to_string()),
             AiMode::Acp => Ok(ai_oneshot::Backend::Agent { provider: self.acp.provider(), model: self.acp.preferred_model() }),
+            AiMode::Cursor => Ok(ai_oneshot::Backend::Agent { provider: self.cursor.provider(), model: self.cursor.preferred_model() }),
             AiMode::Grok => Ok(ai_oneshot::Backend::Agent { provider: self.grok.provider(), model: self.grok.preferred_model() }),
             AiMode::Codex => Ok(ai_oneshot::Backend::Agent { provider: self.codex.provider(), model: self.codex.preferred_model() }),
         }
@@ -1232,6 +1242,7 @@ impl State {
             let send = match self.ai_mode {
                 AiMode::Http => Message::Chat(chat::Message::Send),
                 AiMode::Acp => Message::Acp(acp::Message::Send),
+                AiMode::Cursor => Message::Cursor(acp::Message::Send),
                 AiMode::Grok => Message::Grok(acp::Message::Send),
                 AiMode::Codex => Message::Codex(acp::Message::Send),
             };
@@ -2373,6 +2384,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Chat(chat::Message::Composer(action))
         | Message::Acp(acp::Message::Composer(action))
+        | Message::Cursor(acp::Message::Composer(action))
         | Message::Grok(acp::Message::Composer(action))
         | Message::Codex(acp::Message::Composer(action)) => {
             let next = match action {
@@ -2421,7 +2433,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             for file in files {
                 match file {
                     Ok(file) => {
-                        let attachments = match mode { AiMode::Http => &mut state.chat.attachments, AiMode::Acp => &mut state.acp.attachments, AiMode::Codex => &mut state.codex.attachments, AiMode::Grok => &mut state.grok.attachments };
+                        let attachments = match mode { AiMode::Http => &mut state.chat.attachments, AiMode::Acp => &mut state.acp.attachments, AiMode::Codex => &mut state.codex.attachments, AiMode::Grok => &mut state.grok.attachments, AiMode::Cursor => &mut state.cursor.attachments };
                         if attachments.len() < 16 { attachments.push(file); }
                         else { state.notice = Some(("Maximum 16 attachments per message.".into(), std::time::Instant::now())); }
                     }
@@ -2430,7 +2442,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::AiRemoveAttachment(index) => {
-            let attachments = match state.ai_mode { AiMode::Http => &mut state.chat.attachments, AiMode::Acp => &mut state.acp.attachments, AiMode::Codex => &mut state.codex.attachments, AiMode::Grok => &mut state.grok.attachments };
+            let attachments = match state.ai_mode { AiMode::Http => &mut state.chat.attachments, AiMode::Acp => &mut state.acp.attachments, AiMode::Codex => &mut state.codex.attachments, AiMode::Grok => &mut state.grok.attachments, AiMode::Cursor => &mut state.cursor.attachments };
             if index < attachments.len() { attachments.remove(index); }
         }
         Message::AiPaste => {
@@ -2452,6 +2464,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             let next = match state.ai_mode {
                 AiMode::Http => Message::Chat(chat::Message::InputChanged(paste)),
                 AiMode::Acp => Message::Acp(acp::Message::InputChanged(paste)),
+                AiMode::Cursor => Message::Cursor(acp::Message::InputChanged(paste)),
                 AiMode::Grok => Message::Grok(acp::Message::InputChanged(paste)),
                 AiMode::Codex => Message::Codex(acp::Message::InputChanged(paste)),
             };
@@ -2462,7 +2475,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 let selection = tab.content.copy_selection();
                 let name = format!("{}{}", tab.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "Untitled".into()), if selection.is_some() { " (selection)" } else { " (editor buffer)" });
                 let content = selection.unwrap_or_else(|| tab.content.text());
-                let attachments = match state.ai_mode { AiMode::Http => &mut state.chat.attachments, AiMode::Acp => &mut state.acp.attachments, AiMode::Codex => &mut state.codex.attachments, AiMode::Grok => &mut state.grok.attachments };
+                let attachments = match state.ai_mode { AiMode::Http => &mut state.chat.attachments, AiMode::Acp => &mut state.acp.attachments, AiMode::Codex => &mut state.codex.attachments, AiMode::Grok => &mut state.grok.attachments, AiMode::Cursor => &mut state.cursor.attachments };
                 if content.len() <= ai_context::MAX_BYTES && attachments.len() < 16 { attachments.push(ai_context::Attachment { name, content, mime: None }); }
                 else { state.notice = Some(("Attachment limit reached (16 files, 8 MiB each).".into(), std::time::Instant::now())); }
             }
@@ -2521,6 +2534,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             let diff = state.acp.diff(entry, index).cloned();
             state.open_ai_diff(diff);
         }
+        Message::Cursor(acp::Message::ViewDiff(entry, index)) => {
+            let diff = state.cursor.diff(entry, index).cloned();
+            state.open_ai_diff(diff);
+        }
         Message::Grok(acp::Message::ViewDiff(entry, index)) => {
             let diff = state.grok.diff(entry, index).cloned();
             state.open_ai_diff(diff);
@@ -2535,8 +2552,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Chat(chat::Message::Markdown(ai_markdown::Action::Insert(code)))
         | Message::Acp(acp::Message::Markdown(ai_markdown::Action::Insert(code)))
+        | Message::Cursor(acp::Message::Markdown(ai_markdown::Action::Insert(code)))
         | Message::Grok(acp::Message::Markdown(ai_markdown::Action::Insert(code)))
         | Message::Codex(acp::Message::Markdown(ai_markdown::Action::Insert(code))) => state.insert_code(&code),
+        Message::Cursor(msg) => {
+            let cwd = state.root_or_cwd();
+            let input = matches!(msg, acp::Message::InputChanged(_) | acp::Message::UsePrompt(_));
+            if matches!(msg, acp::Message::Send) { state.attach_mentions(); }
+            task = acp::update(&mut state.cursor, msg, cwd).map(Message::Cursor);
+            if input { state.refresh_mentions(); }
+        }
         Message::Grok(msg) => {
             let cwd = state.root_or_cwd();
             let input = matches!(msg, acp::Message::InputChanged(_) | acp::Message::UsePrompt(_));
@@ -2586,12 +2611,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.acp.ensure_loaded(&cwd);
             state.codex.ensure_loaded(&cwd);
             state.grok.ensure_loaded(&cwd);
+            state.cursor.ensure_loaded(&cwd);
             // Only an ACP chat needs the shell PATH, so look it up once one is open.
-            if state.ai_visible && matches!(state.ai_mode, AiMode::Acp | AiMode::Codex | AiMode::Grok) { agent_launch::warm_up(); }
+            if state.ai_visible && matches!(state.ai_mode, AiMode::Acp | AiMode::Codex | AiMode::Grok | AiMode::Cursor) { agent_launch::warm_up(); }
             // Connect as soon as the panel shows, so it names the model in use straight away.
             if state.ai_visible {
                 match state.ai_mode {
                     AiMode::Acp => state.acp.connect_for_display(&cwd),
+                    AiMode::Cursor => state.cursor.connect_for_display(&cwd),
                     AiMode::Grok => state.grok.connect_for_display(&cwd),
                     AiMode::Codex => state.codex.connect_for_display(&cwd),
                     _ => {}
@@ -2601,11 +2628,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.acp.poll();
             state.codex.poll();
             state.grok.poll();
+            state.cursor.poll();
+            let cursor_finished = state.cursor.take_finished();
             let grok_finished = state.grok.take_finished();
             let codex_finished = state.codex.take_finished();
             let claude_finished = state.acp.take_finished();
             let local_changed = state.chat.take_files_changed();
-            if grok_finished || codex_finished || claude_finished || local_changed {
+            if cursor_finished || grok_finished || codex_finished || claude_finished || local_changed {
                 let reload_task = state.reload_open_tabs();
                 if let Some(root) = state.root.clone() {
                     task = Task::batch([reload_task, refresh_dir_task(root)]);
@@ -2871,13 +2900,14 @@ mod layer_tests {
 fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
     let controls = match state.ai_mode {
         AiMode::Http => chat::conversation_controls(&state.chat).map(Message::Chat),
+        AiMode::Cursor => acp::conversation_controls(&state.cursor).map(Message::Cursor),
         AiMode::Grok => acp::conversation_controls(&state.grok).map(Message::Grok),
         AiMode::Codex => acp::conversation_controls(&state.codex).map(Message::Codex),
         AiMode::Acp => acp::conversation_controls(&state.acp).map(Message::Acp),
     };
     let mode_row = row![
         text("Assistant").size(14),
-        iced::widget::pick_list([AiMode::Http, AiMode::Acp, AiMode::Codex, AiMode::Grok], Some(state.ai_mode), Message::AiModeSelected).text_size(12),
+        iced::widget::pick_list([AiMode::Http, AiMode::Acp, AiMode::Codex, AiMode::Grok, AiMode::Cursor], Some(state.ai_mode), Message::AiModeSelected).text_size(12),
         Space::new().width(Length::Fill),
         controls
     ].spacing(6).padding(8);
@@ -2889,6 +2919,7 @@ fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
     };
     let panel: Element<'_, Message> = match state.ai_mode {
         AiMode::Http => chat::view(&state.chat, composer).map(Message::Chat),
+        AiMode::Cursor => acp::view(&state.cursor, state.root_or_cwd(), composer).map(Message::Cursor),
         AiMode::Grok => acp::view(&state.grok, state.root_or_cwd(), composer).map(Message::Grok),
         AiMode::Codex => acp::view(&state.codex, state.root_or_cwd(), composer).map(Message::Codex),
         AiMode::Acp => acp::view(&state.acp, state.root_or_cwd(), composer).map(Message::Acp),

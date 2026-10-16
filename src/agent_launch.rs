@@ -23,7 +23,8 @@ pub fn warm_up() {
     STARTED.call_once(|| { std::thread::spawn(launch); });
 }
 
-pub fn provider_missing(_provider: &str) -> Option<&'static str> {
+pub fn provider_missing(provider: &str) -> Option<&'static str> {
+    if provider == "Cursor" { return None; }
     LAUNCH.get().and_then(missing_for)
 }
 
@@ -31,13 +32,17 @@ fn missing_for(launch: &Launch) -> Option<&'static str> {
     launch.npx.is_none().then_some(NODE_MISSING)
 }
 
-pub fn provider_found(_provider: &str) -> bool {
-    LAUNCH.get().is_some_and(|launch| missing_for(launch).is_none())
+pub fn provider_found(provider: &str) -> bool {
+    provider == "Cursor" || LAUNCH.get().is_some_and(|launch| missing_for(launch).is_none())
 }
 
 pub fn provider_agent(provider: &str) -> Result<AcpAgent, String> {
     let launch = launch();
-    AcpAgent::from_args(provider_args(launch, provider)?).map_err(|err| describe(&err))
+    let args = if provider == "Cursor" {
+        let package = crate::cursor_agent::ensure()?;
+        crate::cursor_agent::args(&package, cfg!(windows), launch.path.to_str().ok_or("PATH is not valid Unicode")?)
+    } else { provider_args(launch, provider)? };
+    AcpAgent::from_args(args).map_err(|err| describe(&err))
 }
 
 fn provider_args(launch: &Launch, provider: &str) -> Result<Vec<String>, String> {
@@ -146,6 +151,21 @@ fn shell_path() -> Option<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_can_start_without_node_or_npx_discovery() {
+        assert!(provider_found("Cursor"));
+        assert_eq!(provider_missing("Cursor"), None);
+        let launch = Launch { path: "test-path".into(), npx: None };
+        assert_eq!(missing_for(&launch), Some(NODE_MISSING));
+        let package = PathBuf::from("cached cursor");
+        for windows in [false, true] {
+            let args = crate::cursor_agent::args(&package, windows, "test-path");
+            assert_eq!(args[1], package.join(if windows { "node.exe" } else { "node" }).display().to_string());
+            assert_eq!(args[2], package.join("index.js").display().to_string());
+            assert_eq!(args[3], "acp");
+        }
+    }
 
     #[test]
     fn provider_commands_and_requirements_are_independent() {

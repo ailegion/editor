@@ -311,6 +311,7 @@ pub enum Message {
 
 impl AcpState {
     pub fn claude() -> Self { Self { store_dir: crate::config_path("acp_threads"), ..Self::default() } }
+    pub fn cursor() -> Self { Self { provider: "Cursor", ..Self::claude() } }
     pub fn grok() -> Self { Self { provider: "Grok", ..Self::claude() } }
     pub fn codex() -> Self { Self { provider: "Codex", ..Self::claude() } }
 
@@ -770,10 +771,12 @@ impl AcpState {
                         let mut config_options = Vec::new();
                         if init_response.agent_capabilities.load_session {
                             if let Some(id) = resume_session_id.clone() {
-                                let loaded = connection
-                                    .send_request(LoadSessionRequest::new(id.clone(), cwd.clone()))
-                                    .block_task()
-                                    .await;
+                                let request = LoadSessionRequest::new(id.clone(), cwd.clone());
+                                let loaded = if provider == "Cursor" {
+                                    crate::cursor_auth::session(&connection, &init_response, request, Some(&mut auth_rx), |update| {
+                                        let _ = loop_tx.send(Event::Auth(update));
+                                    }).await
+                                } else { connection.send_request(request).block_task().await };
                                 if let Ok(loaded) = loaded {
                                     config_options = loaded.config_options.unwrap_or_default();
                                     loaded_session_id = Some(SessionId::new(id));
@@ -784,10 +787,12 @@ impl AcpState {
                         let session_id = match loaded_session_id {
                             Some(id) => id,
                             None => {
-                                let session = connection
-                                    .send_request(NewSessionRequest::new(cwd))
-                                    .block_task()
-                                    .await?;
+                                let request = NewSessionRequest::new(cwd);
+                                let session = if provider == "Cursor" {
+                                    crate::cursor_auth::session(&connection, &init_response, request, Some(&mut auth_rx), |update| {
+                                        let _ = loop_tx.send(Event::Auth(update));
+                                    }).await?
+                                } else { connection.send_request(request).block_task().await? };
                                 config_options = session.config_options.unwrap_or_default();
                                 session.session_id
                             }
@@ -1135,9 +1140,9 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
         let mut login = column![].spacing(6);
         match auth {
             Update::Required | Update::Failed(_) => {
-                login = login.push(text("Sign in to Grok to start chatting.").size(13));
+                login = login.push(text(format!("Sign in to {} to start chatting.", state.provider)).size(13));
                 if let Update::Failed(error) = auth { login = login.push(text(error).size(12)); }
-                login = login.push(button("Sign in with Grok").on_press(Message::SignIn));
+                login = login.push(button(text(format!("Sign in with {}", state.provider))).on_press(Message::SignIn));
             }
             Update::Waiting | Update::Link { .. } => {
                 login = login.push(text("Complete sign-in in your browser. Chat will continue automatically.").size(13));
@@ -1478,6 +1483,34 @@ fn select_options(option: &agent_client_protocol::schema::v1::SessionConfigOptio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_history_and_sign_in_remain_separate_from_other_providers() {
+        let store = tempfile::tempdir().unwrap();
+        let project = store.path().join("project");
+        let mut cursor = AcpState { provider: "Cursor", store_dir: Some(store.path().to_path_buf()), ..Default::default() };
+        cursor.ensure_loaded(&project);
+        cursor.entries.push(Entry::User { content: "Cursor question".into() });
+        cursor.new_thread(&project);
+        let mut reloaded = AcpState { provider: "Cursor", store_dir: Some(store.path().to_path_buf()), ..Default::default() };
+        reloaded.ensure_loaded(&project);
+        assert_eq!(reloaded.threads[0].title, "Cursor question");
+        for provider in ["Claude", "Codex", "Grok"] {
+            let mut other = AcpState { provider, store_dir: Some(store.path().to_path_buf()), ..Default::default() };
+            other.ensure_loaded(&project);
+            assert!(other.threads[0].entries.is_empty());
+            assert_ne!(threads_file(&project, provider), threads_file(&project, "Cursor"));
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        cursor.auth_tx = Some(tx);
+        cursor.auth = Some(crate::grok_auth::Update::Required);
+        let _ = update(&mut cursor, Message::SignIn, project.clone());
+        assert!(matches!(rx.try_recv().unwrap(), crate::grok_auth::Command::SignIn));
+        let _ = update(&mut cursor, Message::CancelSignIn, project);
+        assert!(rx.is_closed());
+        assert!(!cursor.claim_auto_connect());
+        assert_eq!(AcpState::cursor().provider(), "Cursor");
+    }
 
     #[test]
     fn grok_sign_in_state_routes_codes_and_cancels_queued_prompts() {

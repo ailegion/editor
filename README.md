@@ -6,7 +6,7 @@ A minimal, no-bloat code editor in Rust, built on `iced`.
 
 - Single-pane text editor with syntax highlighting (`syntect`)
 - Left sidebar: project file tree, create/rename/delete, keyboard navigation (arrows to move/open/expand/collapse)
-- Right sidebar: AI chat with Claude, Codex, or Grok (ACP) or any OpenAI-compatible endpoint, with Markdown replies, saved conversations, and file edits reviewed as diffs
+- Right sidebar: AI chat with Claude, Codex, Grok, or Cursor (ACP) or any OpenAI-compatible endpoint, with Markdown replies, saved conversations, and file edits reviewed as diffs
 - AI inline edits (Cmd/Ctrl+K), explain/refactor/fix actions, and AI-written commit messages
 - Integrated PTY terminal with ANSI colors, 5,000 lines of scrollback, and a resizable bottom panel
 - Status bar with AI and terminal visibility toggles
@@ -21,7 +21,7 @@ A minimal, no-bloat code editor in Rust, built on `iced`.
 ## AI assistant
 
 The AI sidebar has one provider picker: **Local / Ollama / API**, **Claude ACP**,
-**Codex ACP**, and **Grok ACP**. Each provider keeps its own conversations and draft, saved separately for
+**Codex ACP**, **Grok ACP**, and **Cursor ACP**. Each provider keeps its own conversations and draft, saved separately for
 each project. The history button lists the 10 most recently active conversations, with
 search, rename, delete, and **Show all** for older ones.
 
@@ -43,6 +43,13 @@ return to the editor, paste the code or callback URL into **Complete sign-in**.
 Grok saves the credentials; subsequent chats, inline edits, and commit messages
 reuse them. You can cancel or retry sign-in in the panel.
 
+**Cursor ACP** automatically downloads and caches the official Cursor package for
+Windows, Linux, or macOS (x64 and ARM64). Its bundled runtime needs no separate
+Cursor or Node installation or PATH setup. Select Cursor, click **Sign in with
+Cursor** when prompted, and finish in the browser that opens. Existing Cursor
+credentials and API keys are reused without opening a new login. Login can be
+cancelled or retried in the panel, and saved conversations resume after signing in.
+
 - Drag project-tree files or external files/images onto the AI message composer.
   The composer highlights while dragging; drops elsewhere do not attach files.
   A paperclip in the composer opens the file picker as a fallback.
@@ -62,7 +69,7 @@ reuse them. You can cancel or retry sign-in in the panel.
   selection or file with AI; the status bar's wand asks the AI to fix the problem on the
   caret's line.
 - The source control panel's sparkles button writes a commit message from the staged diff,
-  matching the style of recent commits. With Claude, Codex, or Grok this starts a short separate
+  matching the style of recent commits. With Claude, Codex, Grok, or Cursor this starts a short separate
   agent session that is not allowed to change files.
 - File edits made by the AI show **View diff**, which opens them in the diff viewer.
 - The Local / API assistant can read, search, create and edit files (`edit_file` replaces

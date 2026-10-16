@@ -94,7 +94,10 @@ async fn connect(
 async fn prompt_once(connection: &ConnectionTo<Agent>, cwd: PathBuf, prompt: String, model: Option<String>, provider: &str) -> agent_client_protocol::Result<()> {
     let init = connection.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
     if provider == "Grok" { crate::grok_auth::authenticate(connection, &init, None, |_| {}).await?; }
-    let session = connection.send_request(NewSessionRequest::new(cwd)).block_task().await?;
+    let request = NewSessionRequest::new(cwd);
+    let session = if provider == "Cursor" {
+        crate::cursor_auth::session(connection, &init, request, None, |_| {}).await?
+    } else { connection.send_request(request).block_task().await? };
     // Use the model picked in the panel when the agent offers it; otherwise its default.
     if let (Some(model), Some(options)) = (model, crate::acp::model_from_options(&session.config_options.unwrap_or_default())) {
         if !crate::acp::is_same_model(&model, &options.current) {
