@@ -3528,12 +3528,34 @@ fn view_editor(state: &State) -> Element<'_, Message> {
     }
 
     if let Some(preview) = &state.git_preview {
+        let path = Path::new(&preview.path);
+        let spec = file_icons::FileIcons.file_glyph(path);
+        let color = file_icons::FileIcons.file_color(path);
+        let icon = text(spec.glyph.into_owned())
+            .font(spec.font.unwrap_or_default()).size(spec.size.unwrap_or(14.0))
+            .style(move |theme: &iced::Theme| iced::widget::text::Style {
+                color: Some(color.unwrap_or(theme.extended_palette().background.base.text)),
+            });
+        let title = row![
+            container(row![icon, text(&preview.path).size(13)].spacing(6).align_y(iced::Alignment::Center))
+                .padding([4, 8]),
+            icon_control(lucide_icons::Icon::X, "Close diff", Some(Message::CloseGitPreview), false),
+        ].spacing(2).align_y(iced::Alignment::Center);
+        let underline = container(Space::new().width(Length::Fill).height(2))
+            .style(|theme: &iced::Theme| iced::widget::container::Style {
+                background: Some(theme.extended_palette().primary.base.color.into()),
+                ..Default::default()
+            });
+        let tab = container(column![title, underline].spacing(2))
+            .style(|theme: &iced::Theme| iced::widget::container::Style {
+                background: Some(theme.extended_palette().background.weak.color.into()),
+                ..Default::default()
+            });
         let mut header = row![
-            text(preview.path.clone()).size(14),
+            tab,
             text(git_preview::summary(preview)).size(12).style(iced::widget::text::secondary),
-            button("×").style(flat_button_style).on_press(Message::CloseGitPreview),
             Space::new().width(Length::Fill),
-        ].spacing(12).padding(8).align_y(iced::Alignment::Center);
+        ].spacing(8).padding([2, 4]).align_y(iced::Alignment::Center);
         if state.inline_edit.as_ref().is_some_and(|edit| matches!(edit.stage, inline_edit::Stage::Review(_))) {
             header = header
                 .push(button(text("Accept").size(13)).padding([6, 14]).style(iced::widget::button::success).on_press(Message::InlineEditAccept))
@@ -3542,7 +3564,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         let header = header.push(button(if state.ai_visible { "Hide AI panel" } else { "Show AI panel" }).style(flat_button_style).on_press(Message::AiToggle));
         return column![
             scrollable(tab_row).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())),
-            header,
+            container(header).style(chrome_style),
 
             git_preview::view(preview, &state.app_theme.iced, Message::GitPreviewScrolled),
         ].width(Length::Fill).height(Length::Fill).into();
