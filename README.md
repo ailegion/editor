@@ -29,15 +29,13 @@ For Ollama, open model settings, choose **Use local Ollama**, and select a disco
 model. Other OpenAI-compatible servers use the same base URL, key, and model settings.
 Image prompts require a vision-capable model.
 
-ACP starts `npx --yes @agentclientprotocol/claude-agent-acp` or
-`npx --yes @agentclientprotocol/codex-acp`. Node/npm must be on PATH; configure the agent's
+ACP starts `npx --yes @agentclientprotocol/claude-agent-acp`,
+`npx --yes @agentclientprotocol/codex-acp`, or
+`npx --yes @xai-official/grok agent stdio`. All three download automatically when
+selected; no separate agent installation or agent PATH setup is needed. They share
+the editor's Node/npm launcher and tool approval controls. Configure the agent's
 credentials before chatting. Codex adapter setup: https://github.com/agentclientprotocol/codex-acp.
-The first launch may download the adapter. Connection errors appear in the conversation.
-
-Grok ACP starts `grok agent stdio` directly and does not require Node/npm. Install
-[Grok Build](https://grok.com/build), sign in through its CLI, and ensure `grok` is on
-PATH (`grok.exe` on Windows), then restart the editor. Grok uses the same tool approval
-controls as the other ACP providers.
+The first launch may download the agent. Connection errors appear in the conversation.
 
 - Drag project-tree files or external files/images onto the AI message composer.
   The composer highlights while dragging; drops elsewhere do not attach files.
