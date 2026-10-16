@@ -1,7 +1,7 @@
-//! Starting the Claude and Codex agents, which run through `npx`. Apps opened from Finder or
+//! Starting Claude and Codex through `npx`, and Grok through its native CLI. Apps opened from Finder or
 //! the Dock inherit launchd's minimal `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`), which misses
 //! Homebrew, nvm and similar, so on macOS and Linux the user's shell is asked for its `PATH`
-//! once, when a Claude or Codex chat is first opened, and put in front of the inherited one.
+//! once, when an ACP chat is first opened, and put in front of the inherited one.
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::sync::{Once, OnceLock};
@@ -15,6 +15,7 @@ pub const NODE_MISSING: &str = "Node.js was not found. Claude and Codex run thro
 struct Launch {
     path: OsString,
     npx: Option<PathBuf>,
+    grok: Option<PathBuf>,
 }
 
 /// Starts the lookup in the background, once, so the first message does not wait for it.
@@ -23,24 +24,38 @@ pub fn warm_up() {
     STARTED.call_once(|| { std::thread::spawn(launch); });
 }
 
-/// True once the lookup has finished without finding `npx`; false while it is still running.
-pub fn node_missing() -> bool {
-    LAUNCH.get().is_some_and(|launch| launch.npx.is_none())
+pub const GROK_MISSING: &str = "Grok CLI was not found. Install Grok Build from https://grok.com/build and sign in, then restart the editor.";
+
+pub fn provider_missing(provider: &str) -> Option<&'static str> {
+    LAUNCH.get().and_then(|launch| missing_for(launch, provider))
 }
 
-/// True once the lookup has finished and found `npx`, so an agent can be started.
-pub fn node_found() -> bool {
-    LAUNCH.get().is_some_and(|launch| launch.npx.is_some())
+fn missing_for(launch: &Launch, provider: &str) -> Option<&'static str> {
+    if provider == "Grok" {
+        launch.grok.is_none().then_some(GROK_MISSING)
+    } else {
+        launch.npx.is_none().then_some(NODE_MISSING)
+    }
 }
 
-/// The agent for `package`, started with `npx` from the user's `PATH`.
-pub fn agent(package: &str) -> Result<AcpAgent, String> {
+pub fn provider_found(provider: &str) -> bool {
+    LAUNCH.get().is_some_and(|launch| missing_for(launch, provider).is_none())
+}
+
+pub fn provider_agent(provider: &str) -> Result<AcpAgent, String> {
     let launch = launch();
-    let npx = launch.npx.as_ref().ok_or(NODE_MISSING)?;
-    // npx's `#!/usr/bin/env node` finds node through the child's PATH, so it gets the full one too.
+    AcpAgent::from_args(provider_args(launch, provider)?).map_err(|err| describe(&err))
+}
+
+fn provider_args(launch: &Launch, provider: &str) -> Result<Vec<String>, String> {
+    if let Some(missing) = missing_for(launch, provider) { return Err(missing.into()); }
     let path = launch.path.to_str().ok_or("PATH is not valid Unicode")?;
-    AcpAgent::from_args([format!("PATH={path}"), npx.display().to_string(), "--yes".into(), package.into()])
-        .map_err(|err| describe(&err))
+    if provider == "Grok" {
+        Ok(vec![format!("PATH={path}"), launch.grok.as_ref().unwrap().display().to_string(), "agent".into(), "stdio".into()])
+    } else {
+        let package = if provider == "Codex" { "@agentclientprotocol/codex-acp" } else { "@agentclientprotocol/claude-agent-acp" };
+        Ok(vec![format!("PATH={path}"), launch.npx.as_ref().unwrap().display().to_string(), "--yes".into(), package.into()])
+    }
 }
 
 /// A readable message for a protocol error. The crate wraps errors from its tasks with the
@@ -68,7 +83,8 @@ fn launch() -> &'static Launch {
             None => inherited,
         };
         let npx = find_in(if cfg!(windows) { "npx.cmd" } else { "npx" }, &path);
-        Launch { path, npx }
+        let grok = find_in(if cfg!(windows) { "grok.exe" } else { "grok" }, &path);
+        Launch { path, npx, grok }
     })
 }
 
@@ -136,6 +152,20 @@ fn shell_path() -> Option<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_commands_and_requirements_are_independent() {
+        let mut launch = Launch { path: "test-path".into(), npx: None, grok: Some(PathBuf::from("grok-test")) };
+        assert_eq!(provider_args(&launch, "Grok").unwrap(), ["PATH=test-path", "grok-test", "agent", "stdio"]);
+        assert_eq!(missing_for(&launch, "Codex"), Some(NODE_MISSING));
+        assert_eq!(missing_for(&launch, "Claude"), Some(NODE_MISSING));
+        launch.npx = Some(PathBuf::from("npx-test"));
+        launch.grok = None;
+        assert_eq!(provider_args(&launch, "Grok"), Err(GROK_MISSING.into()));
+        for (provider, package) in [("Claude", "@agentclientprotocol/claude-agent-acp"), ("Codex", "@agentclientprotocol/codex-acp")] {
+            assert_eq!(provider_args(&launch, provider).unwrap(), ["PATH=test-path", "npx-test", "--yes", package]);
+        }
+    }
 
     fn joined(dirs: &[&str]) -> OsString {
         std::env::join_paths(dirs).unwrap()

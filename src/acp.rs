@@ -299,6 +299,7 @@ pub enum Message {
 
 impl AcpState {
     pub fn claude() -> Self { Self { store_dir: crate::config_path("acp_threads"), ..Self::default() } }
+    pub fn grok() -> Self { Self { provider: "Grok", ..Self::claude() } }
     pub fn codex() -> Self { Self { provider: "Codex", ..Self::claude() } }
 
     pub fn provider(&self) -> &'static str { self.provider }
@@ -615,7 +616,7 @@ impl AcpState {
             };
 
             runtime.block_on(async move {
-                let agent = match crate::agent_launch::agent(if provider == "Codex" { "@agentclientprotocol/codex-acp" } else { "@agentclientprotocol/claude-agent-acp" })
+                let agent = match crate::agent_launch::provider_agent(provider)
                 {
                     Ok(agent) => agent,
                     Err(err) => {
@@ -864,8 +865,8 @@ impl AcpState {
     /// before the first prompt. Done once per conversation: a start that failed is retried
     /// by sending or opening the model menu, not on every tick.
     pub fn connect_for_display(&mut self, cwd: &Path) {
-        // Not before `npx` is known to exist: without it the start would only add an error.
-        if crate::agent_launch::node_found() && self.claim_auto_connect() {
+        // Wait until the provider executable is known to exist.
+        if crate::agent_launch::provider_found(self.provider) && self.claim_auto_connect() {
             self.connect(cwd.to_path_buf());
         }
     }
@@ -1074,8 +1075,8 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
     }
     let project = cwd.file_name().unwrap_or(cwd.as_os_str()).to_string_lossy().into_owned();
     header = header.push(text(format!("Project · {project}")).size(12).style(iced::widget::text::secondary));
-    if crate::agent_launch::node_missing() {
-        header = header.push(container(text(crate::agent_launch::NODE_MISSING).size(12)).padding(8).width(Length::Fill).style(container::danger));
+    if let Some(missing) = crate::agent_launch::provider_missing(state.provider) {
+        header = header.push(container(text(missing).size(12)).padding(8).width(Length::Fill).style(container::danger));
     }
 
     let labeled_copyable = |label: &'static str, index: usize, content: &str, markdown: bool| -> Element<'_, Message> {
@@ -1326,7 +1327,7 @@ fn threads_file(cwd: &Path, provider: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     cwd.hash(&mut hasher);
     let hash = hasher.finish();
-    if provider == "Claude" { format!("{hash:x}.json") } else { format!("{hash:x}-codex.json") }
+    if provider == "Claude" { format!("{hash:x}.json") } else { format!("{hash:x}-{}.json", provider.to_ascii_lowercase()) }
 }
 
 pub(crate) async fn change_model(connection: &ConnectionTo<Agent>, session: &SessionId, config_id: &str, value: &str) -> Result<ModelOptions, String> {
@@ -1860,6 +1861,26 @@ mod tests {
         state.streaming = true;
         state.delete_thread(1);
         assert_eq!(state.threads.len(), 2);
+    }
+
+    #[test]
+    fn grok_history_round_trips_without_reading_other_providers() {
+        let store = tempfile::tempdir().unwrap();
+        let project = store.path().join("project");
+        let mut grok = AcpState { provider: "Grok", store_dir: Some(store.path().to_path_buf()), ..Default::default() };
+        grok.ensure_loaded(&project);
+        grok.entries.push(Entry::User { content: "Grok question".into() });
+        grok.new_thread(&project);
+        let mut reloaded = AcpState { provider: "Grok", store_dir: Some(store.path().to_path_buf()), ..Default::default() };
+        reloaded.ensure_loaded(&project);
+        assert_eq!(reloaded.threads[0].title, "Grok question");
+        for provider in ["Claude", "Codex"] {
+            let mut other = AcpState { provider, store_dir: Some(store.path().to_path_buf()), ..Default::default() };
+            other.ensure_loaded(&project);
+            assert!(other.threads[0].entries.is_empty());
+            assert_ne!(threads_file(&project, provider), threads_file(&project, "Grok"));
+        }
+        assert_eq!(AcpState::grok().provider(), "Grok");
     }
 
     #[test]

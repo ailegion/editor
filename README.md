@@ -6,7 +6,7 @@ A minimal, no-bloat code editor in Rust, built on `iced`.
 
 - Single-pane text editor with syntax highlighting (`syntect`)
 - Left sidebar: project file tree, create/rename/delete, keyboard navigation (arrows to move/open/expand/collapse)
-- Right sidebar: AI chat with Claude or Codex (ACP) or any OpenAI-compatible endpoint, with Markdown replies, saved conversations, and file edits reviewed as diffs
+- Right sidebar: AI chat with Claude, Codex, or Grok (ACP) or any OpenAI-compatible endpoint, with Markdown replies, saved conversations, and file edits reviewed as diffs
 - AI inline edits (Cmd/Ctrl+K), explain/refactor/fix actions, and AI-written commit messages
 - Integrated PTY terminal with ANSI colors, 5,000 lines of scrollback, and a resizable bottom panel
 - Status bar with AI and terminal visibility toggles
@@ -20,8 +20,8 @@ A minimal, no-bloat code editor in Rust, built on `iced`.
 
 ## AI assistant
 
-The AI sidebar has one provider picker: **Local / Ollama / API**, **Claude ACP**, and
-**Codex ACP**. Each provider keeps its own conversations and draft, saved separately for
+The AI sidebar has one provider picker: **Local / Ollama / API**, **Claude ACP**,
+**Codex ACP**, and **Grok ACP**. Each provider keeps its own conversations and draft, saved separately for
 each project. The history button lists the 10 most recently active conversations, with
 search, rename, delete, and **Show all** for older ones.
 
@@ -33,6 +33,11 @@ ACP starts `npx --yes @agentclientprotocol/claude-agent-acp` or
 `npx --yes @agentclientprotocol/codex-acp`. Node/npm must be on PATH; configure the agent's
 credentials before chatting. Codex adapter setup: https://github.com/agentclientprotocol/codex-acp.
 The first launch may download the adapter. Connection errors appear in the conversation.
+
+Grok ACP starts `grok agent stdio` directly and does not require Node/npm. Install
+[Grok Build](https://grok.com/build), sign in through its CLI, and ensure `grok` is on
+PATH (`grok.exe` on Windows), then restart the editor. Grok uses the same tool approval
+controls as the other ACP providers.
 
 - Drag project-tree files or external files/images onto the AI message composer.
   The composer highlights while dragging; drops elsewhere do not attach files.
@@ -53,7 +58,7 @@ The first launch may download the adapter. Connection errors appear in the conve
   selection or file with AI; the status bar's wand asks the AI to fix the problem on the
   caret's line.
 - The source control panel's sparkles button writes a commit message from the staged diff,
-  matching the style of recent commits. With Claude or Codex this starts a short separate
+  matching the style of recent commits. With Claude, Codex, or Grok this starts a short separate
   agent session that is not allowed to change files.
 - File edits made by the AI show **View diff**, which opens them in the diff viewer.
 - The Local / API assistant can read, search, create and edit files (`edit_file` replaces
