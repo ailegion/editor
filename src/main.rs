@@ -21,6 +21,7 @@ mod grok_auth;
 mod cursor_agent;
 mod cursor_auth;
 mod codex_auth;
+mod claude_auth;
 mod terminal;
 mod chat;
 mod code_editor;
@@ -2627,6 +2628,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             state.chat.poll();
             state.acp.poll();
+            if let Some(request) = state.acp.take_terminal_login() {
+                state.terminal.open_claude_login(request, &cwd);
+                if !state.terminal_visible { task = Task::batch([task, update(state, Message::TerminalToggle)]); }
+                state.terminal.set_focused(true);
+                task = Task::batch([task, iced::widget::operation::focus("terminal-canvas")]);
+            }
             state.codex.poll();
             state.grok.poll();
             state.cursor.poll();

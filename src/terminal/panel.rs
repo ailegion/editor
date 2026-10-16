@@ -294,6 +294,17 @@ impl Panel {
         self.menu_open = false;
     }
 
+    pub fn open_claude_login(&mut self, request: crate::claude_auth::Request, cwd: &Path) {
+        self.set_focused(false);
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut terminal = Terminal::default();
+        terminal.start_command(cwd, Some(request.login.command()), Some(request.completion));
+        self.tabs.push(Tab { id, name: request.login.name, terminal });
+        self.active = Some(id);
+        self.menu_open = false;
+    }
+
     pub fn ensure_started(&mut self, cwd: &Path) {
         if self.tabs.is_empty() {
             let saved = crate::config_path("terminal_shell")

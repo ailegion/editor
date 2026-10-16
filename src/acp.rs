@@ -5,9 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 
-use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest,
+    CancelNotification, ContentBlock, LoadSessionRequest, NewSessionRequest,
     PermissionOptionId, PermissionOptionKind, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigValueId, SessionId, SessionNotification,
     SessionUpdate, SetSessionConfigOptionRequest, TextContent, ToolCallStatus,
@@ -169,6 +168,7 @@ enum Event {
     SettingChanged(Setting, Result<SessionConfig, String>),
     SessionId(String),
     Auth(crate::grok_auth::Update),
+    ClaudeLogins(Vec<crate::claude_auth::Login>),
     Permission(PendingPermission),
     ToolCall {
         id: String,
@@ -191,6 +191,9 @@ pub struct AcpState {
     auth: Option<crate::grok_auth::Update>,
     auth_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::grok_auth::Command>>,
     auth_code: String,
+    claude_logins: Vec<crate::claude_auth::Login>,
+    terminal_login: Option<crate::claude_auth::Request>,
+    login_result: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
     /// Where conversations are saved; `None` keeps them in memory only (tests).
     store_dir: Option<PathBuf>,
     session_grants: std::collections::HashSet<String>,
@@ -239,6 +242,9 @@ impl Default for AcpState {
             auth: None,
             auth_tx: None,
             auth_code: String::new(),
+            claude_logins: Vec::new(),
+            terminal_login: None,
+            login_result: None,
             store_dir: None,
             session_grants: Default::default(),
             loaded: false,
@@ -281,6 +287,7 @@ impl Default for AcpState {
 pub enum Message {
     Composer(crate::ai_composer::Action),
     SignIn,
+    ClaudeSignIn(usize),
     CancelSignIn,
     AuthCode(String),
     SubmitAuthCode,
@@ -348,7 +355,39 @@ impl AcpState {
         }));
     }
 
+    pub fn take_terminal_login(&mut self) -> Option<crate::claude_auth::Request> {
+        self.terminal_login.take()
+    }
+
+    fn start_claude_login(&mut self, index: usize) {
+        if self.provider != "Claude" || self.streaming || self.login_result.is_some() { return; }
+        let Some(login) = self.claude_logins.get(index).cloned() else { return; };
+        let methods = self.claude_logins.clone();
+        self.reset_connection();
+        self.claude_logins = methods;
+        let (completion, result) = tokio::sync::oneshot::channel();
+        self.terminal_login = Some(crate::claude_auth::Request { login, completion });
+        self.login_result = Some(result);
+        self.auth = Some(crate::grok_auth::Update::Waiting);
+        // Reconnect only after the CLI finishes. Existing CLI login remains reusable.
+        self.auto_connected = true;
+    }
+
     pub fn poll(&mut self) {
+        if let Some(result) = &mut self.login_result {
+            match result.try_recv() {
+                Ok(Ok(())) => self.reset_connection(),
+                Ok(Err(error)) => {
+                    self.login_result = None;
+                    self.auth = Some(crate::grok_auth::Update::Failed(error));
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    self.login_result = None;
+                    self.auth = Some(crate::grok_auth::Update::Failed("Claude Code login was cancelled. Try again.".into()));
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
         self.poll_events();
         self.sync_selectable();
     }
@@ -400,6 +439,7 @@ impl AcpState {
                     self.usage = Some(Usage { used, size, cost });
                 }
                 Event::SessionId(id) => new_session_id = Some(id),
+                Event::ClaudeLogins(methods) => self.claude_logins = methods,
                 Event::Auth(update) => {
                     if update == crate::grok_auth::Update::SignedIn { self.auth = None; self.auth_code.clear(); }
                     else { self.auth = Some(update); }
@@ -584,6 +624,9 @@ impl AcpState {
     }
 
     fn reset_connection(&mut self) {
+        self.claude_logins.clear();
+        self.terminal_login = None;
+        self.login_result = None;
         self.auth = None;
         self.auth_tx = None;
         self.auth_code.clear();
@@ -758,10 +801,13 @@ impl AcpState {
                     )
                     .connect_with(agent, move |connection: ConnectionTo<Agent>| async move {
                         let init_response = connection
-                            .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                            .send_request(crate::claude_auth::initialize(provider))
                             .block_task()
                             .await?;
 
+                        if provider == "Claude" {
+                            let _ = loop_tx.send(Event::ClaudeLogins(crate::claude_auth::methods(&init_response)));
+                        }
                         if provider == "Grok" {
                             crate::grok_auth::authenticate(&connection, &init_response, Some(&mut auth_rx), |update| {
                                 let _ = loop_tx.send(Event::Auth(update));
@@ -871,7 +917,7 @@ impl AcpState {
 
     fn send(&mut self, cwd: PathBuf) {
         let text = self.input.text();
-        if (text.trim().is_empty() && self.attachments.is_empty()) || self.streaming || self.model_switching || self.effort_switching {
+        if (text.trim().is_empty() && self.attachments.is_empty()) || self.streaming || self.model_switching || self.effort_switching || self.login_result.is_some() {
             return;
         }
         let text = text.trim_end().to_string();
@@ -895,6 +941,7 @@ impl AcpState {
 
     /// Starts (or resumes) the active thread's agent session if it is not running yet.
     fn connect(&mut self, cwd: PathBuf) {
+        if self.login_result.is_some() { return; }
         let resume_session_id = self
             .threads
             .get(self.active_thread)
@@ -1032,6 +1079,7 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
     state.ensure_loaded(&cwd);
     state.cwd = Some(cwd.clone());
     match message {
+        Message::ClaudeSignIn(index) => state.start_claude_login(index),
         Message::SignIn => {
             if state.auth_tx.as_ref().is_none_or(|tx| tx.is_closed()) { state.reset_connection(); state.connect(cwd); }
             if let Some(tx) = &state.auth_tx { let _ = tx.send(crate::grok_auth::Command::SignIn); }
@@ -1039,7 +1087,9 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
         Message::CancelSignIn => {
             if let Some(tx) = &state.auth_tx { let _ = tx.send(crate::grok_auth::Command::Cancel); }
             // Drop queued prompts with this attempt so they cannot run after a later sign-in.
+            let methods = state.claude_logins.clone();
             state.reset_connection();
+            state.claude_logins = methods;
             state.auth = Some(crate::grok_auth::Update::Required);
             state.auto_connected = true;
         }
@@ -1150,10 +1200,15 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
             Update::Required | Update::Failed(_) => {
                 login = login.push(text(format!("Sign in to {} to start chatting.", state.provider)).size(13));
                 if let Update::Failed(error) = auth { login = login.push(text(error).size(12)); }
-                login = login.push(button(text(format!("Sign in with {}", state.provider))).on_press(Message::SignIn));
+                if state.provider != "Claude" {
+                    login = login.push(button(text(format!("Sign in with {}", state.provider))).on_press(Message::SignIn));
+                }
             }
             Update::Waiting | Update::Link { .. } => {
-                login = login.push(text("Complete sign-in in your browser. Chat will continue automatically.").size(13));
+                let instructions = if state.provider == "Claude" {
+                    "Complete Claude Code login in the terminal tab and browser. Claude reconnects when the command finishes."
+                } else { "Complete sign-in in your browser. Chat will continue automatically." };
+                login = login.push(text(instructions).size(13));
                 if let Update::Link { url, can_paste } = auth {
                     login = login.push(text(url).size(12));
                     if url.starts_with("https://") || url.starts_with("http://") {
@@ -1169,6 +1224,13 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
             Update::SignedIn => {}
         }
         header = header.push(container(login).padding(8).width(Length::Fill).style(container::bordered_box));
+    }
+
+    if state.provider == "Claude" && state.login_result.is_none() {
+        for (index, method) in state.claude_logins.iter().enumerate() {
+            header = header.push(button(text(format!("Sign in: {}", method.name)).size(12))
+                .on_press_maybe((!state.streaming).then_some(Message::ClaudeSignIn(index))));
+        }
     }
 
     let labeled_copyable = |label: &'static str, index: usize, content: &str, markdown: bool| -> Element<'_, Message> {
@@ -1368,7 +1430,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
         crate::icon_control(lucide_icons::Icon::CircleStop, "Stop response", (!state.stopping).then_some(Message::Stop), false)
     } else {
         crate::icon_control(lucide_icons::Icon::SendHorizonal, "Send message (Cmd/Ctrl+Enter)",
-            (!state.model_switching && !state.effort_switching && !awaiting_permission && (!state.input.text().trim().is_empty() || !state.attachments.is_empty())).then_some(Message::Send), false)
+            (state.login_result.is_none() && !state.model_switching && !state.effort_switching && !awaiting_permission && (!state.input.text().trim().is_empty() || !state.attachments.is_empty())).then_some(Message::Send), false)
     };
     bottom = bottom.push("composer", crate::ai_composer::view(
         column![
@@ -1491,6 +1553,94 @@ fn select_options(option: &agent_client_protocol::schema::v1::SessionConfigOptio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn claude_login_state() -> AcpState {
+        let mut state = AcpState::default();
+        state.ensure_loaded(Path::new("project"));
+        state.claude_logins = vec![crate::claude_auth::Login {
+            command: "synthetic-node".into(), args: vec!["synthetic-adapter.js".into(), "--cli".into(), "auth".into(), "login".into()],
+            env: Default::default(), name: "Claude Subscription".into(),
+        }];
+        state.set_input("draft preserved");
+        state.entries.push(Entry::User { content: "earlier conversation".into() });
+        state
+    }
+
+    #[test]
+    fn claude_login_waits_for_cli_success_then_allows_reconnection() {
+        let mut state = claude_login_state();
+        let _ = update(&mut state, Message::ClaudeSignIn(0), PathBuf::from("project"));
+        let request = state.take_terminal_login().unwrap();
+        assert_eq!(request.login.name, "Claude Subscription");
+        assert!(state.take_terminal_login().is_none());
+        assert_eq!(state.auth, Some(crate::grok_auth::Update::Waiting));
+        assert!(!state.claim_auto_connect());
+        // Neither Enter nor the model menu may connect while login is running.
+        state.send(PathBuf::from("project"));
+        state.connect(PathBuf::from("project"));
+        assert!(!state.started && !state.streaming);
+        assert_eq!(state.input.text(), "draft preserved");
+        state.poll();
+        assert!(state.login_result.is_some());
+        request.completion.send(Ok(())).unwrap();
+        state.poll();
+        assert!(state.login_result.is_none() && state.auth.is_none());
+        assert!(state.claim_auto_connect());
+        assert_eq!(state.input.text(), "draft preserved");
+        assert!(matches!(&state.entries[0], Entry::User { content } if content == "earlier conversation"));
+    }
+
+    #[test]
+    fn claude_login_failure_or_closed_terminal_can_be_retried() {
+        for failed in [false, true] {
+            let mut state = claude_login_state();
+            state.start_claude_login(0);
+            let request = state.take_terminal_login().unwrap();
+            if failed { request.completion.send(Err("login failed".into())).unwrap(); }
+            else { drop(request); }
+            state.poll();
+            assert!(matches!(state.auth, Some(crate::grok_auth::Update::Failed(_))));
+            assert!(!state.claim_auto_connect());
+            state.start_claude_login(0);
+            assert!(state.take_terminal_login().is_some());
+            assert_eq!(state.input.text(), "draft preserved");
+        }
+    }
+
+    #[test]
+    fn claude_login_cancellation_and_project_changes_cancel_only_that_attempt() {
+        for change_project in [false, true] {
+            let mut state = claude_login_state();
+            state.start_claude_login(0);
+            let request = state.take_terminal_login().unwrap();
+            if change_project { state.ensure_loaded(Path::new("other project")); }
+            else { let _ = update(&mut state, Message::CancelSignIn, PathBuf::from("project")); }
+            assert!(request.completion.is_closed());
+            assert!(state.login_result.is_none());
+            if change_project { assert!(state.claude_logins.is_empty()); }
+            else {
+                assert!(!state.claim_auto_connect());
+                state.start_claude_login(0);
+                assert!(state.take_terminal_login().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn claude_terminal_login_requires_an_advertised_method_and_idle_claude() {
+        for provider in ["Claude", "Codex", "Grok", "Cursor"] {
+            let mut state = claude_login_state();
+            state.provider = provider;
+            state.start_claude_login(99);
+            assert!(state.take_terminal_login().is_none());
+            state.streaming = true;
+            state.start_claude_login(0);
+            assert!(state.take_terminal_login().is_none());
+            state.streaming = false;
+            state.start_claude_login(0);
+            assert_eq!(state.take_terminal_login().is_some(), provider == "Claude");
+        }
+    }
 
     #[test]
     fn cursor_history_and_sign_in_remain_separate_from_other_providers() {

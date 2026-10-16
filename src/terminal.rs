@@ -101,6 +101,10 @@ pub enum Message {
 
 impl Terminal {
     pub fn start(&mut self, cwd: &Path) {
+        self.start_command(cwd, self.shell.as_ref().map(portable_pty::CommandBuilder::new), None);
+    }
+
+    fn start_command(&mut self, cwd: &Path, command: Option<portable_pty::CommandBuilder>, completion: Option<crate::claude_auth::Completion>) {
         let size = self.parser.screen().size();
         self.shutdown();
         self.parser = new_parser();
@@ -114,11 +118,12 @@ impl Terminal {
         self.directory = cwd.display().to_string();
         self.status = "Starting shell…".into();
         backend::spawn(
-            self.shell.clone(),
+            command,
             cwd.to_path_buf(),
             size,
             commands,
             events,
+            completion,
         );
     }
 

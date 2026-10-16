@@ -42,8 +42,18 @@ required, click **Sign in with Codex** and finish in the browser opened by the
 Codex ACP adapter. The editor sends only the adapter's advertised `chat-gpt`
 authentication request; the official Codex process handles OAuth and credentials.
 Sign-in can be cancelled or retried. Inline edits and commit messages reuse the
-saved login and direct unsigned users to the chat panel. Claude authentication
-continues to be configured in its CLI.
+saved login and direct unsigned users to the chat panel.
+
+For **Claude ACP**, existing Claude Code CLI authentication is reused. To sign in
+or renew an expired login, choose **Sign in: Claude Subscription** or **Sign in:
+Anthropic Console** in the chat panel. The editor runs the adapter's advertised
+terminal login command in a separate terminal tab, using the same `terminal-auth`
+extension as Zed. The adapter delegates to its bundled Claude Code CLI, which
+handles browser authorization and stores credentials. Claude reconnects when the
+command succeeds; your conversation and draft are preserved. Cancel from the chat
+panel or close the login terminal tab to stop the attempt. Login choices are shown
+only when the adapter advertises them; remote sessions may offer an interactive
+Claude login instead.
 
 For Grok, click **Sign in with Grok** in the chat panel, then **Open sign-in page**
 and finish in your browser. Chat continues automatically. If the browser cannot
