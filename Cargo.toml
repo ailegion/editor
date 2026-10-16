@@ -10,7 +10,7 @@ base64 = "0.22"
 # Clipboard images pasted into the AI composer (iced's clipboard is text-only). `image` is
 # already in the tree via iced's "image" feature; here it PNG-encodes the clipboard's RGBA.
 arboard = "3.6"
-image = { version = "0.25.9", default-features = false, features = ["png"] }
+image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "ico"] }
 # `file://` URIs for language servers. Already in the tree.
 percent-encoding = "2"
 agent-client-protocol = "2.0.0"

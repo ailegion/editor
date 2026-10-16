@@ -33,6 +33,7 @@ mod titlebar;
 mod completion;
 mod git_graph;
 mod git_preview;
+mod image_preview;
 mod goto_line;
 mod project_search;
 mod quick_open;
@@ -96,6 +97,7 @@ struct Tab {
     hover: Option<code_editor::Hover>,
     /// Rendered Markdown shown instead of the editor, while the preview is on.
     preview: Option<ai_markdown::Cache>,
+    image: Option<image_preview::Preview>,
 }
 
 impl Tab {
@@ -118,6 +120,7 @@ impl Tab {
     }
 
     fn refresh_dirty(&mut self) {
+        if self.image.is_some() { self.dirty = false; return; }
         self.dirty = self.saved_text.as_deref() != Some(self.content.text().as_str());
     }
 
@@ -303,6 +306,7 @@ enum Message {
     GitPanelToggle,
     GitPreviewLoaded(PathBuf, String, Result<String, String>),
     CloseGitPreview,
+    ImageLoaded(u64, Result<image_preview::Decoded, String>),
     GitPreviewScrolled(bool, f32),
     GitGraphOpen,
     GitGraph(git_graph::Message),
@@ -637,7 +641,7 @@ impl State {
                     saved_text: recovery.path.as_ref().and_then(|path| std::fs::read_to_string(path).ok())
                         .map(|text| text.replace("\r\n", "\n").replace('\r', "\n")),
                     search: Default::default(), line_ending: LineEnding::detect(&recovery.text), diff: Default::default(),
-                    diagnostics: Vec::new(), blame: Vec::new(), hover: None, preview: None,
+                    diagnostics: Vec::new(), blame: Vec::new(), hover: None, preview: None, image: None,
                 };
                 tab.refresh_dirty();
                 if let Some(index) = state.tabs.iter().position(|tab| tab.path == recovery.path) {
@@ -774,6 +778,11 @@ impl State {
                 continue;
             }
             let Some(path) = tab.path.clone() else { continue };
+            if let Some(preview) = &mut tab.image {
+                *preview = image_preview::Preview::new();
+                tasks.push(load_image_task(path, preview.request));
+                continue;
+            }
             if let Ok(text) = std::fs::read_to_string(&path) {
                 if text != tab.content.text() {
                     let extension = tab.extension();
@@ -799,9 +808,10 @@ impl State {
         }
     }
 
-    /// A diff or the commit graph covers the editor, so editing keys must not reach the hidden tab.
+    /// Read-only views must not receive text editing or saving actions.
     fn editor_hidden(&self) -> bool {
         self.git_preview.is_some() || self.git_graph.is_some()
+            || self.tabs.get(self.active_tab).is_some_and(|tab| tab.image.is_some())
     }
 
     /// Uncovers the editor: closes the diff view and the commit graph.
@@ -821,9 +831,12 @@ impl State {
             recent_files::record(&mut self.recent_files, path.clone());
             return Task::none();
         }
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err) => { self.notify(format!("Could not open {}: {err}", path.display())); return Task::none(); }
+        let image = image_preview::supported(&path).then(image_preview::Preview::new);
+        let text = if image.is_some() { String::new() } else {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(err) => { self.notify(format!("Could not open {}: {err}", path.display())); return Task::none(); }
+            }
         };
         let extension = path
             .extension()
@@ -835,8 +848,12 @@ impl State {
         content.set_wrap(self.word_wrap);
         recent_files::record(&mut self.recent_files, path.clone());
         self.lsp.set_root(&self.root_or_cwd());
-        self.lsp.open(&path, text.clone());
-        let task = load_diff_task(self.git.repo(), self.root.as_deref(), path.clone(), text);
+        let task = if let Some(preview) = &image {
+            load_image_task(path.clone(), preview.request)
+        } else {
+            self.lsp.open(&path, text.clone());
+            load_diff_task(self.git.repo(), self.root.as_deref(), path.clone(), text)
+        };
         self.tabs.push(Tab {
             path: Some(path),
             saved_text: Some(content.text()),
@@ -847,7 +864,7 @@ impl State {
             diff: std::collections::HashMap::new(),
             diagnostics: Vec::new(), blame: Vec::new(),
             hover: None,
-            preview: None,
+            preview: None, image,
         });
         self.active_tab = self.tabs.len() - 1;
         task
@@ -1086,7 +1103,7 @@ impl State {
         }
         if self.gutter_due.is_some_and(|due| std::time::Instant::now() >= due) {
             self.gutter_due = None;
-            if let Some(tab) = self.tabs.get(self.active_tab) {
+            if let Some(tab) = self.tabs.get(self.active_tab).filter(|tab| tab.image.is_none()) {
                 if let Some(path) = tab.path.clone() {
                     tasks.push(load_diff_task(self.git.repo(), self.root.as_deref(), path, tab.content.text()));
                 }
@@ -1109,6 +1126,7 @@ impl State {
     fn reload_all_diffs(&self) -> Task<Message> {
         let repo = self.git.repo();
         Task::batch(self.tabs.iter().filter_map(|tab| {
+            if tab.image.is_some() { return None; }
             let path = tab.path.clone()?;
             Some(load_diff_task(repo.clone(), self.root.as_deref(), path, tab.content.text()))
         }))
@@ -1275,6 +1293,7 @@ impl State {
     }
 
     fn ai_act(&mut self, act: AiAct) -> Task<Message> {
+        if self.tabs.get(self.active_tab).is_some_and(|tab| tab.image.is_some()) { return Task::none(); }
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
             self.notify("Open a file first");
             return Task::none();
@@ -1667,6 +1686,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::CloseGitPreview => state.git_preview = None,
+        Message::ImageLoaded(request, result) => {
+            if let Some(preview) = state.tabs.iter_mut().filter_map(|tab| tab.image.as_mut()).find(|preview| preview.request == request) {
+                preview.receive(request, result);
+            }
+        }
         Message::GitGraphOpen => {
             if state.git.repo().is_none() {
                 state.git_info("This folder is not inside a Git repository.");
@@ -3107,7 +3131,7 @@ fn menu_button_maybe<'a>(label: String, msg: Option<Message>) -> iced::widget::b
 fn command_list(state: &State) -> Vec<command_palette::Command> {
     use command_palette::Command;
 
-    let active_content = state.tabs.get(state.active_tab).map(|t| &t.content);
+    let active_content = state.tabs.get(state.active_tab).filter(|tab| tab.image.is_none()).map(|t| &t.content);
     let can_undo = active_content.is_some_and(|c| c.can_undo());
     let can_redo = active_content.is_some_and(|c| c.can_redo());
     let has_active_tab = state.tabs.get(state.active_tab).is_some();
@@ -3193,7 +3217,7 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
         )),
     );
 
-    let active_content = state.tabs.get(state.active_tab).map(|t| &t.content);
+    let active_content = state.tabs.get(state.active_tab).filter(|tab| tab.image.is_none()).map(|t| &t.content);
     let can_undo = active_content.is_some_and(|c| c.can_undo());
     let can_redo = active_content.is_some_and(|c| c.can_redo());
 
@@ -3341,7 +3365,7 @@ fn view_status_bar(state: &State) -> Element<'_, Message> {
         ));
     }
 
-    if let Some(tab) = state.tabs.get(state.active_tab) {
+    if let Some(tab) = state.tabs.get(state.active_tab).filter(|tab| tab.image.is_none()) {
         let (line, col) = tab.content.cursor_line_col();
         let language = state.highlighter.language_name(&tab.extension());
         bar = bar.push(text(format!("Ln {line}, Col {col}")).size(12));
@@ -3470,7 +3494,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
     use iced_swdir_tree::IconTheme;
     let mut tab_row = row![].spacing(1).padding([2, 4]);
     for (i, tab) in state.tabs.iter().enumerate() {
-        let is_active = !state.editor_hidden() && i == state.active_tab;
+        let is_active = state.git_preview.is_none() && state.git_graph.is_none() && i == state.active_tab;
         let path = tab.path.as_deref().unwrap_or_else(|| Path::new("Untitled"));
         let spec = file_icons::FileIcons.file_glyph(path);
         let color = file_icons::FileIcons.file_color(path);
@@ -3600,6 +3624,9 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             crumbs = crumbs.push(icon_control(lucide_icons::Icon::Folder, "Reveal in files", Some(Message::RevealPath(path.clone())), false));
             editor_column = editor_column.push(scrollable(crumbs.padding([0, 8]))
                 .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())));
+        }
+        if let Some(preview) = &tab.image {
+            return editor_frame(tab_row, editor_column.push(image_preview::view(preview)));
         }
         if let Some(document) = tab.preview.as_ref().and_then(|preview| ai_markdown::view_document(preview, &state.app_theme.iced, Message::MarkdownPreview)) {
             editor_column = editor_column.push(scrollable(container(container(document).max_width(860))
@@ -4159,6 +4186,12 @@ fn load_diff_task(repo: Option<std::sync::Arc<git::repo::Repo>>, root: Option<&P
     })])
 }
 
+fn load_image_task(path: PathBuf, request: u64) -> Task<Message> {
+    Task::perform(async move {
+        tokio::task::spawn_blocking(move || image_preview::load(&path)).await.map_err(|error| error.to_string())?
+    }, move |result| Message::ImageLoaded(request, result))
+}
+
 fn load_preview_task(repo: Option<std::sync::Arc<git::repo::Repo>>, root: PathBuf, path: String) -> Task<Message> {
     Task::perform(git_preview::load(repo, root.clone(), path.clone()), move |result| {
         Message::GitPreviewLoaded(root.clone(), path.clone(), result)
@@ -4501,7 +4534,7 @@ mod saved_state_tests {
             search: Default::default(),
             line_ending: LineEnding::Lf,
             diff: Default::default(),
-            diagnostics: Vec::new(), blame: Vec::new(), hover: None, preview: None,
+            diagnostics: Vec::new(), blame: Vec::new(), hover: None, preview: None, image: None,
         };
         assert!(tab_for(Some("docs/README.md"), "").is_markdown());
         assert!(tab_for(Some("NOTES.Markdown"), "").is_markdown());
@@ -4524,6 +4557,22 @@ mod saved_state_tests {
     }
 
     #[test]
+    fn image_tabs_never_become_dirty_text_buffers() {
+        let mut tab = Tab {
+            path: Some(PathBuf::from("photo.png")),
+            content: code_editor::Buffer::new("", code_editor::metrics_for_zoom(1.0)),
+            saved_text: Some(String::new()), dirty: false, search: Default::default(),
+            line_ending: LineEnding::Lf, diff: Default::default(), diagnostics: Vec::new(),
+            blame: Vec::new(), hover: None, preview: None, image: Some(image_preview::Preview::new()),
+        };
+        tab.content.perform(cosmic_text::Action::Insert('x'));
+        tab.refresh_dirty();
+        assert!(!tab.dirty);
+        assert_eq!(tab.title(), "photo.png");
+        assert!(tab.image.is_some());
+    }
+
+    #[test]
     fn undo_and_redo_compare_text_with_the_latest_save() {
         let mut tab = Tab {
             path: None,
@@ -4533,7 +4582,7 @@ mod saved_state_tests {
             search: Default::default(),
             line_ending: LineEnding::Lf,
             diff: Default::default(),
-            diagnostics: Vec::new(), blame: Vec::new(), hover: None, preview: None,
+            diagnostics: Vec::new(), blame: Vec::new(), hover: None, preview: None, image: None,
         };
         tab.content.goto(0, 2);
         tab.content.perform(cosmic_text::Action::Backspace);

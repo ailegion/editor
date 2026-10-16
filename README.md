@@ -5,6 +5,7 @@ A minimal, no-bloat code editor in Rust, built on `iced`.
 ## Features
 
 - Single-pane text editor with syntax highlighting (`syntect`)
+- Read-only PNG, JPEG, WebP, GIF, BMP, and ICO image tabs with zoom and pan; GIF previews show the first frame. Decoding runs in Rust without external tools.
 - Left sidebar: project file tree, create/rename/delete, keyboard navigation (arrows to move/open/expand/collapse)
 - Right sidebar: AI chat with Claude, Codex, Grok, or Cursor (ACP) or any OpenAI-compatible endpoint, with Markdown replies, saved conversations, and file edits reviewed as diffs
 - AI inline edits (Cmd/Ctrl+K), explain/refactor/fix actions, and AI-written commit messages
