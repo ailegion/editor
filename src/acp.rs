@@ -197,6 +197,7 @@ pub struct AcpState {
     /// Where conversations are saved; `None` keeps them in memory only (tests).
     store_dir: Option<PathBuf>,
     session_grants: std::collections::HashSet<String>,
+    allow_all_session: bool,
     loaded: bool,
     cwd: Option<PathBuf>,
     threads: Vec<Thread>,
@@ -227,6 +228,7 @@ pub struct AcpState {
     just_finished: bool,
     history: crate::ai_history::Menu,
     stopping: bool,
+    // Toggled entries: thinking defaults open; tool details default closed.
     expanded_thinking: Vec<usize>,
     /// Selectable copies of `entries`' message text, kept in step by `sync_selectable`.
     selectable: crate::ai_selectable::Cache,
@@ -247,6 +249,7 @@ impl Default for AcpState {
             login_result: None,
             store_dir: None,
             session_grants: Default::default(),
+            allow_all_session: false,
             loaded: false,
             cwd: None,
             threads: Vec::new(),
@@ -311,6 +314,7 @@ pub enum Message {
     PermissionChosen(String),
     RememberPermission(bool),
     ResetPermissions,
+    AllowAllSession,
     Copy(String),
     /// Selection or caret movement inside message `usize`'s text.
     Selectable(usize, text_editor::Action),
@@ -328,6 +332,10 @@ impl AcpState {
     pub fn preferred_model(&self) -> Option<String> { self.preferred_model.clone() }
 
     pub fn input_text(&self) -> String { self.input.text() }
+
+    fn thinking_expanded(&self, index: usize) -> bool {
+        !self.expanded_thinking.contains(&index)
+    }
 
     /// Replaces the draft, leaving the caret at the end.
     pub fn set_input(&mut self, text: &str) {
@@ -357,6 +365,11 @@ impl AcpState {
 
     pub fn take_terminal_login(&mut self) -> Option<crate::claude_auth::Request> {
         self.terminal_login.take()
+    }
+
+    fn show_claude_logins(&self) -> bool {
+        self.provider == "Claude" && !self.streaming && self.login_result.is_none()
+            && matches!(self.auth, Some(crate::grok_auth::Update::Required | crate::grok_auth::Update::Failed(_)))
     }
 
     fn start_claude_login(&mut self, index: usize) {
@@ -446,7 +459,7 @@ impl AcpState {
                 }
                 Event::Permission(pending) => {
                     if self.stopping || finished { continue; }
-                    if pending.scope.as_ref().is_some_and(|scope| self.session_grants.contains(scope)) && pending.allow_once.is_some() {
+                    if (self.allow_all_session || pending.scope.as_ref().is_some_and(|scope| self.session_grants.contains(scope))) && pending.allow_once.is_some() {
                         let _ = pending.respond.send(pending.allow_once.unwrap());
                     } else { self.permission_queue.push_back(pending); }
                 }
@@ -477,6 +490,7 @@ impl AcpState {
             self.model_switching = false;
             self.effort_switching = false;
             self.session_grants.clear();
+            self.allow_all_session = false;
             self.started = false;
             self.prompt_tx = None;
             self.cancel_tx = None;
@@ -631,6 +645,7 @@ impl AcpState {
         self.auth_tx = None;
         self.auth_code.clear();
         self.session_grants.clear();
+        self.allow_all_session = false;
         self.models = None;
         self.models_reported = false;
         self.model_switching = false;
@@ -852,6 +867,9 @@ impl AcpState {
                             }
                         };
                         // Apply the remembered model before the first prompt can be sent.
+                        if provider == "Claude" {
+                            let _ = loop_tx.send(Event::Auth(crate::grok_auth::Update::SignedIn));
+                        }
                         let mut config = SessionConfig::from_options(&config_options);
                         if let Some(preferred) = &preferred_model {
                             let _ = loop_tx.send(Event::Config(config.clone()));
@@ -900,6 +918,9 @@ impl AcpState {
                                     let _ = loop_tx.send(Event::Done);
                                 }
                                 Err(err) => {
+                                    if provider == "Claude" && err.code == agent_client_protocol::Error::auth_required().code {
+                                        let _ = loop_tx.send(Event::Auth(crate::grok_auth::Update::Required));
+                                    }
                                     let _ = loop_tx.send(Event::Error(crate::agent_launch::describe(&err)));
                                 }
                             }
@@ -909,6 +930,9 @@ impl AcpState {
                     .await;
 
                 if let Err(err) = result {
+                    if provider == "Claude" && err.code == agent_client_protocol::Error::auth_required().code {
+                        let _ = tx.send(Event::Auth(crate::grok_auth::Update::Required));
+                    }
                     let _ = tx.send(Event::Error(crate::agent_launch::describe(&err)));
                 }
             });
@@ -1154,7 +1178,24 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
         Message::InputChanged(action) => state.input.perform(action),
         Message::Send => state.send(cwd),
         Message::Stop => state.stop(),
-        Message::ResetPermissions => state.session_grants.clear(),
+        Message::ResetPermissions => {
+            state.session_grants.clear();
+            state.allow_all_session = false;
+        }
+        Message::AllowAllSession => {
+            if !state.stopping && state.pending_permission.as_ref().is_some_and(|pending| pending.allow_once.is_some()) {
+                state.allow_all_session = true;
+                let pending = state.pending_permission.take().unwrap();
+                let _ = pending.respond.send(pending.allow_once.unwrap());
+                let mut waiting = std::collections::VecDeque::new();
+                while let Some(pending) = state.permission_queue.pop_front() {
+                    if let Some(id) = pending.allow_once { let _ = pending.respond.send(id); }
+                    else { waiting.push_back(pending); }
+                }
+                state.permission_queue = waiting;
+                state.pending_permission = state.permission_queue.pop_front();
+            }
+        }
         Message::RememberPermission(remember) => {
             if let Some(pending) = &mut state.pending_permission { pending.remember = remember; }
         }
@@ -1226,7 +1267,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
         header = header.push(container(login).padding(8).width(Length::Fill).style(container::bordered_box));
     }
 
-    if state.provider == "Claude" && state.login_result.is_none() {
+    if state.show_claude_logins() {
         for (index, method) in state.claude_logins.iter().enumerate() {
             header = header.push(button(text(format!("Sign in: {}", method.name)).size(12))
                 .on_press_maybe((!state.streaming).then_some(Message::ClaudeSignIn(index))));
@@ -1323,7 +1364,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
             }
             Entry::User { content } => labeled_copyable("You", i, content, false),
             Entry::Thinking { content } => {
-                let expanded = state.expanded_thinking.contains(&i);
+                let expanded = state.thinking_expanded(i);
                 let mut section = column![button(if expanded { "Hide thinking" } else { "Show thinking" })
                     .style(crate::flat_button_style).on_press(Message::ToggleThinking(i))];
                 if expanded { section = section.push(text(content.clone()).size(13).style(iced::widget::text::secondary)); }
@@ -1365,13 +1406,16 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
             Choice { label, kind: style, message: Message::PermissionChosen(id.clone()) }
         }).collect();
         choices.sort_by_key(|choice| match choice.kind { ChoiceKind::Reject => 0, ChoiceKind::Allow => 1, ChoiceKind::Other => 2 });
+        if pending.allow_once.is_some() {
+            choices.push(Choice { label: "Allow everything for this session".into(), kind: ChoiceKind::Other, message: Message::AllowAllSession });
+        }
         extras.push(crate::ai_approval::view(Card {
             title: pending.title.clone(), details: pending.details.clone(), choices,
             remember: (pending.allow_once.is_some() && pending.scope.is_some()).then_some((pending.remember, Message::RememberPermission)),
             copy: Message::Copy(pending.details.clone()),
         }));
     }
-    if !state.session_grants.is_empty() {
+    if state.allow_all_session || !state.session_grants.is_empty() {
         extras.push(button("Reset session approvals").style(crate::flat_button_style).on_press(Message::ResetPermissions).into());
     }
     let can_switch = !state.streaming && !state.model_switching && !state.effort_switching;
@@ -1554,6 +1598,26 @@ fn select_options(option: &agent_client_protocol::schema::v1::SessionConfigOptio
 mod tests {
     use super::*;
 
+    #[test]
+    fn thinking_defaults_open_for_every_provider_and_can_still_be_toggled() {
+        for provider in ["Claude", "Cursor", "Grok", "Codex"] {
+            let mut state = AcpState { provider, ..AcpState::default() };
+            AcpState::append_chunk(&mut state.entries, "Thinking".into(), true);
+            assert!(state.thinking_expanded(0), "{provider}");
+            let project = PathBuf::from("project");
+            let _ = update(&mut state, Message::ToggleThinking(0), project.clone());
+            assert!(!state.thinking_expanded(0));
+            AcpState::append_chunk(&mut state.entries, " more".into(), true);
+            assert!(!state.thinking_expanded(0));
+            let _ = update(&mut state, Message::ToggleThinking(0), project);
+            assert!(state.thinking_expanded(0));
+            // Reopening a thread restores the default for saved thinking too.
+            state.reset_connection();
+            assert!(state.thinking_expanded(0));
+            assert!(state.expanded_thinking.is_empty());
+        }
+    }
+
     fn claude_login_state() -> AcpState {
         let mut state = AcpState::default();
         state.ensure_loaded(Path::new("project"));
@@ -1564,6 +1628,35 @@ mod tests {
         state.set_input("draft preserved");
         state.entries.push(Entry::User { content: "earlier conversation".into() });
         state
+    }
+
+    #[test]
+    fn claude_login_buttons_require_auth_and_hide_during_chat() {
+        let mut state = claude_login_state();
+        // Advertised methods alone say nothing about saved credentials.
+        assert!(!state.show_claude_logins());
+        state.auth = Some(crate::grok_auth::Update::Required);
+        assert!(state.show_claude_logins());
+        state.streaming = true;
+        assert!(!state.show_claude_logins());
+        state.streaming = false;
+        state.auth = Some(crate::grok_auth::Update::Failed("retry".into()));
+        assert!(state.show_claude_logins());
+        state.start_claude_login(0);
+        assert!(!state.show_claude_logins());
+    }
+
+    #[test]
+    fn claude_successful_session_clears_sign_in_buttons() {
+        let mut state = claude_login_state();
+        state.auth = Some(crate::grok_auth::Update::Required);
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.rx = Some(rx);
+        tx.send(Event::Auth(crate::grok_auth::Update::SignedIn)).unwrap();
+        state.poll_events();
+        assert!(state.auth.is_none());
+        assert!(!state.claude_logins.is_empty());
+        assert!(!state.show_claude_logins());
     }
 
     #[test]
@@ -1968,6 +2061,68 @@ mod tests {
     fn permission(scope: &str) -> (PendingPermission, tokio::sync::oneshot::Receiver<String>) {
         let (respond, rx) = tokio::sync::oneshot::channel();
         (PendingPermission { title: "Edit file".into(), details: "replacement".into(), scope: Some(scope.into()), allow_once: Some("accept".into()), options: vec![], remember: false, respond }, rx)
+    }
+
+    #[test]
+    fn allow_everything_approves_current_queued_and_future_requests_for_all_acp_providers() {
+        for provider in ["Claude", "Cursor", "Codex", "Grok"] {
+            let mut state = AcpState { provider, ..AcpState::default() };
+            let (tx, rx) = mpsc::channel();
+            state.rx = Some(rx);
+            let (first, mut first_reply) = permission("first");
+            let (second, mut second_reply) = permission("different");
+            tx.send(Event::Permission(first)).unwrap();
+            tx.send(Event::Permission(second)).unwrap();
+            state.poll();
+            let _ = update(&mut state, Message::AllowAllSession, PathBuf::from("project"));
+            assert_eq!(first_reply.try_recv().unwrap(), "accept");
+            assert_eq!(second_reply.try_recv().unwrap(), "accept");
+            assert!(state.pending_permission.is_none() && state.permission_queue.is_empty());
+            tx.send(Event::Done).unwrap();
+            state.poll();
+            let (mut future, mut future_reply) = permission("unrelated");
+            future.scope = None;
+            future.allow_once = Some("different-allow-id".into());
+            tx.send(Event::Permission(future)).unwrap();
+            state.poll();
+            assert_eq!(future_reply.try_recv().unwrap(), "different-allow-id");
+            let _ = update(&mut state, Message::ResetPermissions, PathBuf::from("project"));
+            assert!(!state.allow_all_session);
+            let (next, mut next_reply) = permission("next");
+            tx.send(Event::Permission(next)).unwrap();
+            state.poll();
+            assert!(next_reply.try_recv().is_err());
+            let _ = update(&mut state, Message::AllowAllSession, PathBuf::from("project"));
+            assert_eq!(next_reply.try_recv().unwrap(), "accept");
+            state.reset_connection();
+            assert!(!state.allow_all_session);
+        }
+    }
+
+    #[test]
+    fn allow_everything_preserves_unapprovable_requests_and_stop() {
+        let mut state = AcpState::default();
+        let (tx, rx) = mpsc::channel();
+        state.rx = Some(rx);
+        let (first, mut first_reply) = permission("first");
+        let (mut unsupported, mut unsupported_reply) = permission("unsupported");
+        unsupported.allow_once = None;
+        tx.send(Event::Permission(first)).unwrap();
+        tx.send(Event::Permission(unsupported)).unwrap();
+        state.poll();
+        let _ = update(&mut state, Message::AllowAllSession, PathBuf::from("project"));
+        assert_eq!(first_reply.try_recv().unwrap(), "accept");
+        assert!(unsupported_reply.try_recv().is_err());
+        assert!(state.pending_permission.is_some());
+        state.stop();
+        let (late, mut late_reply) = permission("late");
+        tx.send(Event::Permission(late)).unwrap();
+        state.poll();
+        assert!(matches!(late_reply.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)));
+        assert!(state.allow_all_session);
+        state.reset_connection();
+        let _ = update(&mut state, Message::AllowAllSession, PathBuf::from("project"));
+        assert!(!state.allow_all_session);
     }
 
     #[test]

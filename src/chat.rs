@@ -160,6 +160,7 @@ enum ConnectionStatus {
 pub struct ChatState {
     pub attachments: Vec<crate::ai_context::Attachment>,
     session_grants: std::collections::HashSet<String>,
+    allow_all_session: bool,
     cwd: Option<PathBuf>,
     /// Where conversations are saved; `None` keeps them in memory only (tests).
     store_dir: Option<PathBuf>,
@@ -194,6 +195,7 @@ impl Default for ChatState {
         Self {
             attachments: Vec::new(),
             session_grants: Default::default(),
+            allow_all_session: false,
             cwd: None,
             store_dir: None,
             threads: vec![ChatThread::default()],
@@ -248,6 +250,7 @@ pub enum Message {
     Copy(String),
     PermissionChosen(bool),
     RememberPermission(bool),
+    AllowAllSession,
     ResetPermissions,
     OllamaPreset,
     /// Selection or caret movement inside message `usize`'s text.
@@ -300,6 +303,7 @@ impl ChatState {
             self.save_current_thread();
             self.persist(&previous);
             self.session_grants.clear();
+            self.allow_all_session = false;
             self.attachments.clear();
             self.input = text_editor::Content::new();
         }
@@ -371,6 +375,7 @@ impl ChatState {
         self.messages = self.threads[self.active_thread].messages.clone();
         self.attachments.clear();
         self.session_grants.clear();
+        self.allow_all_session = false;
         if let Some(cwd) = self.cwd.clone() { self.persist(&cwd); }
     }
 
@@ -384,6 +389,7 @@ impl ChatState {
             self.active_thread = self.threads.len() - 1;
             self.messages = self.threads[self.active_thread].messages.clone();
             self.session_grants.clear();
+            self.allow_all_session = false;
         } else if index < self.active_thread {
             self.active_thread -= 1;
         }
@@ -451,7 +457,7 @@ impl ChatState {
                 }
                 Event::FileChanged => self.files_changed = true,
                 Event::PermissionRequest(pending) => {
-                    if self.session_grants.contains(&pending.label) { let _ = pending.respond.send(true); }
+                    if self.allow_all_session || self.session_grants.contains(&pending.label) { let _ = pending.respond.send(true); }
                     else { self.pending_permission = Some(pending); }
                 },
                 Event::Done => finished = true,
@@ -568,6 +574,7 @@ impl ChatState {
     /// card is enough to get back to a working, connected state.
     fn load_connection(&mut self, index: usize) {
         self.session_grants.clear();
+        self.allow_all_session = false;
         let Some(conn) = self.connections.get(index) else { return };
         self.connection_name = conn.name.clone();
         self.base_url = conn.base_url.clone();
@@ -593,6 +600,7 @@ pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Mes
         Message::ConnectionNameChanged(text) => state.connection_name = text,
         Message::BaseUrlChanged(text) => {
             state.session_grants.clear();
+            state.allow_all_session = false;
             state.base_url = text;
             state.test_rx = None;
             state.connection_status = ConnectionStatus::Idle;
@@ -600,6 +608,7 @@ pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Mes
         }
         Message::ApiKeyChanged(text) => {
             state.session_grants.clear();
+            state.allow_all_session = false;
             state.api_key = text;
             state.test_rx = None;
             state.connection_status = ConnectionStatus::Idle;
@@ -640,13 +649,23 @@ pub fn update(state: &mut ChatState, message: Message, cwd: PathBuf) -> Task<Mes
         Message::OllamaPreset => {
             state.connection_form_open = true;
             state.session_grants.clear();
+            state.allow_all_session = false;
             state.base_url = "http://localhost:11434/v1".into();
             state.api_key.clear();
             state.connection_name = "Ollama".into();
             state.test_connection();
             return reveal_connection_form();
         }
-        Message::ResetPermissions => state.session_grants.clear(),
+        Message::ResetPermissions => {
+            state.session_grants.clear();
+            state.allow_all_session = false;
+        }
+        Message::AllowAllSession => {
+            if let Some(pending) = state.pending_permission.take() {
+                state.allow_all_session = true;
+                let _ = pending.respond.send(true);
+            }
+        }
         Message::RememberPermission(remember) => {
             if let Some(pending) = &mut state.pending_permission { pending.remember = remember; }
         }
@@ -844,12 +863,13 @@ pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>)
             choices: vec![
                 Choice { label: "Reject".into(), message: Message::PermissionChosen(false), kind: ChoiceKind::Reject },
                 Choice { label: if pending.remember { "Allow for session" } else { "Allow once" }.into(), message: Message::PermissionChosen(true), kind: ChoiceKind::Allow },
+                Choice { label: "Allow everything for this session".into(), message: Message::AllowAllSession, kind: ChoiceKind::Other },
             ],
             remember: Some((pending.remember, Message::RememberPermission)),
             copy: Message::Copy(details),
         }));
     }
-    if !state.session_grants.is_empty() { extras.push(button("Reset session approvals").style(crate::flat_button_style).on_press(Message::ResetPermissions).into()); }
+    if state.allow_all_session || !state.session_grants.is_empty() { extras.push(button("Reset session approvals").style(crate::flat_button_style).on_press(Message::ResetPermissions).into()); }
     let mut bottom = iced::widget::keyed::Column::new().spacing(4);
     if !extras.is_empty() {
         bottom = bottom.push("extras", iced::widget::column(extras).spacing(4));
@@ -1582,6 +1602,32 @@ mod tests {
         granted.session_grants.insert("write_file".into());
         assert!(crate::tree_focus::keeps_focus(view(&pending, composer), view(&granted, composer)));
         assert!(crate::tree_focus::keeps_focus(view(&ChatState::default(), composer), view(&pending, composer)));
+    }
+
+    #[test]
+    fn allow_everything_approves_current_and_future_requests_until_reset() {
+        let mut state = ChatState::default();
+        let (tx, rx) = mpsc::channel();
+        state.rx = Some(rx);
+        let (respond, reply) = mpsc::channel();
+        state.pending_permission = Some(PendingPermission { remember: false, label: "first".into(), diff: None, respond });
+        let _ = update(&mut state, Message::AllowAllSession, PathBuf::from("project"));
+        assert!(reply.try_recv().unwrap());
+        assert!(state.allow_all_session);
+        let (respond, reply) = mpsc::channel();
+        tx.send(Event::PermissionRequest(PendingPermission { remember: false, label: "different".into(), diff: None, respond })).unwrap();
+        state.poll_events();
+        assert!(reply.try_recv().unwrap());
+        let _ = update(&mut state, Message::ResetPermissions, PathBuf::from("project"));
+        assert!(!state.allow_all_session);
+        let (respond, reply) = mpsc::channel();
+        tx.send(Event::PermissionRequest(PendingPermission { remember: false, label: "next".into(), diff: None, respond })).unwrap();
+        state.poll_events();
+        assert!(reply.try_recv().is_err());
+        let _ = update(&mut state, Message::AllowAllSession, PathBuf::from("project"));
+        assert!(reply.try_recv().unwrap());
+        state.set_project(Path::new("another project"));
+        assert!(!state.allow_all_session);
     }
 
     #[test]
