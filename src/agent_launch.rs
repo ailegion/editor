@@ -42,14 +42,20 @@ fn missing_for_provider(launch: &Launch, provider: &str) -> Option<&'static str>
     } else { missing_for(launch) }
 }
 
+/// For one-off answers: Claude starts from its installed version without checking it.
 pub fn provider_agent(provider: &str) -> Result<AcpAgent, String> {
-    provider_agent_with_progress(provider, |_| {})
+    start_agent(provider, false, |_| {})
 }
 
+/// For the AI panel: Claude's install is checked, and updated or repaired, first.
 pub fn provider_agent_with_progress(provider: &str, progress: impl FnMut(&str)) -> Result<AcpAgent, String> {
+    start_agent(provider, true, progress)
+}
+
+fn start_agent(provider: &str, check: bool, progress: impl FnMut(&str)) -> Result<AcpAgent, String> {
     let launch = launch();
     if provider == "Claude" {
-        return crate::claude_agent::agent(&launch.path, progress);
+        return crate::claude_agent::agent(&launch.path, check, progress);
     }
     let args = if provider == "Cursor" {
         let package = crate::cursor_agent::ensure()?;
