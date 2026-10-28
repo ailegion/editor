@@ -2,6 +2,7 @@
 
 mod about;
 mod agent_launch;
+mod claude_agent;
 mod ai_usage;
 mod updater;
 mod ai_approval;

@@ -1,4 +1,4 @@
-//! Starting Claude, Codex and Grok through `npx`. Apps opened from Finder or
+//! Starting ACP agents with the user's Node toolchain. Apps opened from Finder or
 //! the Dock inherit launchd's minimal `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`), which misses
 //! Homebrew, nvm and similar, so on macOS and Linux the user's shell is asked for its `PATH`
 //! once, when an ACP chat is first opened, and put in front of the inherited one.
@@ -25,7 +25,7 @@ pub fn warm_up() {
 
 pub fn provider_missing(provider: &str) -> Option<&'static str> {
     if provider == "Cursor" { return None; }
-    LAUNCH.get().and_then(missing_for)
+    LAUNCH.get().and_then(|launch| missing_for_provider(launch, provider))
 }
 
 fn missing_for(launch: &Launch) -> Option<&'static str> {
@@ -33,11 +33,24 @@ fn missing_for(launch: &Launch) -> Option<&'static str> {
 }
 
 pub fn provider_found(provider: &str) -> bool {
-    provider == "Cursor" || LAUNCH.get().is_some_and(|launch| missing_for(launch).is_none())
+    provider == "Cursor" || LAUNCH.get().is_some_and(|launch| missing_for_provider(launch, provider).is_none())
+}
+
+fn missing_for_provider(launch: &Launch, provider: &str) -> Option<&'static str> {
+    if provider == "Claude" {
+        find_in(if cfg!(windows) { "node.exe" } else { "node" }, &launch.path).is_none().then_some(NODE_MISSING)
+    } else { missing_for(launch) }
 }
 
 pub fn provider_agent(provider: &str) -> Result<AcpAgent, String> {
+    provider_agent_with_progress(provider, |_| {})
+}
+
+pub fn provider_agent_with_progress(provider: &str, progress: impl FnMut(&str)) -> Result<AcpAgent, String> {
     let launch = launch();
+    if provider == "Claude" {
+        return crate::claude_agent::agent(&launch.path, progress);
+    }
     let args = if provider == "Cursor" {
         let package = crate::cursor_agent::ensure()?;
         crate::cursor_agent::args(&package, cfg!(windows), launch.path.to_str().ok_or("PATH is not valid Unicode")?)
@@ -73,6 +86,38 @@ pub fn describe(err: &agent_client_protocol::Error) -> String {
     }
 }
 
+/// Keep only stderr, never protocol payloads (which can contain prompts and credentials).
+#[derive(Clone, Default)]
+pub struct Diagnostics(std::sync::Arc<std::sync::Mutex<String>>);
+
+impl Diagnostics {
+    pub fn attach(agent: AcpAgent) -> (AcpAgent, Self) {
+        let diagnostics = Self::default();
+        let capture = diagnostics.clone();
+        (agent.with_debug(move |line, direction| {
+            if matches!(direction, agent_client_protocol::LineDirection::Stderr) { capture.push(line); }
+        }), diagnostics)
+    }
+
+    fn push(&self, line: &str) {
+        let mut tail = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        tail.push_str(line);
+        tail.push('\n');
+        if tail.len() > 8192 {
+            let mut start = tail.len() - 8192;
+            while !tail.is_char_boundary(start) { start += 1; }
+            tail.drain(..start);
+        }
+    }
+
+    pub fn describe(&self, err: &agent_client_protocol::Error) -> String {
+        let message = describe(err);
+        let tail = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if tail.trim().is_empty() { message }
+        else { format!("{message}\nAgent stderr:\n{}", tail.trim()) }
+    }
+}
+
 static LAUNCH: OnceLock<Launch> = OnceLock::new();
 
 fn launch() -> &'static Launch {
@@ -96,7 +141,7 @@ fn merge_paths(front: &OsStr, back: &OsStr) -> OsString {
     std::env::join_paths(dirs).unwrap_or_else(|_| back.to_os_string())
 }
 
-fn find_in(program: &str, path: &OsStr) -> Option<PathBuf> {
+pub(crate) fn find_in(program: &str, path: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path).map(|dir| dir.join(program)).find(|candidate| candidate.is_file())
 }
 
@@ -151,6 +196,31 @@ fn shell_path() -> Option<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_requires_node_without_requiring_the_npx_shim() {
+        let root = tempfile::tempdir().unwrap();
+        let launch = Launch { path: std::env::join_paths([root.path()]).unwrap(), npx: None };
+        assert_eq!(missing_for_provider(&launch, "Claude"), Some(NODE_MISSING));
+        std::fs::write(root.path().join(if cfg!(windows) { "node.exe" } else { "node" }), "").unwrap();
+        assert_eq!(missing_for_provider(&launch, "Claude"), None);
+        for provider in ["Codex", "Grok"] {
+            assert_eq!(missing_for_provider(&launch, provider), Some(NODE_MISSING));
+        }
+    }
+
+    #[test]
+    fn startup_errors_include_bounded_unicode_safe_stderr() {
+        let diagnostics = Diagnostics::default();
+        let error = agent_client_protocol::Error::internal_error().data("incoming_transport_closed");
+        assert_eq!(diagnostics.describe(&error), describe(&error));
+        diagnostics.push(&"é".repeat(9000));
+        diagnostics.push("claude-agent-acp: Permission denied");
+        assert!(diagnostics.0.lock().unwrap().len() <= 8192);
+        let message = diagnostics.describe(&error);
+        assert!(message.contains("incoming_transport_closed"));
+        assert!(message.contains("claude-agent-acp: Permission denied"));
+    }
 
     #[test]
     fn cursor_can_start_without_node_or_npx_discovery() {

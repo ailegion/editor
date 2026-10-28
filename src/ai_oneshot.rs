@@ -63,8 +63,9 @@ fn http_reply(body: &str) -> Result<String, String> {
 
 async fn ask_agent(provider: &'static str, model: Option<String>, cwd: PathBuf, prompt: String) -> Result<String, String> {
     let agent = crate::agent_launch::provider_agent(provider)?;
+    let (agent, diagnostics) = crate::agent_launch::Diagnostics::attach(agent);
     let reply = Arc::new(Mutex::new(String::new()));
-    connect(agent, reply.clone(), cwd, prompt, model, provider).await.map_err(|err| crate::agent_launch::describe(&err))?;
+    connect(agent, reply.clone(), cwd, prompt, model, provider).await.map_err(|err| diagnostics.describe(&err))?;
     let reply = reply.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
     Ok(reply)
 }

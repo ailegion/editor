@@ -161,6 +161,7 @@ async fn run_prompt(
 }
 
 enum Event {
+    Startup(String),
     Delta(String),
     ThoughtDelta(String),
     Usage(u64, u64, Option<(f64, String)>),
@@ -210,6 +211,7 @@ pub struct AcpState {
     model_tx: Option<tokio::sync::mpsc::UnboundedSender<(Setting, String, String)>>,
     streaming: bool,
     started: bool,
+    startup_status: Option<String>,
     /// The session was already started for display once; see `connect_for_display`.
     auto_connected: bool,
     usage: Option<Usage>,
@@ -262,6 +264,7 @@ impl Default for AcpState {
             model_tx: None,
             streaming: false,
             started: false,
+            startup_status: None,
             auto_connected: false,
             usage: None,
             models: None,
@@ -419,6 +422,7 @@ impl AcpState {
         while let Ok(event) = rx.try_recv() {
             transcript_changed |= matches!(&event, Event::Delta(_) | Event::ThoughtDelta(_) | Event::ToolCall { .. } | Event::ToolCallUpdate { .. } | Event::ToolDetails(..) | Event::Error(_));
             match event {
+                Event::Startup(status) => self.startup_status = Some(status),
                 Event::Delta(text) => Self::append_chunk(&mut self.entries, text, false),
                 Event::ThoughtDelta(text) => Self::append_chunk(&mut self.entries, text, true),
                 Event::Config(config) => {
@@ -451,7 +455,7 @@ impl AcpState {
                 Event::Usage(used, size, cost) => {
                     self.usage = Some(Usage { used, size, cost });
                 }
-                Event::SessionId(id) => new_session_id = Some(id),
+                Event::SessionId(id) => { self.startup_status = None; new_session_id = Some(id); },
                 Event::ClaudeLogins(methods) => self.claude_logins = methods,
                 Event::Auth(update) => {
                     if update == crate::grok_auth::Update::SignedIn { self.auth = None; self.auth_code.clear(); }
@@ -477,6 +481,7 @@ impl AcpState {
                 }
                 Event::Done => finished = true,
                 Event::Error(err) => {
+                    if self.startup_status.is_some() { self.startup_status = Some("Connection failed".into()); }
                     Self::append_chunk(&mut self.entries, format!("\n[error: {err}]"), false);
                     finished = true;
                 }
@@ -485,6 +490,7 @@ impl AcpState {
         if self.pending_permission.is_none() { self.pending_permission = self.permission_queue.pop_front(); }
         let disconnected = self.prompt_tx.as_ref().is_some_and(|tx| tx.is_closed());
         if disconnected {
+            if self.startup_status.as_deref() != Some("Connection failed") { self.startup_status = Some("Disconnected".into()); }
             self.auth_tx = None;
             if self.auth.is_some() { self.auth = Some(crate::grok_auth::Update::Failed("Connection closed. Try signing in again.".into())); }
             self.model_switching = false;
@@ -658,6 +664,7 @@ impl AcpState {
         self.stopping = false;
         self.expanded_thinking.clear();
         self.started = false;
+        self.startup_status = None;
         self.auto_connected = false;
         self.rx = None;
         self.prompt_tx = None;
@@ -672,6 +679,7 @@ impl AcpState {
             return;
         }
         self.started = true;
+        self.startup_status = Some("Connecting…".into());
         let (auth_tx, mut auth_rx) = tokio::sync::mpsc::unbounded_channel();
         self.auth_tx = Some(auth_tx);
 
@@ -698,7 +706,9 @@ impl AcpState {
             };
 
             runtime.block_on(async move {
-                let agent = match crate::agent_launch::provider_agent(provider)
+                let agent = match crate::agent_launch::provider_agent_with_progress(provider, |status| {
+                    let _ = tx.send(Event::Startup(status.into()));
+                })
                 {
                     Ok(agent) => agent,
                     Err(err) => {
@@ -707,6 +717,7 @@ impl AcpState {
                     }
                 };
 
+                let (agent, diagnostics) = crate::agent_launch::Diagnostics::attach(agent);
                 let notify_tx = tx.clone();
                 let loop_tx = tx.clone();
                 let permission_tx = tx.clone();
@@ -814,6 +825,7 @@ impl AcpState {
                         },
                         agent_client_protocol::on_receive_request!(),
                     )
+                    .on_close(connection_closed)
                     .connect_with(agent, move |connection: ConnectionTo<Agent>| async move {
                         let init_response = connection
                             .send_request(crate::claude_auth::initialize(provider))
@@ -933,7 +945,7 @@ impl AcpState {
                     if provider == "Claude" && err.code == agent_client_protocol::Error::auth_required().code {
                         let _ = tx.send(Event::Auth(crate::grok_auth::Update::Required));
                     }
-                    let _ = tx.send(Event::Error(crate::agent_launch::describe(&err)));
+                    let _ = tx.send(Event::Error(diagnostics.describe(&err)));
                 }
             });
         });
@@ -988,6 +1000,14 @@ impl AcpState {
     }
 
     /// What the model button shows: the session's model, else the saved choice it will get.
+    fn status_label(&self, awaiting_permission: bool) -> &str {
+        if self.stopping { "Stopping…" }
+        else if awaiting_permission { "Waiting for approval" }
+        else if let Some(status) = &self.startup_status { status }
+        else if self.streaming { "Working…" }
+        else { "Ready" }
+    }
+
     fn model_label(&self) -> String {
         if self.model_switching { return "Switching…".into(); }
         let name = match (&self.models, &self.preferred_model) {
@@ -1484,7 +1504,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
                 .on_action(Message::InputChanged)
                 .min_height(50.0).max_height(290.0)
                 .key_binding(|key_press| crate::ai_composer::key_binding(key_press, Message::Send, Message::Composer)),
-            row![text(if state.stopping { "Stopping…" } else if awaiting_permission { "Waiting for approval" } else if state.streaming { "Working…" } else { "Ready" }).size(12).style(iced::widget::text::secondary), Space::new().width(Length::Fill), model_button].push(effort_button).push(usage_ring).push(send_button).spacing(6).align_y(iced::Alignment::Center),
+            row![text(state.status_label(awaiting_permission)).size(12).style(iced::widget::text::secondary), Space::new().width(Length::Fill), model_button].push(effort_button).push(usage_ring).push(send_button).spacing(6).align_y(iced::Alignment::Center),
         ]
         .spacing(4).into(),
         &state.attachments, composer, Message::Composer,
@@ -1594,9 +1614,74 @@ fn select_options(option: &agent_client_protocol::schema::v1::SessionConfigOptio
     })
 }
 
+async fn connection_closed(_connection: ConnectionTo<Agent>) -> agent_client_protocol::Result<()> {
+    Err(agent_client_protocol::Error::internal_error().data("Agent connection closed. Send a message or open the model menu to reconnect."))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_status_replaces_ready_until_session_creation_and_clears_on_reset() {
+        let mut state = AcpState::default();
+        let (tx, rx) = mpsc::channel();
+        state.rx = Some(rx);
+        assert_eq!(state.status_label(false), "Ready");
+        for status in ["Checking for updates…", "Installing…", "Updating…", "Connecting…"] {
+            tx.send(Event::Startup(status.into())).unwrap();
+            state.poll_events();
+            assert_eq!(state.status_label(false), status);
+            state.streaming = true;
+            assert_eq!(state.status_label(false), status);
+            state.streaming = false;
+        }
+        tx.send(Event::SessionId("ready-session".into())).unwrap();
+        state.poll_events();
+        assert_eq!(state.status_label(false), "Ready");
+        state.streaming = true;
+        assert_eq!(state.status_label(false), "Working…");
+        assert_eq!(state.status_label(true), "Waiting for approval");
+        state.stopping = true;
+        assert_eq!(state.status_label(true), "Stopping…");
+        state.reset_connection();
+        assert_eq!(state.status_label(false), "Ready");
+    }
+
+    #[test]
+    fn startup_failure_and_disconnect_never_claim_ready() {
+        for startup_failure in [false, true] {
+            let mut state = AcpState::default();
+            let (tx, rx) = mpsc::channel();
+            let (prompt_tx, prompt_rx) = tokio::sync::mpsc::unbounded_channel();
+            state.rx = Some(rx);
+            state.prompt_tx = Some(prompt_tx);
+            state.started = true;
+            if startup_failure {
+                tx.send(Event::Startup("Installing…".into())).unwrap();
+                tx.send(Event::Error("synthetic installation failure".into())).unwrap();
+            }
+            drop(prompt_rx);
+            state.poll_events();
+            assert_eq!(state.status_label(false), if startup_failure { "Connection failed" } else { "Disconnected" });
+            assert!(!state.started);
+            state.reset_connection();
+            assert_eq!(state.status_label(false), "Ready");
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_eof_terminates_idle_connection_instead_of_waiting_for_prompts() {
+        let (transport, peer) = agent_client_protocol::Channel::duplex();
+        drop(peer);
+        let result = agent_client_protocol::Client.builder()
+            .on_close(connection_closed)
+            .connect_with(transport, async |connection: ConnectionTo<Agent>| {
+                connection.incoming_closed().await;
+                Ok(())
+            }).await;
+        assert!(crate::agent_launch::describe(&result.unwrap_err()).contains("reconnect"));
+    }
 
     #[test]
     fn thinking_defaults_open_for_every_provider_and_can_still_be_toggled() {
