@@ -19,6 +19,34 @@ pub struct Card<M> {
     pub copy: M,
 }
 
+/// Autopilot is one setting for every AI panel, project and agent, kept across restarts.
+pub fn load_autopilot() -> bool {
+    crate::config_path("ai_autopilot").is_some_and(|path| read_flag(&path))
+}
+
+pub fn save_autopilot(on: bool) {
+    if let Some(path) = crate::config_path("ai_autopilot") { write_flag(&path, on); }
+}
+
+/// Off unless it was saved as on.
+fn read_flag(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|text| text.trim() == "true")
+}
+
+fn write_flag(path: &std::path::Path, on: bool) {
+    if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
+    let _ = std::fs::write(path, on.to_string());
+}
+
+/// The switch beside the send button.
+pub fn autopilot_toggle<'a, M: Clone + 'a>(on: bool, message: fn(bool) -> M) -> Element<'a, M> {
+    iced::widget::tooltip(
+        iced::widget::toggler(on).label("Autopilot").size(14).text_size(12).on_toggle(message),
+        container(text("Approve every request without asking").size(12)).padding(8).style(container::rounded_box),
+        iced::widget::tooltip::Position::Top,
+    ).into()
+}
+
 /// Longest title shown as-is; agents sometimes put a whole file or patch in the title.
 const TITLE_CHARS: usize = 160;
 
@@ -140,6 +168,19 @@ mod tests {
         assert!(preview.contains("cat \"a file\"\nGet-ChildItem C:\\project"));
         assert!(preview.contains("timeout\n3000"));
         assert!(preview.contains("\"flag\": true"));
+    }
+
+    #[test]
+    fn autopilot_is_off_until_saved_on_and_survives_a_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config").join("ai_autopilot");
+        assert!(!read_flag(&path));
+        write_flag(&path, true);
+        assert!(read_flag(&path), "a restart reads the saved setting");
+        write_flag(&path, false);
+        assert!(!read_flag(&path));
+        std::fs::write(&path, "garbage").unwrap();
+        assert!(!read_flag(&path));
     }
 
     #[test]

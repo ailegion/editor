@@ -198,7 +198,8 @@ pub struct AcpState {
     /// Where conversations are saved; `None` keeps them in memory only (tests).
     store_dir: Option<PathBuf>,
     session_grants: std::collections::HashSet<String>,
-    allow_all_session: bool,
+    /// Approves every request the agent lets the editor approve; saved until turned off.
+    autopilot: bool,
     loaded: bool,
     cwd: Option<PathBuf>,
     threads: Vec<Thread>,
@@ -251,7 +252,7 @@ impl Default for AcpState {
             login_result: None,
             store_dir: None,
             session_grants: Default::default(),
-            allow_all_session: false,
+            autopilot: false,
             loaded: false,
             cwd: None,
             threads: Vec::new(),
@@ -317,14 +318,14 @@ pub enum Message {
     PermissionChosen(String),
     RememberPermission(bool),
     ResetPermissions,
-    AllowAllSession,
+    Autopilot(bool),
     Copy(String),
     /// Selection or caret movement inside message `usize`'s text.
     Selectable(usize, text_editor::Action),
 }
 
 impl AcpState {
-    pub fn claude() -> Self { Self { store_dir: crate::config_path("acp_threads"), ..Self::default() } }
+    pub fn claude() -> Self { Self { store_dir: crate::config_path("acp_threads"), autopilot: crate::ai_approval::load_autopilot(), ..Self::default() } }
     pub fn cursor() -> Self { Self { provider: "Cursor", ..Self::claude() } }
     pub fn grok() -> Self { Self { provider: "Grok", ..Self::claude() } }
     pub fn codex() -> Self { Self { provider: "Codex", ..Self::claude() } }
@@ -333,6 +334,19 @@ impl AcpState {
 
     /// The model the user last picked, applied to new sessions.
     pub fn preferred_model(&self) -> Option<String> { self.preferred_model.clone() }
+
+    /// Turning autopilot on also approves the waiting and queued requests that can be approved.
+    pub fn set_autopilot(&mut self, on: bool) {
+        self.autopilot = on;
+        if !on || self.stopping { return; }
+        let mut waiting = std::collections::VecDeque::new();
+        for pending in self.pending_permission.take().into_iter().chain(self.permission_queue.drain(..)) {
+            if let Some(id) = pending.allow_once.clone() { let _ = pending.respond.send(id); }
+            else { waiting.push_back(pending); }
+        }
+        self.permission_queue = waiting;
+        self.pending_permission = self.permission_queue.pop_front();
+    }
 
     pub fn input_text(&self) -> String { self.input.text() }
 
@@ -463,7 +477,7 @@ impl AcpState {
                 }
                 Event::Permission(pending) => {
                     if self.stopping || finished { continue; }
-                    if (self.allow_all_session || pending.scope.as_ref().is_some_and(|scope| self.session_grants.contains(scope))) && pending.allow_once.is_some() {
+                    if (self.autopilot || pending.scope.as_ref().is_some_and(|scope| self.session_grants.contains(scope))) && pending.allow_once.is_some() {
                         let _ = pending.respond.send(pending.allow_once.unwrap());
                     } else { self.permission_queue.push_back(pending); }
                 }
@@ -496,7 +510,6 @@ impl AcpState {
             self.model_switching = false;
             self.effort_switching = false;
             self.session_grants.clear();
-            self.allow_all_session = false;
             self.started = false;
             self.prompt_tx = None;
             self.cancel_tx = None;
@@ -651,7 +664,6 @@ impl AcpState {
         self.auth_tx = None;
         self.auth_code.clear();
         self.session_grants.clear();
-        self.allow_all_session = false;
         self.models = None;
         self.models_reported = false;
         self.model_switching = false;
@@ -1198,24 +1210,8 @@ pub fn update(state: &mut AcpState, message: Message, cwd: PathBuf) -> Task<Mess
         Message::InputChanged(action) => state.input.perform(action),
         Message::Send => state.send(cwd),
         Message::Stop => state.stop(),
-        Message::ResetPermissions => {
-            state.session_grants.clear();
-            state.allow_all_session = false;
-        }
-        Message::AllowAllSession => {
-            if !state.stopping && state.pending_permission.as_ref().is_some_and(|pending| pending.allow_once.is_some()) {
-                state.allow_all_session = true;
-                let pending = state.pending_permission.take().unwrap();
-                let _ = pending.respond.send(pending.allow_once.unwrap());
-                let mut waiting = std::collections::VecDeque::new();
-                while let Some(pending) = state.permission_queue.pop_front() {
-                    if let Some(id) = pending.allow_once { let _ = pending.respond.send(id); }
-                    else { waiting.push_back(pending); }
-                }
-                state.permission_queue = waiting;
-                state.pending_permission = state.permission_queue.pop_front();
-            }
-        }
+        Message::ResetPermissions => state.session_grants.clear(),
+        Message::Autopilot(on) => state.set_autopilot(on),
         Message::RememberPermission(remember) => {
             if let Some(pending) = &mut state.pending_permission { pending.remember = remember; }
         }
@@ -1426,16 +1422,13 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
             Choice { label, kind: style, message: Message::PermissionChosen(id.clone()) }
         }).collect();
         choices.sort_by_key(|choice| match choice.kind { ChoiceKind::Reject => 0, ChoiceKind::Allow => 1, ChoiceKind::Other => 2 });
-        if pending.allow_once.is_some() {
-            choices.push(Choice { label: "Allow everything for this session".into(), kind: ChoiceKind::Other, message: Message::AllowAllSession });
-        }
         extras.push(crate::ai_approval::view(Card {
             title: pending.title.clone(), details: pending.details.clone(), choices,
             remember: (pending.allow_once.is_some() && pending.scope.is_some()).then_some((pending.remember, Message::RememberPermission)),
             copy: Message::Copy(pending.details.clone()),
         }));
     }
-    if state.allow_all_session || !state.session_grants.is_empty() {
+    if !state.session_grants.is_empty() {
         extras.push(button("Reset session approvals").style(crate::flat_button_style).on_press(Message::ResetPermissions).into());
     }
     let can_switch = !state.streaming && !state.model_switching && !state.effort_switching;
@@ -1504,7 +1497,8 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
                 .on_action(Message::InputChanged)
                 .min_height(50.0).max_height(290.0)
                 .key_binding(|key_press| crate::ai_composer::key_binding(key_press, Message::Send, Message::Composer)),
-            row![text(state.status_label(awaiting_permission)).size(12).style(iced::widget::text::secondary), Space::new().width(Length::Fill), model_button].push(effort_button).push(usage_ring).push(send_button).spacing(6).align_y(iced::Alignment::Center),
+            row![text(state.status_label(awaiting_permission)).size(12).style(iced::widget::text::secondary), Space::new().width(Length::Fill), model_button].push(effort_button).push(usage_ring)
+                .push(crate::ai_approval::autopilot_toggle(state.autopilot, Message::Autopilot)).push(send_button).spacing(6).align_y(iced::Alignment::Center),
         ]
         .spacing(4).into(),
         &state.attachments, composer, Message::Composer,
@@ -2149,7 +2143,7 @@ mod tests {
     }
 
     #[test]
-    fn allow_everything_approves_current_queued_and_future_requests_for_all_acp_providers() {
+    fn autopilot_approves_current_queued_and_future_requests_for_all_acp_providers() {
         for provider in ["Claude", "Cursor", "Codex", "Grok"] {
             let mut state = AcpState { provider, ..AcpState::default() };
             let (tx, rx) = mpsc::channel();
@@ -2159,7 +2153,7 @@ mod tests {
             tx.send(Event::Permission(first)).unwrap();
             tx.send(Event::Permission(second)).unwrap();
             state.poll();
-            let _ = update(&mut state, Message::AllowAllSession, PathBuf::from("project"));
+            let _ = update(&mut state, Message::Autopilot(true), PathBuf::from("project"));
             assert_eq!(first_reply.try_recv().unwrap(), "accept");
             assert_eq!(second_reply.try_recv().unwrap(), "accept");
             assert!(state.pending_permission.is_none() && state.permission_queue.is_empty());
@@ -2171,43 +2165,45 @@ mod tests {
             tx.send(Event::Permission(future)).unwrap();
             state.poll();
             assert_eq!(future_reply.try_recv().unwrap(), "different-allow-id");
+            // Reset clears only remembered approvals; a new connection keeps autopilot on.
+            state.session_grants.insert("remembered".into());
             let _ = update(&mut state, Message::ResetPermissions, PathBuf::from("project"));
-            assert!(!state.allow_all_session);
+            assert!(state.session_grants.is_empty() && state.autopilot);
+            state.reset_connection();
+            assert!(state.autopilot);
+            let (tx, rx) = mpsc::channel();
+            state.rx = Some(rx);
+            let _ = update(&mut state, Message::Autopilot(false), PathBuf::from("project"));
             let (next, mut next_reply) = permission("next");
             tx.send(Event::Permission(next)).unwrap();
             state.poll();
-            assert!(next_reply.try_recv().is_err());
-            let _ = update(&mut state, Message::AllowAllSession, PathBuf::from("project"));
-            assert_eq!(next_reply.try_recv().unwrap(), "accept");
-            state.reset_connection();
-            assert!(!state.allow_all_session);
+            assert!(next_reply.try_recv().is_err(), "off asks again");
+            assert!(state.pending_permission.is_some());
         }
     }
 
     #[test]
-    fn allow_everything_preserves_unapprovable_requests_and_stop() {
+    fn autopilot_preserves_unapprovable_requests_and_stop() {
         let mut state = AcpState::default();
         let (tx, rx) = mpsc::channel();
         state.rx = Some(rx);
-        let (first, mut first_reply) = permission("first");
         let (mut unsupported, mut unsupported_reply) = permission("unsupported");
         unsupported.allow_once = None;
-        tx.send(Event::Permission(first)).unwrap();
+        let (queued, mut queued_reply) = permission("queued");
         tx.send(Event::Permission(unsupported)).unwrap();
+        tx.send(Event::Permission(queued)).unwrap();
         state.poll();
-        let _ = update(&mut state, Message::AllowAllSession, PathBuf::from("project"));
-        assert_eq!(first_reply.try_recv().unwrap(), "accept");
+        // The waiting request cannot be approved: it stays, and the queued one is approved.
+        let _ = update(&mut state, Message::Autopilot(true), PathBuf::from("project"));
         assert!(unsupported_reply.try_recv().is_err());
-        assert!(state.pending_permission.is_some());
+        assert_eq!(queued_reply.try_recv().unwrap(), "accept");
+        assert!(state.pending_permission.as_ref().is_some_and(|pending| pending.allow_once.is_none()));
         state.stop();
         let (late, mut late_reply) = permission("late");
         tx.send(Event::Permission(late)).unwrap();
         state.poll();
         assert!(matches!(late_reply.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)));
-        assert!(state.allow_all_session);
-        state.reset_connection();
-        let _ = update(&mut state, Message::AllowAllSession, PathBuf::from("project"));
-        assert!(!state.allow_all_session);
+        assert!(state.autopilot);
     }
 
     #[test]

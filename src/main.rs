@@ -2603,6 +2603,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         | Message::Cursor(acp::Message::Markdown(ai_markdown::Action::Insert(code)))
         | Message::Grok(acp::Message::Markdown(ai_markdown::Action::Insert(code)))
         | Message::Codex(acp::Message::Markdown(ai_markdown::Action::Insert(code))) => state.insert_code(&code),
+        // One autopilot for every panel and agent, saved until turned off.
+        Message::Chat(chat::Message::Autopilot(on))
+        | Message::Acp(acp::Message::Autopilot(on))
+        | Message::Cursor(acp::Message::Autopilot(on))
+        | Message::Grok(acp::Message::Autopilot(on))
+        | Message::Codex(acp::Message::Autopilot(on)) => {
+            ai_approval::save_autopilot(on);
+            state.chat.set_autopilot(on);
+            for panel in [&mut state.acp, &mut state.cursor, &mut state.grok, &mut state.codex] { panel.set_autopilot(on); }
+        }
         Message::Cursor(msg) => {
             let cwd = state.root_or_cwd();
             let input = matches!(msg, acp::Message::InputChanged(_) | acp::Message::UsePrompt(_));
