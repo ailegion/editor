@@ -101,23 +101,59 @@ impl Server {
     /// The binary to run: the newest managed install, else the first hit on `PATH`.
     pub fn locate(&self) -> Option<PathBuf> {
         let file = self.binary_file();
-        if let Some(entries) = self.managed_dir().and_then(|dir| std::fs::read_dir(dir).ok()) {
-            let mut tags: Vec<PathBuf> = entries
-                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                .filter(|path| path.join(&file).is_file())
-                .collect();
-            tags.sort();
-            if let Some(newest) = tags.pop() { return Some(newest.join(&file)); }
-        }
+        if let Some(newest) = self.managed_dir().and_then(|dir| newest_install(&dir, &file)) { return Some(newest); }
         std::env::var_os("PATH")?
             .to_str()
             .and_then(|path| std::env::split_paths(path).map(|dir| dir.join(&file)).find(|candidate| candidate.is_file()))
     }
 }
 
+/// Deepest tag folders searched. A tag with a `/` installs one folder deeper, e.g. Biome's
+/// `@biomejs/biome@2.5.15`.
+const TAG_DEPTH: usize = 3;
+
+/// `file` in the last tag folder under `dir`, by path order.
+fn newest_install(dir: &Path, file: &str) -> Option<PathBuf> {
+    fn collect(dir: &Path, file: &str, depth: usize, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for path in entries.filter_map(|entry| entry.ok().map(|entry| entry.path())).filter(|path| path.is_dir()) {
+            let binary = path.join(file);
+            if binary.is_file() { found.push(binary); }
+            else if depth > 1 { collect(&path, file, depth - 1, found); }
+        }
+    }
+    let mut found = Vec::new();
+    collect(dir, file, TAG_DEPTH, &mut found);
+    found.sort();
+    found.pop()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installs_are_found_even_when_the_release_tag_has_a_slash() {
+        let root = tempfile::tempdir().unwrap();
+        let install = |tag: &str| {
+            let folder = root.path().join(tag);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("server"), "").unwrap();
+            folder.join("server")
+        };
+        assert_eq!(newest_install(root.path(), "server"), None);
+        std::fs::create_dir_all(root.path().join("empty-tag")).unwrap();
+        assert_eq!(newest_install(root.path(), "server"), None, "a tag folder without the binary does not count");
+        install("2024-01-01");
+        let newest = install("2024-02-01");
+        assert_eq!(newest_install(root.path(), "server"), Some(newest), "flat tags: the last by path order");
+
+        let nested = tempfile::tempdir().unwrap();
+        let folder = nested.path().join("@biomejs").join("biome@2.5.15");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("server"), "").unwrap();
+        assert_eq!(newest_install(nested.path(), "server"), Some(folder.join("server")));
+    }
 
     #[test]
     fn languages_map_to_servers_and_assets_follow_the_platform() {
