@@ -52,18 +52,96 @@ fn install_root() -> Result<PathBuf, String> {
 }
 
 fn lock_file(root: &Path) -> Result<File, String> {
-    let parent = root.parent().ok_or("Invalid installation path")?;
-    let name = root
-        .file_name()
-        .ok_or("Invalid installation name")?
-        .to_string_lossy();
     OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(parent.join(format!(".{name}.update-lock")))
+        .open(lock_path(root)?)
         .map_err(|e| format!("Installation is not writable: {e}"))
+}
+
+/// Where earlier versions kept the lock: beside the installation.
+fn sibling_lock(root: &Path) -> Result<PathBuf, String> {
+    let parent = root.parent().ok_or("Invalid installation path")?;
+    let name = root.file_name().ok_or("Invalid installation name")?.to_string_lossy();
+    Ok(parent.join(format!(".{name}.update-lock")))
+}
+
+/// Inside the installation; a macOS bundle can't be written to without breaking its
+/// signature, so there it stays beside the bundle.
+fn lock_path(root: &Path) -> Result<PathBuf, String> {
+    if cfg!(target_os = "macos") { sibling_lock(root) } else { Ok(root.join(".update-lock")) }
+}
+
+/// The one folder updates are staged in, on the installation's filesystem so the swap is
+/// renames: `.update` inside the installation, or `.editor-update` beside a macOS bundle.
+fn staging_dir(root: &Path) -> Result<PathBuf, String> {
+    if cfg!(target_os = "macos") {
+        Ok(root.parent().ok_or("Invalid installation path")?.join(".editor-update"))
+    } else {
+        Ok(root.join(".update"))
+    }
+}
+
+/// Folders earlier versions staged each update in, one per update, beside the installation.
+const LEGACY_PREFIX: &str = ".editor-update-";
+/// The previous version, kept until the next update replaces it.
+const BACKUP: &str = "backup";
+/// A backup made by an update that is not yet settled into [`BACKUP`].
+const NEW_BACKUP: &str = "backup-new";
+
+/// Makes the latest backup the only one.
+fn settle_backup(folder: &Path) {
+    let fresh = folder.join(NEW_BACKUP);
+    if !fresh.exists() { return; }
+    let backup = folder.join(BACKUP);
+    if backup.exists() && fs::remove_dir_all(&backup).is_err() { return; }
+    let _ = fs::rename(fresh, backup);
+}
+
+/// Leaves only the backup in `folder`. Anything still in use, like the helper that just
+/// installed an update, is removed by a later run.
+fn clear_staging(folder: &Path) -> Result<(), String> {
+    fs::create_dir_all(folder).map_err(|e| e.to_string())?;
+    settle_backup(folder);
+    for entry in fs::read_dir(folder).map_err(|e| e.to_string())?.filter_map(Result::ok) {
+        let name = entry.file_name();
+        if name == BACKUP || name == NEW_BACKUP { continue; }
+        let path = entry.path();
+        let _ = if path.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) };
+    }
+    Ok(())
+}
+
+/// Removes what earlier versions left beside the installation: one staging folder per
+/// update and, outside macOS, the lock file. The newest backup among them moves into the
+/// staging folder when it has none, so the previous version stays recoverable.
+fn remove_legacy(root: &Path, folder: &Path) {
+    let Some(parent) = root.parent() else { return };
+    let Ok(entries) = fs::read_dir(parent) else { return };
+    let mut legacy: Vec<(std::time::SystemTime, PathBuf)> = entries.filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(LEGACY_PREFIX) && entry.path().is_dir())
+        .map(|entry| (entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), entry.path()))
+        .collect();
+    legacy.sort();
+    if !folder.join(BACKUP).exists() {
+        if let Some((_, newest)) = legacy.iter().rev().find(|(_, path)| path.join(BACKUP).is_dir()) {
+            let _ = fs::create_dir_all(folder);
+            let _ = fs::rename(newest.join(BACKUP), folder.join(BACKUP));
+        }
+    }
+    for (_, path) in legacy { let _ = fs::remove_dir_all(path); }
+    if !cfg!(target_os = "macos") {
+        if let Ok(old) = sibling_lock(root) { let _ = fs::remove_file(old); }
+    }
+}
+
+/// Run before every update check, so an installed update's leftovers go on the next start.
+fn tidy(root: &Path) {
+    let Ok(folder) = staging_dir(root) else { return };
+    remove_legacy(root, &folder);
+    if folder.exists() { let _ = clear_staging(&folder); }
 }
 
 /// Keep a shared lock for the lifetime of each running editor. The helper waits for all instances.
@@ -78,7 +156,7 @@ enum Event {
     Finished(Result<Option<Prepared>, String>),
 }
 struct Prepared {
-    folder: tempfile::TempDir,
+    folder: PathBuf,
     root: PathBuf,
     version: String,
 }
@@ -173,7 +251,7 @@ impl Updater {
     }
     pub fn restart(&mut self) -> Result<(), String> {
         let prepared = self.prepared.as_ref().ok_or("No update is ready")?;
-        let helper = prepared.folder.path().join(if cfg!(windows) {
+        let helper = prepared.folder.join(if cfg!(windows) {
             "updater.exe"
         } else {
             "updater"
@@ -184,9 +262,9 @@ impl Updater {
         let mut command = Command::new(&helper);
         command
             .arg("--apply-update")
-            .arg(prepared.folder.path())
+            .arg(&prepared.folder)
             .arg(&prepared.root)
-            .current_dir(prepared.folder.path())
+            .current_dir(&prepared.folder)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -194,8 +272,8 @@ impl Updater {
         command
             .spawn()
             .map_err(|e| format!("Could not start updater: {e}"))?;
-        // The helper now owns this directory. Keep its backup for manual recovery.
-        let _ = self.prepared.take().unwrap().folder.keep();
+        // The helper now owns the staging folder; its backup stays until the next update.
+        self.prepared = None;
         Ok(())
     }
 }
@@ -274,6 +352,7 @@ fn newer_version(tag: &str, current: &str) -> Result<Option<String>, String> {
 }
 
 fn prepare(send: &Sender<Event>) -> Result<Option<Prepared>, String> {
+    if let Ok(root) = install_root() { tidy(&root); }
     let release: Release =
         serde_json::from_slice(&get(RELEASES)?).map_err(|e| e.to_string())?;
     if release.draft || release.prerelease {
@@ -294,13 +373,11 @@ fn prepare(send: &Sender<Event>) -> Result<Option<Prepared>, String> {
     protocol::validate(&manifest, &version, platform)?;
     let root = install_root()?;
     // Same filesystem allows atomic renames. Never stage updates inside user projects.
-    let folder = tempfile::Builder::new()
-        .prefix(".editor-update-")
-        .tempdir_in(root.parent().ok_or("Invalid installation path")?)
-        .map_err(|e| format!("Cannot stage update beside the installation: {e}"))?;
-    fs::write(folder.path().join("manifest.json"), bytes).map_err(|e| e.to_string())?;
-    fs::write(folder.path().join("manifest.sig"), signature).map_err(|e| e.to_string())?;
-    let archive = folder.path().join("package");
+    let folder = staging_dir(&root)?;
+    clear_staging(&folder).map_err(|e| format!("Cannot stage update in {}: {e}", folder.display()))?;
+    fs::write(folder.join("manifest.json"), bytes).map_err(|e| e.to_string())?;
+    fs::write(folder.join("manifest.sig"), signature).map_err(|e| e.to_string())?;
+    let archive = folder.join("package");
     let mut response = agent()
         .get(&format!("{base}/{}", manifest.archive))
         .header("User-Agent", "ailegion-editor-updater")
@@ -475,7 +552,8 @@ pub fn run_helper() -> bool {
             let _ = launch(Path::new(&args[3]));
         }
         rfd::MessageDialog::new().set_title("Editor update failed")
-            .set_description(format!("{error}\n\nThe backup, if created, is in the .editor-update-* folder beside the installation."))
+            .set_description(format!("{error}\n\nThe previous version, if backed up, is in {}.",
+                if cfg!(target_os = "macos") { "the .editor-update folder beside the app" } else { "the .update folder inside the installation" }))
             .set_level(rfd::MessageLevel::Error).show();
     }
     true
@@ -484,12 +562,7 @@ pub fn run_helper() -> bool {
 fn apply(folder: &Path, root: &Path) -> Result<(), String> {
     let folder = folder.canonicalize().map_err(|e| e.to_string())?;
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    if folder.parent() != root.parent()
-        || !folder
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with(".editor-update-")
+    if staging_dir(&root)?.canonicalize().ok().as_deref() != Some(folder.as_path())
         || std::env::current_exe()
             .and_then(fs::canonicalize)
             .map_err(|e| e.to_string())?
@@ -510,6 +583,7 @@ fn apply(folder: &Path, root: &Path) -> Result<(), String> {
     }
     verify_archive(&folder.join("package"), &manifest)?;
     let unpacked = folder.join("unpacked");
+    if unpacked.exists() { fs::remove_dir_all(&unpacked).map_err(|e| e.to_string())?; }
     extract(&folder.join("package"), &unpacked, platform)?;
     let payload = if cfg!(target_os = "macos") {
         unpacked.join("editor.app")
@@ -562,7 +636,9 @@ fn apply(folder: &Path, root: &Path) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let backup = folder.join("backup");
+    // The previous backup stays until this update has launched, then this one replaces it.
+    let backup = folder.join(NEW_BACKUP);
+    if backup.exists() { fs::remove_dir_all(&backup).map_err(|e| e.to_string())?; }
     let result = replace(&root, &payload, &backup, cfg!(target_os = "macos"));
     FileExt::unlock(&lock).map_err(|e| e.to_string())?;
     match result {
@@ -577,11 +653,17 @@ fn apply(folder: &Path, root: &Path) -> Result<(), String> {
                     cfg!(target_os = "macos"),
                 )?;
                 FileExt::unlock(&lock).map_err(|e| e.to_string())?;
+                let _ = fs::remove_dir(&backup);
                 return Err(error);
             }
+            settle_backup(&folder);
             Ok(())
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            // Empty after a rollback. If the rollback failed it holds the previous version, so it stays.
+            let _ = fs::remove_dir(&backup);
+            Err(error)
+        }
     }
 }
 
@@ -874,11 +956,78 @@ mod tests {
     fn running_editor_lock_blocks_installation() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("editor");
+        fs::create_dir(&root).unwrap();
         let running = lock_file(&root).unwrap();
         FileExt::lock_shared(&running).unwrap();
         let installing = lock_file(&root).unwrap();
         assert!(FileExt::try_lock_exclusive(&installing).is_err());
         drop(running);
         FileExt::try_lock_exclusive(&installing).unwrap();
+    }
+
+    #[test]
+    fn updates_stage_in_one_folder_inside_the_installation_except_macos_bundles() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("editor");
+        fs::create_dir(&root).unwrap();
+        if cfg!(target_os = "macos") {
+            assert_eq!(staging_dir(&root).unwrap(), dir.path().join(".editor-update"));
+            assert_eq!(lock_path(&root).unwrap(), dir.path().join(".editor.update-lock"));
+        } else {
+            assert_eq!(staging_dir(&root).unwrap(), root.join(".update"));
+            assert_eq!(lock_path(&root).unwrap(), root.join(".update-lock"));
+        }
+        // The swap only moves the editor's own files, never the staging folder or the lock.
+        assert!(!MANAGED.contains(&".update") && !MANAGED.contains(&".update-lock"));
+    }
+
+    #[test]
+    fn staging_is_cleared_except_the_one_latest_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join(".update");
+        fs::create_dir_all(folder.join("backup")).unwrap();
+        fs::write(folder.join("backup").join("editor.exe"), "previous").unwrap();
+        fs::create_dir_all(folder.join("unpacked").join("editor-1.0.0")).unwrap();
+        for leftover in ["package", "manifest.json", "manifest.sig", "updater.exe"] {
+            fs::write(folder.join(leftover), "leftover").unwrap();
+        }
+        clear_staging(&folder).unwrap();
+        let names: Vec<_> = fs::read_dir(&folder).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(names, ["backup"]);
+        assert_eq!(fs::read_to_string(folder.join("backup").join("editor.exe")).unwrap(), "previous");
+        // A newer backup replaces the older one: one previous version, never more.
+        fs::create_dir_all(folder.join(NEW_BACKUP)).unwrap();
+        fs::write(folder.join(NEW_BACKUP).join("editor.exe"), "latest").unwrap();
+        clear_staging(&folder).unwrap();
+        let names: Vec<_> = fs::read_dir(&folder).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(names, ["backup"]);
+        assert_eq!(fs::read_to_string(folder.join("backup").join("editor.exe")).unwrap(), "latest");
+        // A missing folder is created.
+        let fresh = dir.path().join("fresh");
+        clear_staging(&fresh).unwrap();
+        assert!(fresh.is_dir());
+    }
+
+    #[test]
+    fn folders_left_beside_the_installation_are_removed_keeping_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("editor");
+        fs::create_dir(&root).unwrap();
+        let folder = staging_dir(&root).unwrap();
+        let with_backup = dir.path().join(".editor-update-abc123");
+        fs::create_dir_all(with_backup.join("backup")).unwrap();
+        fs::write(with_backup.join("backup").join("editor.exe"), "previous").unwrap();
+        fs::write(with_backup.join("package"), "zip").unwrap();
+        fs::create_dir_all(dir.path().join(".editor-update-def456").join("unpacked")).unwrap();
+        fs::write(dir.path().join(".editor.update-lock"), "").unwrap();
+        // Things that are not the updater's are left alone.
+        fs::create_dir(dir.path().join("other-app")).unwrap();
+        fs::write(dir.path().join(".editor-update-notes.txt"), "a file, not a folder").unwrap();
+        tidy(&root);
+        assert!(!with_backup.exists() && !dir.path().join(".editor-update-def456").exists());
+        assert_eq!(fs::read_to_string(folder.join("backup").join("editor.exe")).unwrap(), "previous");
+        assert_eq!(fs::read_dir(&folder).unwrap().count(), 1, "only the backup is kept");
+        assert_eq!(dir.path().join(".editor.update-lock").exists(), cfg!(target_os = "macos"), "macOS still uses this lock");
+        assert!(dir.path().join("other-app").is_dir() && dir.path().join(".editor-update-notes.txt").is_file());
     }
 }
