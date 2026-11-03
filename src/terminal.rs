@@ -101,7 +101,7 @@ pub enum Message {
 
 impl Terminal {
     pub fn start(&mut self, cwd: &Path) {
-        self.start_command(cwd, self.shell.as_ref().map(portable_pty::CommandBuilder::new), None);
+        self.start_command(cwd, self.shell.as_deref().map(|shell| shell_command(shell, cfg!(target_os = "macos"))), None);
     }
 
     fn start_command(&mut self, cwd: &Path, command: Option<portable_pty::CommandBuilder>, completion: Option<crate::claude_auth::Completion>) {
@@ -687,9 +687,44 @@ fn color(value: vt100::Color, default: Color) -> Color {
     }
 }
 
+/// Shells known to accept `-l` (start as a login shell) as their only argument.
+const LOGIN_SHELLS: &[&str] = &["zsh", "bash", "sh", "dash", "ksh", "tcsh", "csh", "fish", "pwsh", "nu"];
+
+/// On macOS the shell starts as a login shell, as in Terminal, VS Code and Zed. Apps opened
+/// from Finder or the Dock get launchd's minimal `PATH`, and only a login shell reads
+/// `/etc/zprofile`, whose `path_helper` adds Homebrew from `/etc/paths.d`.
+fn shell_command(shell: &Path, login: bool) -> portable_pty::CommandBuilder {
+    let mut command = portable_pty::CommandBuilder::new(shell);
+    let name = shell.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    if login && LOGIN_SHELLS.contains(&name) {
+        command.arg("-l");
+    }
+    command
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_shells_start_as_login_shells_when_asked() {
+        let dir = std::env::temp_dir();
+        for name in LOGIN_SHELLS {
+            let shell = dir.join(name);
+            assert_eq!(shell_command(&shell, true).get_argv(), &[shell.clone().into_os_string(), "-l".into()]);
+            assert_eq!(shell_command(&shell, false).get_argv(), &[shell.into_os_string()]);
+        }
+        let unknown = dir.join("editor-synthetic-shell");
+        assert_eq!(shell_command(&unknown, true).get_argv(), &[unknown.into_os_string()]);
+    }
+
+    #[test]
+    fn terminal_login_flag_is_macos_only() {
+        let mut terminal = Terminal::default();
+        terminal.shell = Some(std::env::temp_dir().join("zsh"));
+        let command = shell_command(terminal.shell.as_deref().unwrap(), cfg!(target_os = "macos"));
+        assert_eq!(command.get_argv().len(), if cfg!(target_os = "macos") { 2 } else { 1 });
+    }
 
     #[test]
     fn startup_errors_arrive_asynchronously_and_restart_discards_old_events() {
