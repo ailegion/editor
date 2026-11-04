@@ -302,6 +302,19 @@ impl ChatState {
         self.messages.get(index)?.diff.as_ref()
     }
 
+    /// A reply is being written.
+    pub fn busy(&self) -> bool { self.streaming }
+
+    /// The project's tab is closing: stops a running reply and saves its conversations, as
+    /// switching to another project does.
+    pub fn close(&mut self) {
+        if let Some(previous) = self.cwd.take() {
+            self.stop();
+            self.save_current_thread();
+            self.persist(&previous);
+        }
+    }
+
     /// Follows the open project: saves the previous project's conversations and loads this one's.
     pub fn set_project(&mut self, cwd: &Path) {
         if self.cwd.as_deref() == Some(cwd) { return; }

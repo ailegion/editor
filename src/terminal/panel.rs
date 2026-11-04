@@ -340,10 +340,13 @@ impl Panel {
         self.active = None;
     }
 
-    pub fn poll(&mut self) {
+    /// Reads every session's output. Returns whether any of them printed something.
+    pub fn poll(&mut self) -> bool {
+        let mut printed = false;
         for tab in &mut self.tabs {
-            tab.terminal.poll();
+            printed |= tab.terminal.poll();
         }
+        printed
     }
 
     pub fn update(&mut self, message: Message, cwd: &Path) -> Task<Message> {

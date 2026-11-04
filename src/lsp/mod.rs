@@ -41,6 +41,8 @@ pub enum Event {
     Notice(String),
     /// A file needs `server`, which isn't installed. Shown once per server per session.
     Prompt(&'static Server),
+    /// `server` was installed to this path; other workspaces can start it too.
+    Installed(&'static Server, PathBuf),
     /// Hover text for a position (UTF-16 `column`); `lines` is empty when there was none.
     Hover { path: PathBuf, line: usize, column: usize, lines: Vec<String> },
     /// Where a definition request landed (UTF-16 `column`).
@@ -190,6 +192,8 @@ impl Manager {
         let path = path.to_owned(); self.send(move |core| core.completion(&path, line, column, text, trigger));
     }
     pub fn install(&self, server: &'static Server) { self.send(move |core| core.install(server)); }
+    /// Another workspace installed `server` to `binary`: start it here for files waiting on it.
+    pub fn installed(&self, server: &'static Server, binary: PathBuf) { self.send(move |core| core.installed(server, binary)); }
     pub fn dismiss(&self, server: &'static Server) { self.send(move |core| core.dismiss(server)); }
     pub fn shutdown_all(&self) { self.send(Core::shutdown_all); }
     pub fn poll(&self) -> Vec<Event> { self.events.try_iter().take(32).collect() }
@@ -348,6 +352,16 @@ impl Core {
         self.events.push(Event::Notice(format!("Installing {}…", server.name)));
     }
 
+    /// `server` is now installed at `binary` (by another workspace). Starts it if open files
+    /// need it and it isn't running; it opens them once initialized.
+    pub fn installed(&mut self, server: &'static Server, binary: PathBuf) {
+        self.binaries.insert(server.id, binary);
+        let running = self.slots.get(server.id).is_some_and(|slot| slot.client.is_some() && !slot.disabled);
+        if running || !self.docs.values().any(|doc| doc.server == server.id) { return; }
+        self.slots.remove(server.id);
+        self.start(server);
+    }
+
     pub fn shutdown_all(&mut self) {
         for (_, slot) in self.slots.drain() {
             if let Some(client) = slot.client { client.shutdown(); }
@@ -382,6 +396,7 @@ impl Core {
             match result {
                 Ok(path) => {
                     self.events.push(Event::Notice(format!("Installed {} to {}", server.name, path.display())));
+                    self.events.push(Event::Installed(server, path.clone()));
                     self.binaries.insert(id, path);
                     self.slots.remove(id);
                     self.start(server);
@@ -799,6 +814,23 @@ mod tests {
     }
 
     #[test]
+    fn an_install_elsewhere_starts_the_server_for_files_waiting_on_it() {
+        let server = registry::by_id("ruff").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // A binary that doesn't exist: starting fails with a notice instead of running anything.
+        let binary = dir.path().join("missing-language-server");
+        let mut core = Core::default();
+        core.set_root(dir.path());
+        core.installed(server, binary.clone());
+        assert!(core.events.is_empty(), "no open file needs it: nothing starts");
+        assert_eq!(core.binaries.get(server.id), Some(&binary), "but the install is remembered");
+        core.docs.insert(dir.path().join("a.py"), Doc { server: server.id, language: "python", version: 1, text: String::new() });
+        core.installed(server, binary);
+        assert!(matches!(core.events.as_slice(), [Event::Notice(text)] if text.starts_with(server.name)),
+            "a file waiting on it starts it (here failing, as the binary is missing)");
+    }
+
+    #[test]
     fn uris_round_trip_and_columns_convert() {
         let path = if cfg!(windows) { PathBuf::from(r"C:\Projects\my app\src\ma#in.rs") } else { PathBuf::from("/home/me/my app/src/ma#in.rs") };
         let uri = path_to_uri(&path);
@@ -972,7 +1004,7 @@ mod tests {
                             if path == main && has_error == want_error { return true; }
                         }
                         Event::Notice(text) => eprintln!("notice: {text}"),
-                        Event::Prompt(_) | Event::Hover { .. } | Event::Definition { .. } | Event::Completion { .. } => {}
+                        Event::Prompt(_) | Event::Installed(..) | Event::Hover { .. } | Event::Definition { .. } | Event::Completion { .. } => {}
                     }
                 }
                 std::thread::sleep(Duration::from_millis(50));

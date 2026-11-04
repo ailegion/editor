@@ -11,7 +11,8 @@ A minimal, no-bloat code editor in Rust, built on `iced`.
 - AI inline edits (Cmd/Ctrl+K), explain/refactor/fix actions, and AI-written commit messages
 - Integrated PTY terminal with ANSI colors, 5,000 lines of scrollback, and a resizable bottom panel
 - Status bar with AI and terminal visibility toggles
-- Reopens the last project with only the root expanded; restores tabs and the active file
+- Workspace tabs: one tab per project under the top bar, each with its own files, file tree, terminals, language servers, source control and AI conversations; background tabs keep running
+- Reopens every project tab with only the root expanded; restores each tab's files, active file and panel layout
 - Recovers unsaved edits from atomic local snapshots (every 500 ms and on normal window close)
 - Git panel with staging, confirmed discard of unstaged changes (file, folder, or all), and side-by-side diffs with character highlights
 - Inline Git blame on the current line: author and commit age, including uncommitted edits
@@ -105,6 +106,23 @@ cancelled or retried in the panel, and saved conversations resume after signing 
   **Reset session approvals** revokes these grants. New conversations, project changes,
   or ACP connection resets clear them. ACP can also offer its own named permission
   choices, whose persistence is controlled by the agent.
+
+## Workspace tabs
+
+Every project opens in its own tab in the strip under the top bar. Opening a folder that
+is already open switches to its tab; in a tab without a folder it opens there; otherwise
+you choose between replacing the current project and a new tab. A tab shows a dot for
+unsaved files, a spinner while its AI assistant works, and a second dot when its terminal
+printed output in the background. Drag tabs to reorder them; middle-click or the × closes
+one (asking first about unsaved files), and right-click offers Close Others, Close to the
+Right, Copy Path and reveal in the file manager. Closing the last tab, or **Close Folder**
+with one tab open, empties it and shows the recent projects. Only the shown tab loads at
+startup; the others load when first shown.
+
+- `Ctrl+Tab` / `Ctrl+Shift+Tab` (Windows, Linux) or `Cmd+Shift+]` / `Cmd+Shift+[`
+  (macOS): next / previous workspace tab
+- `Cmd/Ctrl+T`: new workspace tab
+- `Cmd/Ctrl+Shift+W`: close the workspace tab
 
 ## Tab shortcuts
 

@@ -188,7 +188,9 @@ impl Terminal {
         Some(((row, start), (row, end)))
     }
 
-    pub fn poll(&mut self) {
+    /// Reads what the shell printed since the last call. Returns whether there was output.
+    pub fn poll(&mut self) -> bool {
+        let mut printed = false;
         if let (Some(size), Some(tx)) = (self.pending_size, &self.input) {
             if tx.try_send(Command::Resize(size.0, size.1)).is_ok() {
                 self.pending_size = None;
@@ -201,6 +203,7 @@ impl Terminal {
                 match rx.try_recv() {
                     Ok(PtyEvent::Ready) => self.status = self.directory.clone(),
                     Ok(PtyEvent::Output(bytes)) => {
+                        printed |= !bytes.is_empty();
                         self.parser.process(&bytes);
                         let replies = std::mem::take(&mut self.parser.callbacks_mut().0);
                         if !replies.is_empty() {
@@ -232,6 +235,7 @@ impl Terminal {
             }
         }
         self.drop_stale_selection();
+        printed
     }
 
     fn write(&mut self, bytes: Vec<u8>) {
@@ -475,6 +479,10 @@ impl canvas::Program<Message> for Screen<'_> {
                 ..
             }) if self.enabled && self.terminal.focused => {
                 if modifiers.control() && key.as_ref() == keyboard::Key::Character("`") {
+                    return None;
+                }
+                // Switching workspace tabs (Ctrl+Tab) works from the terminal too.
+                if crate::workspace_cycle_key(key, *modifiers).is_some() {
                     return None;
                 }
                 let clipboard_modifier = if cfg!(target_os = "macos") {
@@ -775,6 +783,43 @@ mod tests {
         terminal.poll();
         assert_eq!(commands.try_recv().unwrap(), Command::Resize(30, 120));
         assert_eq!(terminal.pending_size, None);
+    }
+
+    #[test]
+    fn poll_reports_output_so_a_background_tab_can_show_activity() {
+        let mut terminal = Terminal::default();
+        let (events, output) = mpsc::sync_channel(4);
+        terminal.output = Some(output);
+        assert!(!terminal.poll(), "nothing printed yet");
+        events.send(PtyEvent::Output(b"build done\r\n".to_vec())).unwrap();
+        assert!(terminal.poll());
+        assert!(!terminal.poll(), "reported once");
+        events.send(PtyEvent::Ready).unwrap();
+        assert!(!terminal.poll(), "becoming ready is not output");
+    }
+
+    #[test]
+    fn ctrl_tab_leaves_a_focused_terminal_to_switch_workspace_tabs() {
+        let mut terminal = Terminal::default();
+        terminal.focused = true;
+        let screen = Screen { terminal: &terminal, enabled: true };
+        let press = |modifiers: keyboard::Modifiers| {
+            let tab = keyboard::Key::Named(keyboard::key::Named::Tab);
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: tab.clone(), modified_key: tab, physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab),
+                location: keyboard::Location::Standard, modifiers, text: Some("\t".into()), repeat: false,
+            })
+        };
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0));
+        let mut state = ScreenState::default();
+        let mut update = |event: &Event| canvas::Program::update(&screen, &mut state, event, bounds, mouse::Cursor::Unavailable);
+        // Plain Tab is the shell's, as before.
+        assert!(update(&press(keyboard::Modifiers::empty())).is_some());
+        // Ctrl+Tab switches workspace tabs on Windows and Linux; on macOS (Cmd+Shift+] there)
+        // it stays the shell's.
+        let mac = cfg!(target_os = "macos");
+        assert_eq!(update(&press(keyboard::Modifiers::CTRL)).is_none(), !mac);
+        assert_eq!(update(&press(keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT)).is_none(), !mac);
     }
 
     #[test]

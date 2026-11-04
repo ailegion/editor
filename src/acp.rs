@@ -585,6 +585,20 @@ impl AcpState {
         });
     }
 
+    /// The agent is working on a prompt.
+    pub fn busy(&self) -> bool { self.streaming }
+
+    /// The project's tab is closing: saves its conversations and ends the agent session, as
+    /// switching to another project does.
+    pub fn close(&mut self) {
+        if !self.loaded { return; }
+        self.save_current_thread();
+        if let Some(previous) = self.cwd.clone() { self.persist(&previous); }
+        self.stop();
+        self.reset_connection();
+        self.loaded = false;
+    }
+
     pub fn ensure_loaded(&mut self, cwd: &Path) {
         if self.loaded && self.cwd.as_deref() != Some(cwd) {
             self.save_current_thread();

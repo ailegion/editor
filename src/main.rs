@@ -39,8 +39,10 @@ mod goto_line;
 mod project_search;
 mod quick_open;
 mod recent_files;
+mod recent_projects;
 mod theme;
 mod theme_install;
+mod workspaces;
 
 use iced::keyboard;
 use iced::widget::{
@@ -155,7 +157,7 @@ enum Focus {
     Editor,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 enum SidebarMode {
     #[default]
     Tree,
@@ -227,7 +229,7 @@ impl std::fmt::Display for ViewAction {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 enum AiMode {
     #[default]
     Http,
@@ -406,32 +408,116 @@ enum Message {
     PaintInitialWindow(iced::window::Id, u64),
     WindowMoved(iced::Point),
     WindowMaximizedChecked(bool),
+
+    /// `Message` for the workspace tab `WorkspaceId`, even if it is in the background by now:
+    /// what an async job, dialog or timer started for a project reports back to that project.
+    In(WorkspaceId, Box<Message>),
+    /// The per-project half of `Tick`, sent to every loaded workspace tab.
+    WorkspaceTick,
+    WorkspaceNew,
+    /// Next (`true`) or previous workspace tab, wrapping around.
+    WorkspaceCycle(bool),
+    WorkspaceClose(WorkspaceId),
+    WorkspaceCloseOthers(WorkspaceId),
+    WorkspaceCloseRight(WorkspaceId),
+    /// Closes these tabs, unsaved edits and all (answered "Yes", or nothing was unsaved).
+    WorkspacesCloseConfirmed(Vec<WorkspaceId>),
+    WorkspaceCopyPath(WorkspaceId),
+    WorkspaceReveal(WorkspaceId),
+    /// Pressed on a workspace tab: selects it and may start dragging it.
+    WorkspaceDragStart(WorkspaceId),
+    /// The pointer moved over the tab strip while a tab may be dragged: its x from the start
+    /// of the tabs, and the tabs' width.
+    WorkspaceDragMove(f32, f32),
+    /// Open this folder: switch to its tab, open it in an empty one, or ask.
+    OpenFolderRequest(PathBuf),
+    /// The answer to "replace the current project or open a new tab?"; `None` cancels.
+    FolderPromptChoice(Option<FolderChoice>),
+    /// Replace the project in this tab with the folder (answered "Yes" to losing unsaved edits).
+    FolderReplaceConfirmed(WorkspaceId, PathBuf),
 }
 
-#[derive(PartialEq, serde::Serialize, serde::Deserialize)]
+impl Message {
+    /// Messages about the app or the tab strip rather than one project. They are handled
+    /// where the user is, never inside a background tab.
+    fn is_global(&self) -> bool {
+        matches!(self,
+            Message::CheckUpdate | Message::CheckUpdateFromMenu | Message::RestartUpdate | Message::About(_)
+            | Message::FileBugReport | Message::ThemeInstall(_) | Message::CommandPalette(_) | Message::ToggleCommandPalette
+            | Message::QuickOpen(_) | Message::ToggleQuickOpen | Message::GotoLine(_) | Message::ToggleGotoLine
+            | Message::AppThemeSelected(_) | Message::ViewAction(_) | Message::DismissNotice | Message::Exit
+            | Message::KeyPressed(..) | Message::Noop | Message::Tick | Message::PathDropped(_)
+            | Message::WindowResized(..) | Message::WindowFrameDrawn(_) | Message::WindowOpened(_)
+            | Message::PaintInitialWindow(..) | Message::WindowMoved(_) | Message::WindowMaximizedChecked(_)
+            | Message::In(..) | Message::WorkspaceNew | Message::WorkspaceCycle(_)
+            | Message::WorkspaceClose(_) | Message::WorkspaceCloseOthers(_) | Message::WorkspaceCloseRight(_)
+            | Message::WorkspacesCloseConfirmed(_) | Message::WorkspaceCopyPath(_) | Message::WorkspaceReveal(_)
+            | Message::WorkspaceDragStart(_) | Message::WorkspaceDragMove(..) | Message::OpenFolderRequest(_)
+            | Message::FolderPromptChoice(_) | Message::FolderReplaceConfirmed(..))
+    }
+}
+
+/// Addresses what `task` produces to workspace `id`, except app-wide messages.
+fn tag(task: Task<Message>, id: WorkspaceId) -> Task<Message> {
+    task.map(move |message| if message.is_global() { message } else { Message::In(id, Box::new(message)) })
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct RecoveryBuffer {
     path: Option<PathBuf>,
     text: String,
 }
 
-#[derive(Default, PartialEq, serde::Serialize, serde::Deserialize)]
+/// One workspace tab as saved in `session.json` (see `workspaces::SessionFile`).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 struct EditorSession {
     root: Option<PathBuf>,
     tabs: Vec<PathBuf>,
     active: Option<PathBuf>,
     #[serde(default)]
     recovery: Vec<RecoveryBuffer>,
+    /// The tab's panels and their sizes. Absent in sessions saved before workspace tabs, which
+    /// open with the saved defaults like before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    layout: Option<Layout>,
 }
 
-struct State {
-    updater: updater::Updater,
-    /// A menu-requested update check is running; its outcome is shown as a notice.
-    announce_update_check: bool,
+/// Which panels a workspace tab shows and how they are sized.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Layout {
+    sidebar_visible: bool,
+    sidebar_mode: SidebarMode,
+    ai_visible: bool,
+    ai_mode: AiMode,
+    terminal_visible: bool,
+    sidebar_ratio: f32,
+    ai_ratio: f32,
+}
+
+impl Layout {
+    /// What a new tab starts with: the panels and sizes last saved, the file tree, the first AI
+    /// assistant, no terminal. The same as startup before workspace tabs.
+    fn saved_defaults() -> Self {
+        Self {
+            sidebar_visible: load_sidebar_visible(),
+            sidebar_mode: SidebarMode::default(),
+            ai_visible: load_ai_visible(),
+            ai_mode: AiMode::default(),
+            terminal_visible: false,
+            sidebar_ratio: load_sidebar_ratio(),
+            ai_ratio: load_ai_ratio(),
+        }
+    }
+}
+
+type WorkspaceId = u64;
+
+/// Everything that belongs to one project: its files, panels, language servers, terminals,
+/// source control and AI conversations. Each workspace tab has one.
+struct Workspace {
+    id: WorkspaceId,
     root: Option<PathBuf>,
-    saved_session: EditorSession,
-    last_session_write: std::time::Instant,
     closed_tabs: Vec<PathBuf>,
-    notice: Option<(String, std::time::Instant)>,
     git_status: Option<(String, std::time::Instant)>,
     reveal_generation: u64,
     reveal_queue: std::collections::VecDeque<PathBuf>,
@@ -445,12 +531,6 @@ struct State {
     creating: Option<(PathBuf, bool, String)>,
     sidebar_mode: SidebarMode,
     project_search: project_search::SearchState,
-    quick_open: quick_open::QuickOpenState,
-    theme_install: theme_install::ThemeInstallState,
-    command_palette: command_palette::PaletteState,
-    goto_line: goto_line::GotoLineState,
-    about: about::AboutState,
-    recent_files: Vec<PathBuf>,
     git: git::GitState,
     git_preview: Option<git_preview::Preview>,
     /// The commit graph, covering the editor area like `git_preview` (which opens over it).
@@ -468,29 +548,13 @@ struct State {
     completion: Option<completion::Session>,
     completion_request: Option<(PathBuf, usize, usize)>,
 
-    app_theme: theme::EditorTheme,
-    themes: theme::ThemeRegistry,
-    highlighter: code_editor::Highlighter,
-    zoom: f32,
-    /// Long lines continue on further rows instead of running off to the right.
-    word_wrap: bool,
-
     panes: pane_grid::State<PaneKind>,
     sidebar_split: Option<pane_grid::Split>,
     ai_split: Option<pane_grid::Split>,
     sidebar_visible: bool,
-
-    /// The most recent size reported by a `WindowResized` event -- kept so the async
-    /// `is_maximized` check triggered by that same event (see its handler) knows what to
-    /// persist as "windowed size" once it resolves.
-    last_known_size: iced::Size,
-    window_revealed: bool,
-    startup_maximized: bool,
-    startup_window: Option<u64>,
-    /// The main window's native handle (HWND on Windows), used to parent native dialogs so
-    /// they open in front of the app.
-    window_handle: Option<u64>,
-    started_at: std::time::Instant,
+    /// The sidebar's and AI panel's share of the width, for showing them again.
+    sidebar_ratio: f32,
+    ai_ratio: f32,
 
     ai_visible: bool,
     ai_mode: AiMode,
@@ -508,44 +572,37 @@ struct State {
     cursor: acp::AcpState,
     terminal: terminal::panel::Panel,
     terminal_visible: bool,
+    /// A terminal printed output while this tab was in the background; cleared on showing it.
+    terminal_activity: bool,
 }
 
-impl State {
-    fn new() -> Self {
-        let root = load_last_project();
-        let tree = root
-            .clone()
-            .map(file_tree);
-        let sidebar_visible = load_sidebar_visible();
-        let ai_visible = load_ai_visible();
-        let themes = theme::ThemeRegistry::load();
-        let app_theme = load_app_theme(&themes);
-        let zoom = load_zoom();
-        let sidebar_ratio = load_sidebar_ratio();
-        let ai_ratio = load_ai_ratio();
-
-        let (mut panes, first_pane) = if sidebar_visible {
+impl Workspace {
+    /// A workspace for `root` (none: a "New Tab") laid out as `layout`. The terminal starts
+    /// hidden; `State::restore_layout` opens it when the layout says so.
+    fn new(id: WorkspaceId, root: Option<PathBuf>, layout: Layout) -> Self {
+        let tree = root.clone().map(file_tree);
+        let (mut panes, first_pane) = if layout.sidebar_visible {
             pane_grid::State::new(PaneKind::Sidebar)
         } else {
             pane_grid::State::new(PaneKind::Main)
         };
 
-        let (main_pane, sidebar_split) = if sidebar_visible {
+        let (main_pane, sidebar_split) = if layout.sidebar_visible {
             let (main_pane, split) = panes
                 .split(pane_grid::Axis::Vertical, first_pane, PaneKind::Main)
                 .expect("splitting a freshly created single-pane state always succeeds");
-            panes.resize(split, sidebar_ratio);
+            panes.resize(split, layout.sidebar_ratio);
             (main_pane, Some(split))
         } else {
             (first_pane, None)
         };
 
-        let ai_split = if ai_visible {
+        let ai_split = if layout.ai_visible {
             let split = panes
                 .split(pane_grid::Axis::Vertical, main_pane, PaneKind::Ai)
                 .map(|(_, split)| split);
             if let Some(split) = split {
-                panes.resize(split, ai_ratio);
+                panes.resize(split, layout.ai_ratio);
             }
             split
         } else {
@@ -553,13 +610,9 @@ impl State {
         };
 
         Self {
-            updater: updater::Updater::default(),
-            announce_update_check: false,
+            id,
             root,
-            saved_session: EditorSession::default(),
-            last_session_write: std::time::Instant::now() - Duration::from_secs(1),
             closed_tabs: Vec::new(),
-            notice: None,
             git_status: None,
             reveal_generation: 0,
             reveal_queue: std::collections::VecDeque::new(),
@@ -570,14 +623,8 @@ impl State {
             tree,
             renaming: None,
             creating: None,
-            sidebar_mode: SidebarMode::default(),
+            sidebar_mode: layout.sidebar_mode,
             project_search: project_search::SearchState::default(),
-            quick_open: quick_open::QuickOpenState::default(),
-            theme_install: theme_install::ThemeInstallState::default(),
-            command_palette: command_palette::PaletteState::default(),
-            goto_line: goto_line::GotoLineState::default(),
-            about: about::AboutState::default(),
-            recent_files: recent_files::load(),
             git: git::GitState::new(),
             git_preview: None,
             git_graph: None,
@@ -587,23 +634,14 @@ impl State {
             hover_request: None,
             completion: None,
             completion_request: None,
-            app_theme,
-            themes,
-            highlighter: code_editor::Highlighter::new(),
-            zoom,
-            word_wrap: load_word_wrap(),
             panes,
             sidebar_split,
             ai_split,
-            sidebar_visible,
-            last_known_size: load_window_size(),
-            window_revealed: !cfg!(windows),
-            startup_maximized: load_window_maximized(),
-            startup_window: None,
-            window_handle: None,
-            started_at: std::time::Instant::now(),
-            ai_visible,
-            ai_mode: AiMode::default(),
+            sidebar_visible: layout.sidebar_visible,
+            sidebar_ratio: layout.sidebar_ratio,
+            ai_ratio: layout.ai_ratio,
+            ai_visible: layout.ai_visible,
+            ai_mode: layout.ai_mode,
             mention_files: None,
             mentions: Vec::new(),
             inline_edit: None,
@@ -615,28 +653,266 @@ impl State {
             cursor: acp::AcpState::cursor(),
             terminal: terminal::panel::Panel::default(),
             terminal_visible: false,
+            terminal_activity: false,
+        }
+    }
+
+    fn layout(&self) -> Layout {
+        Layout {
+            sidebar_visible: self.sidebar_visible,
+            sidebar_mode: self.sidebar_mode,
+            ai_visible: self.ai_visible,
+            ai_mode: self.ai_mode,
+            terminal_visible: self.terminal_visible,
+            sidebar_ratio: self.sidebar_ratio,
+            ai_ratio: self.ai_ratio,
+        }
+    }
+
+    /// What `session.json` keeps for this tab.
+    fn session(&self) -> EditorSession {
+        EditorSession {
+            root: self.root.clone(),
+            tabs: self.tabs.iter().filter_map(|tab| tab.path.clone()).collect(),
+            active: self.tabs.get(self.active_tab).and_then(|tab| tab.path.clone()),
+            recovery: self.recovery(),
+            layout: Some(self.layout()),
+        }
+    }
+
+    fn recovery(&self) -> Vec<RecoveryBuffer> {
+        self.tabs.iter().filter(|tab| tab.dirty).map(|tab| RecoveryBuffer {
+            path: tab.path.clone(), text: tab.content.text(),
+        }).collect()
+    }
+
+    fn unsaved(&self) -> usize {
+        self.tabs.iter().filter(|tab| tab.dirty).count()
+    }
+
+    /// An AI assistant in this tab is writing a reply.
+    fn ai_busy(&self) -> bool {
+        self.chat.busy() || [&self.acp, &self.codex, &self.grok, &self.cursor].iter().any(|panel| panel.busy())
+    }
+
+    /// Stops what the project runs and saves its AI conversations, before the tab goes away.
+    /// Terminals and language servers also stop when dropped; this makes it explicit.
+    fn shut_down(&mut self) {
+        self.terminal.shutdown();
+        self.lsp.shutdown_all();
+        self.chat.close();
+        for panel in [&mut self.acp, &mut self.codex, &mut self.grok, &mut self.cursor] {
+            panel.close();
+        }
+    }
+}
+
+/// Where a workspace tab's state is: in `State::ws` (the one being worked on), set aside
+/// while another is, or not loaded yet since startup (only its saved session is known).
+enum Slot {
+    Here,
+    Parked(Box<Workspace>),
+    Unloaded(EditorSession),
+}
+
+struct Entry {
+    id: WorkspaceId,
+    slot: Slot,
+}
+
+/// Where a folder the user picked should open, once they answered the dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FolderChoice {
+    Replace,
+    NewTab,
+}
+
+/// What the app reads from disk at startup, gathered so tests can build a `State` without
+/// touching the user's settings.
+struct Settings {
+    themes: theme::ThemeRegistry,
+    app_theme: theme::EditorTheme,
+    zoom: f32,
+    word_wrap: bool,
+    recent_files: Vec<PathBuf>,
+    session_store: SessionStore,
+    /// Where the recent projects list is saved; `None` keeps it in memory.
+    recent_projects_path: Option<PathBuf>,
+}
+
+/// Where `session.json` is written. `Disk(None)` when there's no home folder: nothing is saved,
+/// as before. `Memory` (tests) keeps it in `State::saved_session` only.
+enum SessionStore {
+    Disk(Option<PathBuf>),
+    #[cfg_attr(not(test), allow(dead_code))]
+    Memory,
+}
+
+impl Settings {
+    fn load() -> Self {
+        let themes = theme::ThemeRegistry::load();
+        let app_theme = load_app_theme(&themes);
+        Self {
+            themes,
+            app_theme,
+            zoom: load_zoom(),
+            word_wrap: load_word_wrap(),
+            recent_files: recent_files::load(),
+            session_store: SessionStore::Disk(config_path("session.json")),
+            recent_projects_path: recent_projects::path(),
+        }
+    }
+}
+
+struct State {
+    updater: updater::Updater,
+    /// A menu-requested update check is running; its outcome is shown as a notice.
+    announce_update_check: bool,
+    saved_session: workspaces::SessionFile,
+    last_session_write: std::time::Instant,
+    session_store: SessionStore,
+    notice: Option<(String, std::time::Instant)>,
+
+    /// The workspace being worked on: the active tab's, except while a message for a
+    /// background tab is handled (see `route`).
+    ws: Box<Workspace>,
+    /// Every workspace tab in strip order; the one at `current` is `Slot::Here`.
+    workspaces: Vec<Entry>,
+    /// The tab shown.
+    active: usize,
+    /// The tab whose workspace is in `ws`; equal to `active` outside `route`.
+    current: usize,
+    next_workspace_id: WorkspaceId,
+    /// A folder waiting for the user to choose between replacing the current project and a new tab.
+    folder_prompt: Option<PathBuf>,
+    /// The workspace tab being dragged, and whether the pointer has moved since the press.
+    workspace_drag: Option<(WorkspaceId, bool)>,
+    recent_projects: Vec<PathBuf>,
+    recent_projects_path: Option<PathBuf>,
+
+    quick_open: quick_open::QuickOpenState,
+    theme_install: theme_install::ThemeInstallState,
+    command_palette: command_palette::PaletteState,
+    goto_line: goto_line::GotoLineState,
+    about: about::AboutState,
+    recent_files: Vec<PathBuf>,
+
+    app_theme: theme::EditorTheme,
+    themes: theme::ThemeRegistry,
+    highlighter: code_editor::Highlighter,
+    zoom: f32,
+    /// Long lines continue on further rows instead of running off to the right.
+    word_wrap: bool,
+
+    /// The most recent size reported by a `WindowResized` event -- kept so the async
+    /// `is_maximized` check triggered by that same event (see its handler) knows what to
+    /// persist as "windowed size" once it resolves.
+    last_known_size: iced::Size,
+    window_revealed: bool,
+    startup_maximized: bool,
+    startup_window: Option<u64>,
+    /// The main window's native handle (HWND on Windows), used to parent native dialogs so
+    /// they open in front of the app.
+    window_handle: Option<u64>,
+    started_at: std::time::Instant,
+}
+
+impl State {
+    /// A state whose only workspace is `session`'s, not restored yet (see `boot`).
+    fn with_settings(settings: Settings, first: &EditorSession) -> Self {
+        let layout = first.layout.unwrap_or_else(Layout::saved_defaults);
+        let recent_projects = recent_projects::load(settings.recent_projects_path.as_deref());
+        Self {
+            updater: updater::Updater::default(),
+            announce_update_check: false,
+            saved_session: workspaces::SessionFile { workspaces: Vec::new(), active_workspace: 0 },
+            last_session_write: std::time::Instant::now() - Duration::from_secs(1),
+            session_store: settings.session_store,
+            notice: None,
+            ws: Box::new(Workspace::new(1, first.root.clone(), layout)),
+            workspaces: vec![Entry { id: 1, slot: Slot::Here }],
+            active: 0,
+            current: 0,
+            next_workspace_id: 2,
+            folder_prompt: None,
+            workspace_drag: None,
+            recent_projects,
+            recent_projects_path: settings.recent_projects_path,
+            quick_open: quick_open::QuickOpenState::default(),
+            theme_install: theme_install::ThemeInstallState::default(),
+            command_palette: command_palette::PaletteState::default(),
+            goto_line: goto_line::GotoLineState::default(),
+            about: about::AboutState::default(),
+            recent_files: settings.recent_files,
+            app_theme: settings.app_theme,
+            themes: settings.themes,
+            highlighter: code_editor::Highlighter::new(),
+            zoom: settings.zoom,
+            word_wrap: settings.word_wrap,
+            last_known_size: load_window_size(),
+            window_revealed: !cfg!(windows),
+            startup_maximized: load_window_maximized(),
+            startup_window: None,
+            window_handle: None,
+            started_at: std::time::Instant::now(),
         }
     }
 
     fn boot() -> (Self, Task<Message>) {
-        let mut state = Self::new();
-        let session: EditorSession = config_path("session.json")
-            .and_then(|path| std::fs::read(path).ok())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
+        let settings = Settings::load();
+        let bytes = match &settings.session_store {
+            SessionStore::Disk(Some(path)) => std::fs::read(path).ok(),
+            _ => None,
+        };
+        let session = workspaces::read_session(bytes.as_deref(), load_last_project());
+        Self::start(settings, session)
+    }
+
+    /// Opens every saved workspace tab: the active one now, the others when first shown.
+    fn start(settings: Settings, session: workspaces::SessionFile) -> (Self, Task<Message>) {
+        let active = session.active_workspace;
+        let mut state = Self::with_settings(settings, &session.workspaces[active]);
+        state.workspaces.clear();
+        for (index, saved) in session.workspaces.iter().enumerate() {
+            let id = if index == active { state.ws.id } else { state.new_workspace_id() };
+            let slot = if index == active { Slot::Here } else { Slot::Unloaded(saved.clone()) };
+            state.workspaces.push(Entry { id, slot });
+        }
+        state.active = active;
+        state.current = active;
+        let task = state.restore(session.workspaces[active].clone());
+        let task = tag(task, state.ws.id);
+        state.persist_session();
+        (state, task)
+    }
+
+    fn new_workspace_id(&mut self) -> WorkspaceId {
+        let id = self.next_workspace_id;
+        self.next_workspace_id += 1;
+        id
+    }
+
+    /// Fills the workspace in `ws`, freshly created for `session`'s folder and layout, with
+    /// the session's files and unsaved edits, and opens its terminal if it was open.
+    fn restore(&mut self, session: EditorSession) -> Task<Message> {
         let mut tasks = Vec::new();
-        if let (Some(tree), Some(root)) = (&mut state.tree, &state.root) {
+        if let (Some(tree), Some(root)) = (&mut self.ws.tree, &self.ws.root) {
             tasks.push(tree.update(DirectoryTreeEvent::Toggled(root.clone())).map(Message::Tree));
         }
-        if session.root == state.root {
+        // Projects restored from the last session count as opened, so they stay findable
+        // among the recent projects once their tab is closed.
+        if let Some(root) = self.ws.root.clone() {
+            recent_projects::record(&mut self.recent_projects, root, self.recent_projects_path.as_deref());
+        }
+        if session.root == self.ws.root {
             for path in &session.tabs {
-                tasks.push(state.open_path(path.clone()));
+                tasks.push(self.open_path(path.clone()));
             }
             for recovery in session.recovery {
                 let extension = recovery.path.as_ref().and_then(|path| path.extension()).and_then(|ext| ext.to_str()).unwrap_or("txt");
-                let mut content = code_editor::Buffer::highlighted(&recovery.text, code_editor::metrics_for_zoom(state.zoom), &state.highlighter, extension, &state.app_theme.syntax);
-                content.set_wrap(state.word_wrap);
-                if let Some(path) = &recovery.path { state.lsp.open(path, recovery.text.clone()); }
+                let mut content = code_editor::Buffer::highlighted(&recovery.text, code_editor::metrics_for_zoom(self.zoom), &self.highlighter, extension, &self.app_theme.syntax);
+                content.set_wrap(self.word_wrap);
+                if let Some(path) = &recovery.path { self.ws.lsp.open(path, recovery.text.clone()); }
                 let mut tab = Tab {
                     path: recovery.path.clone(), content, dirty: true,
                     saved_text: recovery.path.as_ref().and_then(|path| std::fs::read_to_string(path).ok())
@@ -645,26 +921,208 @@ impl State {
                     diagnostics: Vec::new(), blame: Vec::new(), hover: None, preview: None, image: None,
                 };
                 tab.refresh_dirty();
-                if let Some(index) = state.tabs.iter().position(|tab| tab.path == recovery.path) {
-                    state.tabs[index] = tab;
-                } else { state.tabs.push(tab); }
-                state.notify("Recovered unsaved edits");
+                if let Some(index) = self.ws.tabs.iter().position(|tab| tab.path == recovery.path) {
+                    self.ws.tabs[index] = tab;
+                } else { self.ws.tabs.push(tab); }
+                self.notify("Recovered unsaved edits");
             }
-            state.tabs.sort_by_key(|tab| session.tabs.iter().position(|path| tab.path.as_ref() == Some(path)).unwrap_or(usize::MAX));
-            if let Some(index) = state.tabs.iter().position(|tab| tab.path == session.active) {
-                state.active_tab = index;
+            self.ws.tabs.sort_by_key(|tab| session.tabs.iter().position(|path| tab.path.as_ref() == Some(path)).unwrap_or(usize::MAX));
+            if let Some(index) = self.ws.tabs.iter().position(|tab| tab.path == session.active) {
+                self.ws.active_tab = index;
             }
         }
-        state.persist_session();
-        (state, Task::batch(tasks))
+        if session.layout.is_some_and(|layout| layout.terminal_visible) {
+            // A fresh shell: the old one ended with the app.
+            self.show_terminal(false);
+        }
+        Task::batch(tasks)
     }
 
     fn notify(&mut self, message: impl Into<String>) {
-        self.notice = Some((message.into(), std::time::Instant::now()));
+        let message = message.into();
+        // A notice from a tab in the background says which project it is about.
+        let message = if self.in_background() { format!("[{}] {message}", self.workspace_label(self.current)) } else { message };
+        self.notice = Some((message, std::time::Instant::now()));
+    }
+
+    /// A message for a background tab is being handled: nothing may take focus or change
+    /// what the user is looking at.
+    fn in_background(&self) -> bool {
+        self.current != self.active
+    }
+
+    fn workspace_root(&self, index: usize) -> Option<&Path> {
+        match &self.workspaces.get(index)?.slot {
+            Slot::Here => self.ws.root.as_deref(),
+            Slot::Parked(workspace) => workspace.root.as_deref(),
+            Slot::Unloaded(session) => session.root.as_deref(),
+        }
+    }
+
+    fn workspace_roots(&self) -> Vec<Option<&Path>> {
+        (0..self.workspaces.len()).map(|index| self.workspace_root(index)).collect()
+    }
+
+    fn workspace_label(&self, index: usize) -> String {
+        workspaces::labels(&self.workspace_roots()).into_iter().nth(index).unwrap_or_default()
+    }
+
+    fn workspace_index(&self, id: WorkspaceId) -> Option<usize> {
+        self.workspaces.iter().position(|entry| entry.id == id)
+    }
+
+    /// The loaded workspace of tab `index`, wherever it is.
+    fn workspace(&self, index: usize) -> Option<&Workspace> {
+        match &self.workspaces.get(index)?.slot {
+            Slot::Here => Some(&self.ws),
+            Slot::Parked(workspace) => Some(workspace),
+            Slot::Unloaded(_) => None,
+        }
+    }
+
+    /// Unsaved files in tab `index`, counting the unsaved edits of a tab not loaded yet.
+    fn workspace_unsaved(&self, index: usize) -> usize {
+        match self.workspaces.get(index).map(|entry| &entry.slot) {
+            Some(Slot::Unloaded(session)) => session.recovery.len(),
+            Some(_) => self.workspace(index).map_or(0, Workspace::unsaved),
+            None => 0,
+        }
+    }
+
+    /// Puts tab `index`'s workspace in `ws` (loading it first if needed) and sets the one
+    /// that was there aside. Doesn't change which tab is shown.
+    fn swap_to(&mut self, index: usize) -> Task<Message> {
+        if index == self.current || index >= self.workspaces.len() { return Task::none(); }
+        let mut task = Task::none();
+        let incoming = match std::mem::replace(&mut self.workspaces[index].slot, Slot::Here) {
+            Slot::Parked(workspace) => workspace,
+            Slot::Unloaded(session) => {
+                let layout = session.layout.unwrap_or_else(Layout::saved_defaults);
+                let workspace = Box::new(Workspace::new(self.workspaces[index].id, session.root.clone(), layout));
+                let outgoing = std::mem::replace(&mut self.ws, workspace);
+                self.workspaces[self.current].slot = Slot::Parked(outgoing);
+                self.current = index;
+                task = tag(self.restore(session), self.ws.id);
+                return task;
+            }
+            Slot::Here => unreachable!("only the current tab is here"),
+        };
+        let outgoing = std::mem::replace(&mut self.ws, incoming);
+        self.workspaces[self.current].slot = Slot::Parked(outgoing);
+        self.current = index;
+        task
+    }
+
+    /// Adds a tab at the end of the strip and shows it: empty ("New Tab"), or with `root` open.
+    fn new_workspace(&mut self, root: Option<PathBuf>) -> Task<Message> {
+        let id = self.new_workspace_id();
+        let workspace = Workspace::new(id, None, Layout::saved_defaults());
+        self.workspaces.push(Entry { id, slot: Slot::Parked(Box::new(workspace)) });
+        let mut task = self.activate_workspace(self.workspaces.len() - 1);
+        if let Some(root) = root {
+            task = Task::batch([task, tag(open_folder(self, root), id)]);
+        }
+        task
+    }
+
+    /// Replaces the shown tab's project with the folder at `path`, keeping the tab's place
+    /// and layout. The old project is closed completely, unsaved edits included. The tab
+    /// gets a new id, so replies still on their way to the old project are dropped.
+    fn replace_workspace(&mut self, path: PathBuf) -> Task<Message> {
+        let layout = self.ws.layout();
+        let focused = self.ws.terminal.focused();
+        let id = self.new_workspace_id();
+        let mut old = std::mem::replace(&mut self.ws, Box::new(Workspace::new(id, None, Layout { terminal_visible: false, ..layout })));
+        old.shut_down();
+        self.workspaces[self.current].id = id;
+        let task = open_folder(self, path);
+        if layout.terminal_visible {
+            self.show_terminal(focused);
+        }
+        tag(task, id)
+    }
+
+    /// Asks before closing tabs with unsaved edits, then closes them.
+    fn request_close(&mut self, ids: Vec<WorkspaceId>) -> Task<Message> {
+        if ids.is_empty() { return Task::none(); }
+        let unsaved: usize = ids.iter().filter_map(|id| self.workspace_index(*id)).map(|index| self.workspace_unsaved(index)).sum();
+        if unsaved == 0 {
+            return update(self, Message::WorkspacesCloseConfirmed(ids));
+        }
+        let what = match ids.as_slice() {
+            [id] => format!("\"{}\"", self.workspace_index(*id).map(|index| self.workspace_label(index)).unwrap_or_default()),
+            many => format!("{} tabs", many.len()),
+        };
+        ask(self.window_handle, "Unsaved changes", format!("Discard unsaved changes in {unsaved} file(s) and close {what}?"), Message::WorkspacesCloseConfirmed(ids))
+    }
+
+    /// Closes tab `id`: its terminals, language servers, source control and AI sessions stop,
+    /// and its unsaved edits are dropped. The last tab isn't removed but emptied, which shows
+    /// the welcome screen with recent projects.
+    fn close_workspace(&mut self, id: WorkspaceId) -> Task<Message> {
+        let Some(index) = self.workspace_index(id) else { return Task::none() };
+        if self.workspaces.len() == 1 {
+            self.reset_workspace();
+            return Task::none();
+        }
+        let mut task = Task::none();
+        if index == self.active {
+            // The tab to the right takes its place, or the one to the left at the end.
+            let next = if index + 1 < self.workspaces.len() { index + 1 } else { index - 1 };
+            task = self.activate_workspace(next);
+        }
+        let entry = self.workspaces.remove(index);
+        if let Slot::Parked(mut workspace) = entry.slot { workspace.shut_down(); }
+        if self.active > index { self.active -= 1; }
+        if self.current > index { self.current -= 1; }
+        task
+    }
+
+    /// Empties the shown tab: no folder, no files, no terminal, fresh AI and source control.
+    fn reset_workspace(&mut self) {
+        let layout = Layout { terminal_visible: false, ..self.ws.layout() };
+        let id = self.new_workspace_id();
+        let mut old = std::mem::replace(&mut self.ws, Box::new(Workspace::new(id, None, layout)));
+        old.shut_down();
+        self.workspaces[self.current].id = id;
+    }
+
+    /// Moves the tab at `from` to `to`, keeping the same tab shown.
+    fn move_workspace(&mut self, from: usize, to: usize) {
+        if from >= self.workspaces.len() || to >= self.workspaces.len() { return; }
+        let (active, current) = (self.workspaces[self.active].id, self.workspaces[self.current].id);
+        let entry = self.workspaces.remove(from);
+        self.workspaces.insert(to, entry);
+        self.active = self.workspace_index(active).unwrap_or(0);
+        self.current = self.workspace_index(current).unwrap_or(0);
+    }
+
+    /// Runs `apply` on every loaded workspace, the one in `ws` included.
+    fn for_each_loaded(&mut self, mut apply: impl FnMut(&mut Workspace)) {
+        apply(&mut self.ws);
+        for entry in &mut self.workspaces {
+            if let Slot::Parked(workspace) = &mut entry.slot { apply(workspace); }
+        }
+    }
+
+    /// Shows tab `index`, loading it the first time.
+    fn activate_workspace(&mut self, index: usize) -> Task<Message> {
+        if index >= self.workspaces.len() { return Task::none(); }
+        // Project-bound overlays would act on the wrong project after the switch.
+        if index != self.active {
+            let _ = quick_open::update(&mut self.quick_open, quick_open::Message::Close, None, &[]);
+            let _ = command_palette::update(&mut self.command_palette, command_palette::Message::Close);
+            let _ = goto_line::update(&mut self.goto_line, goto_line::Message::Close);
+        }
+        self.active = index;
+        let task = self.swap_to(index);
+        self.ws.terminal_activity = false;
+        if let Some(tab) = self.ws.tabs.get_mut(self.ws.active_tab) { tab.sync_preview(); }
+        task
     }
 
     fn git_info(&mut self, message: impl Into<String>) {
-        self.git_status = Some((message.into(), std::time::Instant::now()));
+        self.ws.git_status = Some((message.into(), std::time::Instant::now()));
     }
 
     fn notify_git(&mut self, message: &git::Message) {
@@ -675,63 +1133,101 @@ impl State {
         }
     }
 
+    /// Every workspace tab as `session.json` keeps it. Tabs not loaded since startup keep
+    /// exactly what was read for them.
+    fn session(&self) -> workspaces::SessionFile {
+        workspaces::SessionFile {
+            workspaces: self.workspaces.iter().map(|entry| match &entry.slot {
+                Slot::Here => self.ws.session(),
+                Slot::Parked(workspace) => workspace.session(),
+                Slot::Unloaded(session) => session.clone(),
+            }).collect(),
+            active_workspace: self.active,
+        }
+    }
+
+    /// The unsaved edits of every tab, as the session file must hold them before quitting.
+    fn all_recovery(session: &workspaces::SessionFile) -> Vec<&RecoveryBuffer> {
+        session.workspaces.iter().flat_map(|workspace| &workspace.recovery).collect()
+    }
+
     fn persist_session(&mut self) {
         if self.last_session_write.elapsed() < Duration::from_millis(500) { return; }
         self.last_session_write = std::time::Instant::now();
-        let session = EditorSession {
-            root: self.root.clone(),
-            tabs: self.tabs.iter().filter_map(|tab| tab.path.clone()).collect(),
-            active: self.tabs.get(self.active_tab).and_then(|tab| tab.path.clone()),
-            recovery: self.tabs.iter().filter(|tab| tab.dirty).map(|tab| RecoveryBuffer {
-                path: tab.path.clone(), text: tab.content.text(),
-            }).collect(),
-        };
+        let session = self.session();
         if session == self.saved_session { return; }
-        if let Some(path) = config_path("session.json") {
-            if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
-            if let Ok(bytes) = serde_json::to_vec(&session) {
-                match write_session(&path, &bytes) {
-                    Ok(()) => self.saved_session = session,
-                    Err(err) => self.notify(format!("Could not save recovery: {err}")),
-                }
+        let path = match &self.session_store {
+            SessionStore::Memory => {
+                self.saved_session = session;
+                return;
+            }
+            SessionStore::Disk(None) => return,
+            SessionStore::Disk(Some(path)) => path.clone(),
+        };
+        if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
+        if let Ok(bytes) = serde_json::to_vec(&session) {
+            match write_session(&path, &bytes) {
+                Ok(()) => self.saved_session = session,
+                Err(err) => self.notify(format!("Could not save recovery: {err}")),
+            }
+        }
+    }
+
+    /// Whether every tab's unsaved edits are in the saved session, so quitting loses nothing.
+    fn recovery_saved(&mut self) -> bool {
+        self.last_session_write = std::time::Instant::now() - Duration::from_secs(1);
+        self.persist_session();
+        let session = self.session();
+        Self::all_recovery(&session) == Self::all_recovery(&self.saved_session)
+    }
+
+    /// Shows the terminal panel below the editor, starting a shell if none is open.
+    fn show_terminal(&mut self, focus: bool) {
+        self.ws.terminal_visible = true;
+        self.ws.terminal.ensure_started(&self.root_or_cwd());
+        self.ws.terminal.set_focused(focus);
+        let main = self.ws.panes.iter().find(|(_, kind)| **kind == PaneKind::Main).map(|(pane, _)| *pane);
+        if let Some(main) = main {
+            if let Some((_, split)) = self.ws.panes.split(pane_grid::Axis::Horizontal, main, PaneKind::Terminal) {
+                self.ws.panes.resize(split, 0.7);
             }
         }
     }
 
     fn root_or_cwd(&self) -> PathBuf {
-        self.root.clone().unwrap_or_else(|| PathBuf::from("."))
+        self.ws.root.clone().unwrap_or_else(|| PathBuf::from("."))
     }
 
     /// Re-inserts the sidebar pane (to Main's left) if it isn't already showing, and marks it
     /// visible/persisted. Safe to call when the sidebar is already visible -- it's a no-op.
     fn show_sidebar(&mut self) {
-        if self.sidebar_visible {
+        if self.ws.sidebar_visible {
             return;
         }
-        self.sidebar_visible = true;
+        self.ws.sidebar_visible = true;
         save_sidebar_visible(true);
-        let main_pane = self.panes.iter().find(|(_, kind)| **kind == PaneKind::Main).map(|(pane, _)| *pane);
+        let main_pane = self.ws.panes.iter().find(|(_, kind)| **kind == PaneKind::Main).map(|(pane, _)| *pane);
         if let Some(main_pane) = main_pane {
             if let Some((sidebar_pane, split)) =
-                self.panes.split(pane_grid::Axis::Vertical, main_pane, PaneKind::Sidebar)
+                self.ws.panes.split(pane_grid::Axis::Vertical, main_pane, PaneKind::Sidebar)
             {
                 // `split` always inserts the new pane after the target, i.e. to Main's
                 // right; swap them so the sidebar ends up on the left.
-                self.panes.swap(main_pane, sidebar_pane);
-                self.panes.resize(split, load_sidebar_ratio());
-                self.sidebar_split = Some(split);
+                self.ws.panes.swap(main_pane, sidebar_pane);
+                self.ws.panes.resize(split, self.ws.sidebar_ratio);
+                self.ws.sidebar_split = Some(split);
             }
         }
     }
 
     fn hide_sidebar(&mut self) {
-        self.sidebar_visible = false;
+        self.ws.sidebar_visible = false;
         save_sidebar_visible(false);
-        let sidebar_pane = self.panes.iter().find(|(_, kind)| **kind == PaneKind::Sidebar).map(|(pane, _)| *pane);
+        let sidebar_pane = self.ws.panes.iter().find(|(_, kind)| **kind == PaneKind::Sidebar).map(|(pane, _)| *pane);
         if let Some(sidebar_pane) = sidebar_pane {
-            self.panes.close(sidebar_pane);
+            self.ws.panes.close(sidebar_pane);
         }
-        self.sidebar_split = None;
+        self.ws.sidebar_split = None;
     }
 
     /// Single entry point for every sidebar-mode button (tree/git/project-search): clicking
@@ -740,11 +1236,11 @@ impl State {
     /// opening the sidebar first if it was closed. Returns `true` if `mode` ended up visible
     /// (as opposed to the sidebar collapsing), so callers can decide whether to e.g. refresh.
     fn toggle_sidebar_mode(&mut self, mode: SidebarMode) -> bool {
-        if self.sidebar_visible && self.sidebar_mode == mode {
+        if self.ws.sidebar_visible && self.ws.sidebar_mode == mode {
             self.hide_sidebar();
             false
         } else {
-            self.sidebar_mode = mode;
+            self.ws.sidebar_mode = mode;
             self.show_sidebar();
             true
         }
@@ -752,11 +1248,11 @@ impl State {
 
     /// The path the context menu should act on: the tree's current selection, or the root.
     fn context_target_path(&self) -> Option<PathBuf> {
-        self.tree
+        self.ws.tree
             .as_ref()
             .and_then(|t| t.selected_path())
             .map(Path::to_path_buf)
-            .or_else(|| self.root.clone())
+            .or_else(|| self.ws.root.clone())
     }
 
     /// The directory a New File/Folder should be created in.
@@ -773,8 +1269,8 @@ impl State {
     /// Reloads open, unmodified tabs from disk, in case the AI sidebar just edited them.
     fn reload_open_tabs(&mut self) -> Task<Message> {
         let mut tasks = Vec::new();
-        let repo = self.git.repo();
-        for tab in &mut self.tabs {
+        let repo = self.ws.git.repo();
+        for tab in &mut self.ws.tabs {
             if tab.dirty {
                 continue;
             }
@@ -790,8 +1286,8 @@ impl State {
                     tab.content = code_editor::Buffer::highlighted(&text, code_editor::metrics_for_zoom(self.zoom), &self.highlighter, &extension, &self.app_theme.syntax);
                     tab.content.set_wrap(self.word_wrap);
                     tab.blame.clear();
-                    self.lsp.changed(&path);
-                    tasks.push(load_diff_task(repo.clone(), self.root.as_deref(), path, text));
+                    self.ws.lsp.changed(&path);
+                    tasks.push(load_diff_task(repo.clone(), self.ws.root.as_deref(), path, text));
                 }
                 tab.saved_text = Some(tab.content.text());
             }
@@ -801,7 +1297,7 @@ impl State {
 
     /// Points open tabs at their new paths after files or folders moved; unsaved edits stay.
     fn paths_moved(&mut self, moves: &[(PathBuf, PathBuf)]) {
-        for tab in &mut self.tabs {
+        for tab in &mut self.ws.tabs {
             let Some(path) = &tab.path else { continue };
             if let Some(new_path) = moves.iter().find_map(|(from, to)| moved_path(path, from, to)) {
                 tab.path = Some(new_path);
@@ -811,24 +1307,24 @@ impl State {
 
     /// Read-only views must not receive text editing or saving actions.
     fn editor_hidden(&self) -> bool {
-        self.git_preview.is_some() || self.git_graph.is_some()
-            || self.tabs.get(self.active_tab).is_some_and(|tab| tab.image.is_some())
+        self.ws.git_preview.is_some() || self.ws.git_graph.is_some()
+            || self.ws.tabs.get(self.ws.active_tab).is_some_and(|tab| tab.image.is_some())
     }
 
     /// Uncovers the editor: closes the diff view and the commit graph.
     fn show_editor(&mut self) {
-        self.git_preview = None;
-        self.git_graph = None;
+        self.ws.git_preview = None;
+        self.ws.git_graph = None;
     }
 
     fn open_path(&mut self, path: PathBuf) -> Task<Message> {
         self.show_editor();
         if let Some(index) = self
-            .tabs
+            .ws.tabs
             .iter()
             .position(|t| t.path.as_deref() == Some(path.as_path()))
         {
-            self.active_tab = index;
+            self.ws.active_tab = index;
             recent_files::record(&mut self.recent_files, path.clone());
             return Task::none();
         }
@@ -848,14 +1344,14 @@ impl State {
         let mut content = code_editor::Buffer::highlighted(&text, code_editor::metrics_for_zoom(self.zoom), &self.highlighter, &extension, &self.app_theme.syntax);
         content.set_wrap(self.word_wrap);
         recent_files::record(&mut self.recent_files, path.clone());
-        self.lsp.set_root(&self.root_or_cwd());
+        self.ws.lsp.set_root(&self.root_or_cwd());
         let task = if let Some(preview) = &image {
             load_image_task(path.clone(), preview.request)
         } else {
-            self.lsp.open(&path, text.clone());
-            load_diff_task(self.git.repo(), self.root.as_deref(), path.clone(), text)
+            self.ws.lsp.open(&path, text.clone());
+            load_diff_task(self.ws.git.repo(), self.ws.root.as_deref(), path.clone(), text)
         };
-        self.tabs.push(Tab {
+        self.ws.tabs.push(Tab {
             path: Some(path),
             saved_text: Some(content.text()),
             content,
@@ -867,15 +1363,15 @@ impl State {
             hover: None,
             preview: None, image,
         });
-        self.active_tab = self.tabs.len() - 1;
+        self.ws.active_tab = self.ws.tabs.len() - 1;
         task
     }
 
     fn close_tab(&mut self, index: usize) -> Task<Message> {
-        if index >= self.tabs.len() {
+        if index >= self.ws.tabs.len() {
             return Task::none();
         }
-        if self.tabs[index].dirty {
+        if self.ws.tabs[index].dirty {
             return ask(self.window_handle, "Unsaved changes", "Discard unsaved changes?".into(), Message::CloseTabConfirmed(index));
         }
         self.remove_tab(index);
@@ -883,8 +1379,8 @@ impl State {
     }
 
     fn close_tabs(&mut self, anchor: usize, scope: TabCloseScope) -> Task<Message> {
-        let indices = tabs_to_close(self.tabs.len(), anchor, scope);
-        let unsaved = indices.iter().filter(|&&index| self.tabs[index].dirty).count();
+        let indices = tabs_to_close(self.ws.tabs.len(), anchor, scope);
+        let unsaved = indices.iter().filter(|&&index| self.ws.tabs[index].dirty).count();
         if unsaved > 0 {
             return ask(self.window_handle, "Unsaved changes", format!("Discard unsaved changes in {unsaved} tab(s) and close the selected tabs?"), Message::CloseTabsConfirmed(anchor, scope));
         }
@@ -894,25 +1390,25 @@ impl State {
 
     fn remove_tabs(&mut self, anchor: usize, scope: TabCloseScope) {
         // Descending indices keep the remaining targets and active tab stable.
-        for index in tabs_to_close(self.tabs.len(), anchor, scope) { self.remove_tab(index); }
+        for index in tabs_to_close(self.ws.tabs.len(), anchor, scope) { self.remove_tab(index); }
     }
 
     fn remove_tab(&mut self, index: usize) {
-        if let Some(path) = self.tabs[index].path.clone() {
-            self.lsp.closed(&path);
-            self.closed_tabs.push(path);
+        if let Some(path) = self.ws.tabs[index].path.clone() {
+            self.ws.lsp.closed(&path);
+            self.ws.closed_tabs.push(path);
         }
-        self.tabs.remove(index);
-        if self.tabs.is_empty() {
-            self.active_tab = 0;
-        } else if self.active_tab > index || self.active_tab >= self.tabs.len() {
-            self.active_tab = self.active_tab.saturating_sub(1).min(self.tabs.len() - 1);
+        self.ws.tabs.remove(index);
+        if self.ws.tabs.is_empty() {
+            self.ws.active_tab = 0;
+        } else if self.ws.active_tab > index || self.ws.active_tab >= self.ws.tabs.len() {
+            self.ws.active_tab = self.ws.active_tab.saturating_sub(1).min(self.ws.tabs.len() - 1);
         }
     }
 
     fn save(&mut self) -> Task<Message> {
         if self.editor_hidden() { return Task::none(); }
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        let Some(tab) = self.ws.tabs.get_mut(self.ws.active_tab) else {
             return Task::none();
         };
         let path = match &tab.path {
@@ -927,7 +1423,7 @@ impl State {
                 tab.path = Some(path.clone());
                 tab.saved_text = Some(text.clone());
                 tab.dirty = false;
-                if was_untitled { self.lsp.open(&path, text); } else { self.lsp.saved(&path, text); }
+                if was_untitled { self.ws.lsp.open(&path, text); } else { self.ws.lsp.saved(&path, text); }
                 // Saving changes neither the buffer nor the index, so the markers stay valid.
                 self.notify(format!("Saved {}", path.file_name().unwrap_or_default().to_string_lossy()));
                 return Task::none();
@@ -940,7 +1436,7 @@ impl State {
     /// Routes a key press to the active tab's editor. Returns whether it was handled.
     fn handle_editor_key(&mut self, key: &keyboard::Key, modifiers: keyboard::Modifiers) -> bool {
         if self.editor_hidden() { return false; }
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        let Some(tab) = self.ws.tabs.get_mut(self.ws.active_tab) else {
             return false;
         };
         let before = tab.content.undo_count();
@@ -953,7 +1449,7 @@ impl State {
     /// `undo_count()` taken just before some editor operation) no longer matches -- i.e. the
     /// operation actually changed the document, as opposed to just moving the cursor.
     fn mark_edited_if_changed(&mut self, before: usize) {
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        let Some(tab) = self.ws.tabs.get_mut(self.ws.active_tab) else {
             return;
         };
         if tab.content.undo_count() == before {
@@ -964,54 +1460,62 @@ impl State {
         tab.hover = None;
         let extension = tab.extension();
         tab.content.highlight(&self.highlighter, &extension, &self.app_theme.syntax);
-        if let Some(path) = &tab.path { self.lsp.changed(path); }
-        self.gutter_due = Some(std::time::Instant::now() + GUTTER_DEBOUNCE);
+        if let Some(path) = &tab.path { self.ws.lsp.changed(path); }
+        self.ws.gutter_due = Some(std::time::Instant::now() + GUTTER_DEBOUNCE);
     }
 
     /// Sends debounced edits to language servers and applies what they sent back.
     fn poll_lsp(&mut self) -> Task<Message> {
-        for path in self.lsp.take_due() {
-            if let Some(tab) = self.tabs.iter().find(|tab| tab.path.as_deref() == Some(path.as_path())) {
+        for path in self.ws.lsp.take_due() {
+            if let Some(tab) = self.ws.tabs.iter().find(|tab| tab.path.as_deref() == Some(path.as_path())) {
                 let text = tab.content.text();
-                self.lsp.change(&path, text);
+                self.ws.lsp.change(&path, text);
             }
         }
         let mut tasks = Vec::new();
-        for event in self.lsp.poll() {
+        for event in self.ws.lsp.poll() {
             match event {
                 lsp::Event::Diagnostics(path, diagnostics) => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.path.as_deref() == Some(path.as_path())) {
+                    if let Some(tab) = self.ws.tabs.iter_mut().find(|tab| tab.path.as_deref() == Some(path.as_path())) {
                         tab.diagnostics = diagnostics;
                     }
                 }
                 lsp::Event::Notice(text) => self.notify(text),
-                lsp::Event::Prompt(server) => self.lsp_prompt = Some(server),
+                lsp::Event::Prompt(server) => self.ws.lsp_prompt = Some(server),
+                // Installed from this tab: the other tabs' files that need it get it too.
+                lsp::Event::Installed(server, binary) => {
+                    for entry in &mut self.workspaces {
+                        let Slot::Parked(workspace) = &mut entry.slot else { continue };
+                        workspace.lsp.installed(server, binary.clone());
+                        if workspace.lsp_prompt.is_some_and(|prompt| prompt.id == server.id) { workspace.lsp_prompt = None; }
+                    }
+                }
                 lsp::Event::Hover { path, line, column, lines } => {
                     if lines.is_empty() { continue; }
-                    if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.path.as_deref() == Some(path.as_path())) {
+                    if let Some(tab) = self.ws.tabs.iter_mut().find(|tab| tab.path.as_deref() == Some(path.as_path())) {
                         let index = tab.content.inner.lines.get(line).map_or(0, |l| lsp::utf16_to_byte(l.text(), column));
-                        if let Some((_, _, anchor)) = self.hover_request.filter(|(l, i, _)| (*l, *i) == (line, index)) {
+                        if let Some((_, _, anchor)) = self.ws.hover_request.filter(|(l, i, _)| (*l, *i) == (line, index)) {
                             tab.hover = Some(code_editor::Hover { line, index, anchor, lines });
                         }
                     }
                 }
                 lsp::Event::Completion { path, line, column, items, incomplete } => {
                     // Only the answer to the latest request, for the tab and line it was about.
-                    let Some((_, _, request)) = self.completion_request.clone().filter(|(p, l, _)| *p == path && *l == line) else { continue };
-                    let Some(tab) = self.tabs.get(self.active_tab).filter(|tab| tab.path.as_deref() == Some(path.as_path())) else { continue };
+                    let Some((_, _, request)) = self.ws.completion_request.clone().filter(|(p, l, _)| *p == path && *l == line) else { continue };
+                    let Some(tab) = self.ws.tabs.get(self.ws.active_tab).filter(|tab| tab.path.as_deref() == Some(path.as_path())) else { continue };
                     let Some(text) = tab.content.inner.lines.get(line).map(|l| l.text()) else { continue };
                     if text.get(..request).is_none() || lsp::byte_to_utf16(text, request) != column { continue; }
                     let word = completion::word_start(text, request);
                     let mut session = completion::Session::new(path, line, request, word, items, incomplete);
-                    self.completion = session.refilter(&tab.content).then_some(session);
+                    self.ws.completion = session.refilter(&tab.content).then_some(session);
                 }
                 lsp::Event::Definition { path, line, column } => {
                     tasks.push(self.open_path(path.clone()));
-                    if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.path.as_deref() == Some(path.as_path())) {
+                    if let Some(tab) = self.ws.tabs.iter_mut().find(|tab| tab.path.as_deref() == Some(path.as_path())) {
                         let index = tab.content.inner.lines.get(line).map_or(0, |l| lsp::utf16_to_byte(l.text(), column));
                         tab.content.goto(line, index);
                         tab.hover = None;
-                        self.focus = Focus::Editor;
+                        self.ws.focus = Focus::Editor;
                     }
                 }
             }
@@ -1022,27 +1526,27 @@ impl State {
     /// Asks the language server for completions at the active tab's cursor. `trigger` is the
     /// non-word character just typed, when that is what prompted it.
     fn request_completion(&mut self, trigger: Option<char>) {
-        let Some(tab) = self.tabs.get(self.active_tab) else { return };
+        let Some(tab) = self.ws.tabs.get(self.ws.active_tab) else { return };
         let Some(path) = tab.path.clone() else { return };
         let cursor = tab.content.cursor;
         let Some(line) = tab.content.inner.lines.get(cursor.line) else { return };
         let column = lsp::byte_to_utf16(line.text(), cursor.index);
         let text = tab.content.text();
-        self.completion_request = Some((path.clone(), cursor.line, cursor.index));
-        self.lsp.completion(&path, cursor.line, column, text, trigger);
+        self.ws.completion_request = Some((path.clone(), cursor.line, cursor.index));
+        self.ws.lsp.completion(&path, cursor.line, column, text, trigger);
     }
 
     fn close_completion(&mut self) {
-        self.completion = None;
-        self.completion_request = None;
+        self.ws.completion = None;
+        self.ws.completion_request = None;
     }
 
     /// The completion list, if it belongs to the active tab and the cursor is still in its word.
     fn active_completion(&mut self) -> Option<&mut completion::Session> {
-        let tab = self.tabs.get(self.active_tab)?;
-        let valid = self.completion.as_ref().is_some_and(|session| tab.path.as_deref() == Some(session.path.as_path()) && session.at_cursor(&tab.content));
+        let tab = self.ws.tabs.get(self.ws.active_tab)?;
+        let valid = self.ws.completion.as_ref().is_some_and(|session| tab.path.as_deref() == Some(session.path.as_path()) && session.at_cursor(&tab.content));
         if !valid { self.close_completion(); }
-        self.completion.as_mut()
+        self.ws.completion.as_mut()
     }
 
     /// After the editor handled `key`: keeps the list in step with the typed word, and asks
@@ -1060,13 +1564,13 @@ impl State {
             return;
         }
         // A word character, or Backspace (`typed` is `None`): narrow the list to the word.
-        let Some(tab) = self.tabs.get(self.active_tab) else { return };
-        let (open, incomplete) = match self.completion.as_mut() {
+        let Some(tab) = self.ws.tabs.get(self.ws.active_tab) else { return };
+        let (open, incomplete) = match self.ws.completion.as_mut() {
             Some(session) => (session.refilter(&tab.content), session.incomplete),
             None => (false, false),
         };
-        let had_list = self.completion.is_some();
-        if !open { self.completion = None; }
+        let had_list = self.ws.completion.is_some();
+        if !open { self.ws.completion = None; }
         // Typing a word with no list yet, or one the server marked incomplete (it may be
         // missing what matches now): ask again, keeping what shows meanwhile.
         if typed.is_some() && (!had_list || incomplete) { self.request_completion(None); }
@@ -1074,7 +1578,7 @@ impl State {
 
     /// UTF-16 column of byte `index` on `line` of the active tab, with the tab's path.
     fn lsp_position(&self, line: usize, index: usize) -> Option<(PathBuf, usize)> {
-        let tab = self.tabs.get(self.active_tab)?;
+        let tab = self.ws.tabs.get(self.ws.active_tab)?;
         let column = lsp::byte_to_utf16(tab.content.inner.lines.get(line)?.text(), index);
         Some((tab.path.clone()?, column))
     }
@@ -1083,30 +1587,30 @@ impl State {
     /// buffer, and status reloads only while the source control panel is showing.
     fn poll_git(&mut self) -> Task<Message> {
         let mut tasks = Vec::new();
-        if self.git.set_project(self.root.as_deref()) {
+        if self.ws.git.set_project(self.ws.root.as_deref()) {
             tasks.push(self.reload_git_views());
-            if self.sidebar_visible && self.sidebar_mode == SidebarMode::Git {
+            if self.ws.sidebar_visible && self.ws.sidebar_mode == SidebarMode::Git {
                 tasks.push(Task::done(Message::Git(git::Message::Refresh)));
             }
         }
-        if let Some(changes) = self.git.take_changes() {
+        if let Some(changes) = self.ws.git.take_changes() {
             if changes.repository {
                 tasks.push(self.reload_git_views());
-                if let Some(graph) = &mut self.git_graph { tasks.push(graph.reload().map(Message::GitGraph)); }
-            } else if let Some(preview) = self.git_preview.as_mut().filter(|preview| preview.live) {
+                if let Some(graph) = &mut self.ws.git_graph { tasks.push(graph.reload().map(Message::GitGraph)); }
+            } else if let Some(preview) = self.ws.git_preview.as_mut().filter(|preview| preview.live) {
                 // Working-tree edits only change the unstaged half of an open preview.
-                tasks.push(load_preview_task(self.git.repo(), preview.root.clone(), preview.path.clone()));
+                tasks.push(load_preview_task(self.ws.git.repo(), preview.root.clone(), preview.path.clone()));
             }
-            if self.sidebar_visible && self.sidebar_mode == SidebarMode::Git {
+            if self.ws.sidebar_visible && self.ws.sidebar_mode == SidebarMode::Git {
                 let cwd = self.root_or_cwd();
-                tasks.push(git::update(&mut self.git, git::Message::Refresh, cwd).map(Message::Git));
+                tasks.push(git::update(&mut self.ws.git, git::Message::Refresh, cwd).map(Message::Git));
             }
         }
-        if self.gutter_due.is_some_and(|due| std::time::Instant::now() >= due) {
-            self.gutter_due = None;
-            if let Some(tab) = self.tabs.get(self.active_tab).filter(|tab| tab.image.is_none()) {
+        if self.ws.gutter_due.is_some_and(|due| std::time::Instant::now() >= due) {
+            self.ws.gutter_due = None;
+            if let Some(tab) = self.ws.tabs.get(self.ws.active_tab).filter(|tab| tab.image.is_none()) {
                 if let Some(path) = tab.path.clone() {
-                    tasks.push(load_diff_task(self.git.repo(), self.root.as_deref(), path, tab.content.text()));
+                    tasks.push(load_diff_task(self.ws.git.repo(), self.ws.root.as_deref(), path, tab.content.text()));
                 }
             }
         }
@@ -1116,20 +1620,20 @@ impl State {
     /// Reloads the open diff preview and every tab's markers from current repository state.
     fn reload_git_views(&mut self) -> Task<Message> {
         let mut tasks = vec![self.reload_all_diffs()];
-        if let Some(preview) = self.git_preview.as_mut().filter(|preview| preview.live) {
+        if let Some(preview) = self.ws.git_preview.as_mut().filter(|preview| preview.live) {
             preview.result = None;
-            tasks.push(load_preview_task(self.git.repo(), preview.root.clone(), preview.path.clone()));
+            tasks.push(load_preview_task(self.ws.git.repo(), preview.root.clone(), preview.path.clone()));
         }
         Task::batch(tasks)
     }
 
     /// Recomputes the diff markers of every open tab, e.g. after the index changed.
     fn reload_all_diffs(&self) -> Task<Message> {
-        let repo = self.git.repo();
-        Task::batch(self.tabs.iter().filter_map(|tab| {
+        let repo = self.ws.git.repo();
+        Task::batch(self.ws.tabs.iter().filter_map(|tab| {
             if tab.image.is_some() { return None; }
             let path = tab.path.clone()?;
-            Some(load_diff_task(repo.clone(), self.root.as_deref(), path, tab.content.text()))
+            Some(load_diff_task(repo.clone(), self.ws.root.as_deref(), path, tab.content.text()))
         }))
     }
 
@@ -1138,9 +1642,10 @@ impl State {
     /// Turns word wrap on or off for every open file, and for files opened from now on.
     fn toggle_word_wrap(&mut self) {
         self.word_wrap = !self.word_wrap;
-        for tab in &mut self.tabs {
-            tab.content.set_wrap(self.word_wrap);
-        }
+        let wrap = self.word_wrap;
+        self.for_each_loaded(|workspace| for tab in &mut workspace.tabs {
+            tab.content.set_wrap(wrap);
+        });
         save_word_wrap(self.word_wrap);
     }
 
@@ -1152,54 +1657,54 @@ impl State {
             ViewAction::ToggleWordWrap => return self.toggle_word_wrap(),
         };
         let metrics = code_editor::metrics_for_zoom(self.zoom);
-        for tab in &mut self.tabs {
+        self.for_each_loaded(|workspace| for tab in &mut workspace.tabs {
             tab.content.set_metrics(metrics);
-        }
+        });
         save_zoom(self.zoom);
     }
 
     fn ai_input(&self) -> String {
-        match self.ai_mode {
-            AiMode::Http => self.chat.input_text(),
-            AiMode::Acp => self.acp.input_text(),
-            AiMode::Cursor => self.cursor.input_text(),
-            AiMode::Grok => self.grok.input_text(),
-            AiMode::Codex => self.codex.input_text(),
+        match self.ws.ai_mode {
+            AiMode::Http => self.ws.chat.input_text(),
+            AiMode::Acp => self.ws.acp.input_text(),
+            AiMode::Cursor => self.ws.cursor.input_text(),
+            AiMode::Grok => self.ws.grok.input_text(),
+            AiMode::Codex => self.ws.codex.input_text(),
         }
     }
 
     fn set_ai_input(&mut self, text: &str) {
-        match self.ai_mode {
-            AiMode::Http => self.chat.set_input(text),
-            AiMode::Acp => self.acp.set_input(text),
-            AiMode::Cursor => self.cursor.set_input(text),
-            AiMode::Grok => self.grok.set_input(text),
-            AiMode::Codex => self.codex.set_input(text),
+        match self.ws.ai_mode {
+            AiMode::Http => self.ws.chat.set_input(text),
+            AiMode::Acp => self.ws.acp.set_input(text),
+            AiMode::Cursor => self.ws.cursor.set_input(text),
+            AiMode::Grok => self.ws.grok.set_input(text),
+            AiMode::Codex => self.ws.codex.set_input(text),
         }
         self.refresh_mentions();
     }
 
     fn ai_attachments(&mut self) -> &mut Vec<ai_context::Attachment> {
-        match self.ai_mode {
-            AiMode::Http => &mut self.chat.attachments,
-            AiMode::Acp => &mut self.acp.attachments,
-            AiMode::Cursor => &mut self.cursor.attachments,
-            AiMode::Grok => &mut self.grok.attachments,
-            AiMode::Codex => &mut self.codex.attachments,
+        match self.ws.ai_mode {
+            AiMode::Http => &mut self.ws.chat.attachments,
+            AiMode::Acp => &mut self.ws.acp.attachments,
+            AiMode::Cursor => &mut self.ws.cursor.attachments,
+            AiMode::Grok => &mut self.ws.grok.attachments,
+            AiMode::Codex => &mut self.ws.codex.attachments,
         }
     }
 
     /// Where one-off AI requests (commit messages, inline edits) go: the assistant selected
     /// in the AI panel.
     fn ai_backend(&self) -> Result<ai_oneshot::Backend, String> {
-        match self.ai_mode {
-            AiMode::Http => self.chat.connection()
+        match self.ws.ai_mode {
+            AiMode::Http => self.ws.chat.connection()
                 .map(|(base_url, api_key, model)| ai_oneshot::Backend::Http { base_url, api_key, model })
                 .ok_or_else(|| "Choose a model in the AI panel's settings first".to_string()),
-            AiMode::Acp => Ok(ai_oneshot::Backend::Agent { provider: self.acp.provider(), model: self.acp.preferred_model() }),
-            AiMode::Cursor => Ok(ai_oneshot::Backend::Agent { provider: self.cursor.provider(), model: self.cursor.preferred_model() }),
-            AiMode::Grok => Ok(ai_oneshot::Backend::Agent { provider: self.grok.provider(), model: self.grok.preferred_model() }),
-            AiMode::Codex => Ok(ai_oneshot::Backend::Agent { provider: self.codex.provider(), model: self.codex.preferred_model() }),
+            AiMode::Acp => Ok(ai_oneshot::Backend::Agent { provider: self.ws.acp.provider(), model: self.ws.acp.preferred_model() }),
+            AiMode::Cursor => Ok(ai_oneshot::Backend::Agent { provider: self.ws.cursor.provider(), model: self.ws.cursor.preferred_model() }),
+            AiMode::Grok => Ok(ai_oneshot::Backend::Agent { provider: self.ws.grok.provider(), model: self.ws.grok.preferred_model() }),
+            AiMode::Codex => Ok(ai_oneshot::Backend::Agent { provider: self.ws.codex.provider(), model: self.ws.codex.preferred_model() }),
         }
     }
 
@@ -1207,22 +1712,22 @@ impl State {
     fn refresh_mentions(&mut self) {
         let text = self.ai_input();
         let Some(query) = ai_mention::typing(&text) else {
-            self.mentions.clear();
-            self.mention_files = None;
+            self.ws.mentions.clear();
+            self.ws.mention_files = None;
             return;
         };
         let root = self.root_or_cwd();
-        if self.mention_files.as_ref().is_none_or(|(listed, _)| *listed != root) {
-            let files = self.root.as_deref().map(quick_open::walk).unwrap_or_default();
-            self.mention_files = Some((root.clone(), ai_mention::relative_paths(&root, &files)));
+        if self.ws.mention_files.as_ref().is_none_or(|(listed, _)| *listed != root) {
+            let files = self.ws.root.as_deref().map(quick_open::walk).unwrap_or_default();
+            self.ws.mention_files = Some((root.clone(), ai_mention::relative_paths(&root, &files)));
         }
-        self.mentions = self.mention_files.as_ref().map(|(_, files)| ai_mention::suggest(files, query)).unwrap_or_default();
+        self.ws.mentions = self.ws.mention_files.as_ref().map(|(_, files)| ai_mention::suggest(files, query)).unwrap_or_default();
     }
 
     /// Attaches the project files `@`-mentioned in the AI input that aren't attached yet.
     /// Mentions that aren't files in the project are left as plain text.
     fn attach_mentions(&mut self) {
-        let Some(root) = self.root.clone() else { return };
+        let Some(root) = self.ws.root.clone() else { return };
         let Ok(canonical_root) = root.canonicalize() else { return };
         for mention in ai_mention::mentioned(&self.ai_input()) {
             if self.ai_attachments().iter().any(|attachment| attachment.name == mention) { continue; }
@@ -1240,26 +1745,26 @@ impl State {
                 Err(err) => self.notify(format!("Could not attach {mention}: {err}")),
             }
         }
-        self.mentions.clear();
+        self.ws.mentions.clear();
     }
 
     /// Puts AI-suggested code into the active tab at the caret, replacing any selection.
     fn insert_code(&mut self, code: &str) {
-        if self.editor_hidden() || self.tabs.get(self.active_tab).is_none() {
+        if self.editor_hidden() || self.ws.tabs.get(self.ws.active_tab).is_none() {
             self.notify("Open a file tab to insert code");
             return;
         }
-        let before = self.tabs[self.active_tab].content.undo_count();
-        self.tabs[self.active_tab].content.replace_selection(&code.replace("\r\n", "\n"));
-        self.focus = Focus::Editor;
+        let before = self.ws.tabs[self.ws.active_tab].content.undo_count();
+        self.ws.tabs[self.ws.active_tab].content.replace_selection(&code.replace("\r\n", "\n"));
+        self.ws.focus = Focus::Editor;
         self.mark_edited_if_changed(before);
     }
 
     fn open_ai_diff(&mut self, diff: Option<ai_diff::FileDiff>) {
         match diff {
             Some(diff) => {
-                self.git_preview = Some(diff.preview(&self.root_or_cwd()));
-                self.focus = Focus::Editor;
+                self.ws.git_preview = Some(diff.preview(&self.root_or_cwd()));
+                self.ws.focus = Focus::Editor;
             }
             None => self.notify("That change is no longer available"),
         }
@@ -1269,12 +1774,12 @@ impl State {
     /// the user is meant to finish typing it.
     fn ask_ai(&mut self, prompt: &str, attachment: ai_context::Attachment, send: bool) -> Task<Message> {
         let mut task = Task::none();
-        if !self.ai_visible { task = update(self, Message::AiToggle); }
+        if !self.ws.ai_visible { task = update(self, Message::AiToggle); }
         if self.ai_attachments().len() < 16 { self.ai_attachments().push(attachment); }
         else { self.notify("Maximum 16 attachments per message."); }
         self.set_ai_input(prompt);
         if send {
-            let send = match self.ai_mode {
+            let send = match self.ws.ai_mode {
                 AiMode::Http => Message::Chat(chat::Message::Send),
                 AiMode::Acp => Message::Acp(acp::Message::Send),
                 AiMode::Cursor => Message::Cursor(acp::Message::Send),
@@ -1294,8 +1799,8 @@ impl State {
     }
 
     fn ai_act(&mut self, act: AiAct) -> Task<Message> {
-        if self.tabs.get(self.active_tab).is_some_and(|tab| tab.image.is_some()) { return Task::none(); }
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        if self.ws.tabs.get(self.ws.active_tab).is_some_and(|tab| tab.image.is_some()) { return Task::none(); }
+        let Some(tab) = self.ws.tabs.get_mut(self.ws.active_tab) else {
             self.notify("Open a file first");
             return Task::none();
         };
@@ -1304,7 +1809,7 @@ impl State {
             Some((start, end)) => tab.content.text_between(start, end).unwrap_or_default(),
             None => tab.content.text(),
         };
-        let tab = &self.tabs[self.active_tab];
+        let tab = &self.ws.tabs[self.ws.active_tab];
         let name = self.tab_label(tab);
         let label = match bounds {
             Some((start, end)) => format!("{name} (lines {}-{})", start.line + 1, end.line + 1),
@@ -1339,7 +1844,7 @@ impl State {
     /// Cmd/Ctrl+K: asks for an instruction to rewrite the selection, or the caret's line.
     fn start_inline_edit(&mut self) -> Task<Message> {
         if self.editor_hidden() { return Task::none(); }
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        let Some(tab) = self.ws.tabs.get_mut(self.ws.active_tab) else {
             self.notify("Open a file first");
             return Task::none();
         };
@@ -1349,7 +1854,7 @@ impl State {
             (cosmic_text::Cursor::new(line, 0), cosmic_text::Cursor::new(line, length))
         });
         let original = tab.content.text_between(start, end).unwrap_or_default();
-        self.inline_edit = Some(inline_edit::InlineEdit {
+        self.ws.inline_edit = Some(inline_edit::InlineEdit {
             path: tab.path.clone(), start, end, original, instruction: String::new(), stage: inline_edit::Stage::Prompt,
         });
         iced::widget::operation::focus(inline_edit::INPUT_ID)
@@ -1361,11 +1866,11 @@ impl State {
             Err(err) => { self.notify(err); return Task::none(); }
         };
         let root = self.root_or_cwd();
-        let Some(edit) = self.inline_edit.as_ref().filter(|edit| matches!(edit.stage, inline_edit::Stage::Prompt) && !edit.instruction.trim().is_empty()) else {
+        let Some(edit) = self.ws.inline_edit.as_ref().filter(|edit| matches!(edit.stage, inline_edit::Stage::Prompt) && !edit.instruction.trim().is_empty()) else {
             return Task::none();
         };
-        let Some(tab) = self.tabs.iter().find(|tab| tab.path == edit.path) else {
-            self.inline_edit = None;
+        let Some(tab) = self.ws.tabs.iter().find(|tab| tab.path == edit.path) else {
+            self.ws.inline_edit = None;
             return Task::none();
         };
         let last = tab.content.line_count().saturating_sub(1);
@@ -1374,9 +1879,9 @@ impl State {
         let after = tab.content.text_between(edit.end, end_of_file).unwrap_or_default();
         let language = self.highlighter.language_name(&tab.extension()).to_string();
         let prompt = inline_edit::prompt(&self.tab_label(tab), &language, &before, &edit.original, &after, &edit.instruction);
-        self.inline_generation += 1;
-        let id = self.inline_generation;
-        if let Some(edit) = &mut self.inline_edit { edit.stage = inline_edit::Stage::Working(id); }
+        self.ws.inline_generation += 1;
+        let id = self.ws.inline_generation;
+        if let Some(edit) = &mut self.ws.inline_edit { edit.stage = inline_edit::Stage::Working(id); }
         Task::perform(ai_oneshot::ask(backend, root, prompt), move |result| Message::InlineEditReady(id, result))
     }
 
@@ -1394,7 +1899,7 @@ impl State {
         };
         if result.is_ok() {
             self.notify("Deleted successfully");
-            if let Some(index) = self.tabs.iter().position(|t| t.path.as_deref() == Some(path)) {
+            if let Some(index) = self.ws.tabs.iter().position(|t| t.path.as_deref() == Some(path)) {
                 task = self.close_tab(index);
             }
         } else if let Err(err) = result { self.notify(format!("Delete failed: {err}")); }
@@ -1409,7 +1914,7 @@ impl State {
 /// changed (a reload from disk, an AI edit, switching tabs).
 fn update_and_sync_preview(state: &mut State, message: Message) -> Task<Message> {
     let task = update(state, message);
-    if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+    if let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab) {
         tab.sync_preview();
     }
     task
@@ -1432,7 +1937,39 @@ fn git_notification(message: &git::Message) -> Option<Result<String, String>> {
     }
 }
 
+/// Handles `message` for the workspace it belongs to: an addressed one (`Message::In`) for
+/// its tab, wherever that is; anything else for the tab in `ws`. What the handling starts
+/// reports back to that same tab.
 fn update(state: &mut State, message: Message) -> Task<Message> {
+    if let Message::In(id, message) = message {
+        return route(state, id, *message);
+    }
+    let id = state.ws.id;
+    tag(handle(state, message), id)
+}
+
+/// Handles `message` with workspace `id` in `ws`, then puts the shown tab's workspace back.
+/// Messages for a tab that was closed meanwhile are dropped.
+fn route(state: &mut State, id: WorkspaceId, message: Message) -> Task<Message> {
+    if message.is_global() {
+        return update(state, message);
+    }
+    let Some(index) = state.workspace_index(id) else { return Task::none() };
+    if matches!(state.workspaces[index].slot, Slot::Unloaded(_)) { return Task::none(); }
+    if index == state.current {
+        return tag(handle(state, message), id);
+    }
+    let back = state.workspaces[state.current].id;
+    let _ = state.swap_to(index);
+    let task = tag(handle(state, message), id);
+    if let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab) { tab.sync_preview(); }
+    if let Some(back) = state.workspace_index(back) {
+        let _ = state.swap_to(back);
+    }
+    task
+}
+
+fn handle(state: &mut State, message: Message) -> Task<Message> {
     if matches!(&message, Message::TabClosed(_) | Message::CloseTabs(_, _) | Message::CloseTabConfirmed(_) | Message::CloseTabsConfirmed(_, _) | Message::TabSelected(_) | Message::FileAction(_) | Message::ReopenClosedTab)
         || matches!(&message, Message::KeyPressed(_, modifiers) if modifiers.command()) {
         state.last_session_write = std::time::Instant::now() - Duration::from_secs(1);
@@ -1444,14 +1981,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         return Task::none();
     }
     // The previewed buffer is hidden; edits to it would go unseen.
-    if state.tabs.get(state.active_tab).is_some_and(|tab| tab.preview.is_some()) && matches!(&message,
+    if state.ws.tabs.get(state.ws.active_tab).is_some_and(|tab| tab.preview.is_some()) && matches!(&message,
         Message::EditorAction(_) | Message::EditAction(_) | Message::EditorPasted(_) | Message::Search(_)
         | Message::InlineEditStart) {
         return Task::none();
     }
     match message {
         Message::MarkdownPreviewToggle => {
-            if let Some(tab) = state.tabs.get_mut(state.active_tab).filter(|tab| tab.is_markdown()) {
+            if let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab).filter(|tab| tab.is_markdown()) {
                 tab.preview = if tab.preview.is_some() { None } else { Some(Default::default()) };
                 tab.hover = None;
             }
@@ -1474,90 +2011,82 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::About(msg) => task = about::update(&mut state.about, msg).map(Message::About),
         Message::FileBugReport => open_url("https://github.com/ailegion/editor/issues/new"),
         Message::RestartUpdate => {
-            state.last_session_write = std::time::Instant::now() - Duration::from_secs(1);
-            state.persist_session();
-            let recovery: Vec<_> = state.tabs.iter().filter(|tab| tab.dirty).map(|tab| RecoveryBuffer {
-                path: tab.path.clone(), text: tab.content.text(),
-            }).collect();
-            if recovery != state.saved_session.recovery {
+            if !state.recovery_saved() {
                 state.notify("Could not save recovery. Save your files before updating.");
                 return Task::none();
             }
             match state.updater.restart() {
-                Ok(()) => { state.terminal.shutdown(); return iced::exit(); }
+                Ok(()) => {
+                    state.for_each_loaded(|workspace| workspace.terminal.shutdown());
+                    return iced::exit();
+                }
                 Err(error) => state.notify(error),
             }
         }
         Message::TerminalToggle => {
-            state.terminal_visible = !state.terminal_visible;
-            if state.terminal_visible {
-                state.terminal.ensure_started(&state.root_or_cwd());
-                state.terminal.set_focused(true);
-                task = iced::widget::operation::focus("terminal-canvas");
-                let main = state.panes.iter().find(|(_, kind)| **kind == PaneKind::Main).map(|(pane, _)| *pane);
-                if let Some(main) = main {
-                    if let Some((_, split)) = state.panes.split(pane_grid::Axis::Horizontal, main, PaneKind::Terminal) {
-                        state.panes.resize(split, 0.7);
-                    }
-                }
-
+            if !state.ws.terminal_visible {
+                // A tab in the background opens it without taking focus from the user.
+                let focus = !state.in_background();
+                state.show_terminal(focus);
+                if focus { task = iced::widget::operation::focus("terminal-canvas"); }
             } else {
-                state.terminal.set_focused(false);
-                let pane = state.panes.iter().find(|(_, kind)| **kind == PaneKind::Terminal).map(|(pane, _)| *pane);
-                if let Some(pane) = pane { state.panes.close(pane); }
+                state.ws.terminal_visible = false;
+                state.ws.terminal.set_focused(false);
+                let pane = state.ws.panes.iter().find(|(_, kind)| **kind == PaneKind::Terminal).map(|(pane, _)| *pane);
+                if let Some(pane) = pane { state.ws.panes.close(pane); }
             }
         }
         Message::Terminal(terminal::panel::Message::Hide) => return update(state, Message::TerminalToggle),
-        Message::Terminal(message) => task = state.terminal.update(message, &state.root_or_cwd()).map(Message::Terminal),
+        Message::Terminal(message) => task = state.ws.terminal.update(message, &state.root_or_cwd()).map(Message::Terminal),
         Message::ToggleFold(line) => {
-            if let Some(tab) = state.tabs.get_mut(state.active_tab) { tab.content.toggle_fold(line); }
+            if let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab) { tab.content.toggle_fold(line); }
         }
         Message::CompletionAccept(index) => {
-            let Some(session) = state.completion.take() else { return Task::none() };
-            state.completion_request = None;
-            let Some(tab) = state.tabs.get_mut(state.active_tab).filter(|tab| tab.path.as_deref() == Some(session.path.as_path())) else { return Task::none() };
+            let Some(session) = state.ws.completion.take() else { return Task::none() };
+            state.ws.completion_request = None;
+            let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab).filter(|tab| tab.path.as_deref() == Some(session.path.as_path())) else { return Task::none() };
             let Some(edits) = index.or_else(|| session.selected_item()).and_then(|index| session.edits(index, &tab.content)) else { return Task::none() };
             let before = tab.content.undo_count();
             tab.content.replace_ranges(&edits, 0);
-            state.focus = Focus::Editor;
+            state.ws.focus = Focus::Editor;
             state.mark_edited_if_changed(before);
         }
         Message::EditorAction(action) => {
-            state.focus = Focus::Editor;
+            state.ws.focus = Focus::Editor;
             state.close_completion();
             let before = state
-                .tabs
-                .get(state.active_tab)
+                .ws.tabs
+                .get(state.ws.active_tab)
                 .map(|t| t.content.undo_count())
                 .unwrap_or(0);
-            if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+            if let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab) {
                 tab.content.perform(action);
                 tab.hover = None;
             }
             state.mark_edited_if_changed(before);
         }
         Message::EditorViewport(width, height) => {
-            if let Some(tab) = state.tabs.get_mut(state.active_tab) { tab.content.set_viewport(width, height); }
+            if let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab) { tab.content.set_viewport(width, height); }
         }
         Message::Search(msg) => {
             let before = state
-                .tabs
-                .get(state.active_tab)
+                .ws.tabs
+                .get(state.ws.active_tab)
                 .map(|t| t.content.undo_count())
                 .unwrap_or(0);
-            if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+            if let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab) {
                 code_editor::search::update(&mut tab.search, &mut tab.content, msg);
             }
             state.mark_edited_if_changed(before);
         }
         Message::ProjectSearch(msg) => {
-            let root = state.root.clone();
-            let (search_task, opened) = project_search::update(&mut state.project_search, msg, root.as_deref());
+            let root = state.ws.root.clone();
+            let (search_task, opened) = project_search::update(&mut state.ws.project_search, msg, root.as_deref());
             task = search_task.map(Message::ProjectSearch);
             if let Some((path, line)) = opened {
                 task = Task::batch([task, state.open_path(path)]);
-                state.focus = Focus::Editor;
-                if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+                state.ws.focus = Focus::Editor;
+                if let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab) {
                     tab.content.goto_line(line.saturating_sub(1));
                 }
             }
@@ -1566,16 +2095,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.toggle_sidebar_mode(SidebarMode::ProjectSearch);
         }
         Message::QuickOpen(msg) => {
-            let root = state.root.clone();
+            let root = state.ws.root.clone();
             let (t, opened) = quick_open::update(&mut state.quick_open, msg, root.as_deref(), &state.recent_files);
             task = t.map(Message::QuickOpen);
             if let Some(path) = opened {
                 task = Task::batch([task, state.open_path(path)]);
-                state.focus = Focus::Editor;
+                state.ws.focus = Focus::Editor;
             }
         }
         Message::ToggleQuickOpen => {
-            let root = state.root.clone();
+            let root = state.ws.root.clone();
             let msg = if state.quick_open.visible {
                 quick_open::Message::Close
             } else {
@@ -1607,16 +2136,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::GotoLine(msg) => {
             if let Some(line) = goto_line::update(&mut state.goto_line, msg) {
-                if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+                if let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab) {
                     tab.content.goto_line(line.saturating_sub(1));
                 }
-                state.focus = Focus::Editor;
+                state.ws.focus = Focus::Editor;
             }
         }
         Message::ToggleGotoLine => {
             if state.goto_line.visible {
                 let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
-            } else if state.tabs.get(state.active_tab).is_some() {
+            } else if state.ws.tabs.get(state.ws.active_tab).is_some() {
                 state.quick_open.visible = false;
                 state.theme_install.visible = false;
                 let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
@@ -1659,17 +2188,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Git(git::Message::OpenDiff(path)) => {
             let root = state.root_or_cwd();
-            state.focus = Focus::Editor;
-            state.git_preview = Some(git_preview::Preview {
+            state.ws.focus = Focus::Editor;
+            state.ws.git_preview = Some(git_preview::Preview {
                 root: root.clone(), path: path.clone(), result: None, live: true,
             });
-            task = load_preview_task(state.git.repo(), root, path);
+            task = load_preview_task(state.ws.git.repo(), root, path);
         }
         Message::Git(git::Message::GenerateMessage) => match state.ai_backend() {
             Err(err) => state.notify(err),
             Ok(backend) => {
                 let cwd = state.root_or_cwd();
-                let _ = git::update(&mut state.git, git::Message::GenerateMessage, cwd.clone());
+                let _ = git::update(&mut state.ws.git, git::Message::GenerateMessage, cwd.clone());
                 task = Task::perform(async move {
                     let prompt = tokio::task::spawn_blocking({
                         let cwd = cwd.clone();
@@ -1680,35 +2209,35 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         },
         Message::GitPreviewLoaded(root, path, result) => {
-            if let Some(preview) = &mut state.git_preview {
+            if let Some(preview) = &mut state.ws.git_preview {
                 if preview.root == root && preview.path == path {
                     preview.result = Some(result);
                 }
             }
         }
-        Message::CloseGitPreview => state.git_preview = None,
+        Message::CloseGitPreview => state.ws.git_preview = None,
         Message::ImageLoaded(request, result) => {
-            if let Some(preview) = state.tabs.iter_mut().filter_map(|tab| tab.image.as_mut()).find(|preview| preview.request == request) {
+            if let Some(preview) = state.ws.tabs.iter_mut().filter_map(|tab| tab.image.as_mut()).find(|preview| preview.request == request) {
                 preview.receive(request, result);
             }
         }
         Message::GitGraphOpen => {
-            if state.git.repo().is_none() {
+            if state.ws.git.repo().is_none() {
                 state.git_info("This folder is not inside a Git repository.");
             } else {
                 let (graph, load) = git_graph::Graph::open(state.root_or_cwd());
-                state.git_preview = None;
-                state.git_graph = Some(graph);
-                state.focus = Focus::Editor;
+                state.ws.git_preview = None;
+                state.ws.git_graph = Some(graph);
+                state.ws.focus = Focus::Editor;
                 task = load.map(Message::GitGraph);
             }
         }
-        Message::GitGraph(git_graph::Message::Close) => state.git_graph = None,
+        Message::GitGraph(git_graph::Message::Close) => state.ws.git_graph = None,
         Message::GitGraph(git_graph::Message::OpenFile(hash, file)) => {
-            if let Some(graph) = &state.git_graph {
+            if let Some(graph) = &state.ws.git_graph {
                 let (root, parent) = (graph.root.clone(), graph.parent_of(&hash));
                 let label = format!("{} @ {}", file.path, &hash[..hash.len().min(7)]);
-                state.git_preview = Some(git_preview::Preview { root: root.clone(), path: label.clone(), result: None, live: false });
+                state.ws.git_preview = Some(git_preview::Preview { root: root.clone(), path: label.clone(), result: None, live: false });
                 task = Task::perform(async move {
                     tokio::task::spawn_blocking(move || git_graph::file_patch(&root, &hash, parent.as_deref(), &file))
                         .await.map_err(|err| err.to_string())?
@@ -1716,12 +2245,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::GitGraphPatchLoaded(label, result) => {
-            if let Some(preview) = state.git_preview.as_mut().filter(|preview| !preview.live && preview.path == label) {
+            if let Some(preview) = state.ws.git_preview.as_mut().filter(|preview| !preview.live && preview.path == label) {
                 preview.result = Some(result);
             }
         }
         Message::GitGraph(msg) => {
-            if let Some(graph) = &mut state.git_graph {
+            if let Some(graph) = &mut state.ws.git_graph {
                 task = git_graph::update(graph, msg).map(Message::GitGraph);
             }
         }
@@ -1733,7 +2262,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Git(git::Message::ShowGraph) => {
             let cwd = state.root_or_cwd();
-            let _ = git::update(&mut state.git, git::Message::ShowGraph, cwd);
+            let _ = git::update(&mut state.ws.git, git::Message::ShowGraph, cwd);
             task = update(state, Message::GitGraphOpen);
         }
         Message::Git(git::Message::Discard(files)) => {
@@ -1741,16 +2270,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::DiscardGitConfirmed(cwd, files) => {
             if cwd != state.root_or_cwd() { return Task::none(); }
-            let paths: Vec<_> = state.tabs.iter().filter_map(|tab| {
+            let paths: Vec<_> = state.ws.tabs.iter().filter_map(|tab| {
                 let path = tab.path.as_ref()?;
                 files.iter().any(|file| cwd.join(&file.path) == *path).then(|| (path.clone(), tab.content.text()))
             }).collect();
-            task = git::update(&mut state.git, git::Message::DiscardConfirmed(files), cwd).map(move |msg| Message::DiscardGitFinished(paths.clone(), msg));
+            task = git::update(&mut state.ws.git, git::Message::DiscardConfirmed(files), cwd).map(move |msg| Message::DiscardGitFinished(paths.clone(), msg));
         }
         Message::DiscardGitFinished(paths, msg) => {
             if matches!(msg, git::Message::Discarded(Ok(()))) {
-                for index in (0..state.tabs.len()).rev() {
-                    let tab = &mut state.tabs[index];
+                for index in (0..state.ws.tabs.len()).rev() {
+                    let tab = &mut state.ws.tabs[index];
                     if paths.iter().any(|(path, snapshot)| tab.path.as_ref() == Some(path) && tab.content.text() == *snapshot) {
                         if tab.path.as_ref().is_some_and(|p| !p.exists()) {
                             state.remove_tab(index);
@@ -1761,7 +2290,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             state.notify_git(&msg);
             let cwd = state.root_or_cwd();
-            task = Task::batch([task, git::update(&mut state.git, msg, cwd).map(Message::Git)]);
+            task = Task::batch([task, git::update(&mut state.ws.git, msg, cwd).map(Message::Git)]);
         }
         Message::Git(msg) => {
             state.notify_git(&msg);
@@ -1777,106 +2306,103 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if matches!(msg, git::Message::SyncDone(git::remote::Sync::Pull, _)) {
                 task = Task::batch([state.reload_open_tabs(), state.reload_git_views()]);
             }
-            task = Task::batch([task, git::update(&mut state.git, msg, cwd).map(Message::Git)]);
+            task = Task::batch([task, git::update(&mut state.ws.git, msg, cwd).map(Message::Git)]);
         }
         Message::GitPanelToggle => {
             if state.toggle_sidebar_mode(SidebarMode::Git) {
                 let cwd = state.root_or_cwd();
-                task = git::update(&mut state.git, git::Message::Refresh, cwd).map(Message::Git);
+                task = git::update(&mut state.ws.git, git::Message::Refresh, cwd).map(Message::Git);
             }
         }
         Message::GitBlameLoaded(path, snapshot, blame) => {
-            if let Some(tab) = state.tabs.iter_mut().find(|t| t.path.as_deref() == Some(path.as_path())) {
+            if let Some(tab) = state.ws.tabs.iter_mut().find(|t| t.path.as_deref() == Some(path.as_path())) {
                 if tab.content.text() == snapshot { tab.blame = blame; }
             }
         }
         Message::GitDiffLoaded(path, snapshot, diff) => {
-            if let Some(tab) = state.tabs.iter_mut().find(|t| t.path.as_deref() == Some(path.as_path())) {
+            if let Some(tab) = state.ws.tabs.iter_mut().find(|t| t.path.as_deref() == Some(path.as_path())) {
                 if tab.content.text() == snapshot { tab.diff = diff.into_iter().collect(); }
             }
         }
-        Message::TabSelected(i) => { state.show_editor(); state.active_tab = i; },
+        Message::TabSelected(i) => { state.show_editor(); state.ws.active_tab = i; },
         Message::TabClosed(i) => task = state.close_tab(i),
         Message::CloseTabs(anchor, scope) => task = state.close_tabs(anchor, scope),
         Message::CloseTabConfirmed(i) => {
-            if i < state.tabs.len() { state.remove_tab(i); }
+            if i < state.ws.tabs.len() { state.remove_tab(i); }
         }
         Message::CloseTabsConfirmed(anchor, scope) => state.remove_tabs(anchor, scope),
         Message::DeleteConfirmed(path) => task = state.delete_confirmed(&path),
         Message::DismissNotice => state.notice = None,
         Message::Exit => {
-            state.last_session_write = std::time::Instant::now() - Duration::from_secs(1);
-            state.persist_session();
-            let recovery: Vec<_> = state.tabs.iter().filter(|tab| tab.dirty).map(|tab| RecoveryBuffer {
-                path: tab.path.clone(), text: tab.content.text(),
-            }).collect();
-            if recovery != state.saved_session.recovery {
+            if !state.recovery_saved() {
                 state.notify("Could not save recovery. Save your files before closing.");
                 return Task::none();
             }
-            state.terminal.shutdown();
-            state.lsp.shutdown_all();
+            state.for_each_loaded(|workspace| {
+                workspace.terminal.shutdown();
+                workspace.lsp.shutdown_all();
+            });
             return iced::exit();
         }
         Message::LspInstall(id) => {
-            state.lsp_prompt = None;
-            if let Some(server) = lsp::registry::by_id(id) { state.lsp.install(server); }
+            state.ws.lsp_prompt = None;
+            if let Some(server) = lsp::registry::by_id(id) { state.ws.lsp.install(server); }
         }
         Message::LspDismiss(id) => {
-            state.lsp_prompt = None;
-            if let Some(server) = lsp::registry::by_id(id) { state.lsp.dismiss(server); }
+            state.ws.lsp_prompt = None;
+            if let Some(server) = lsp::registry::by_id(id) { state.ws.lsp.dismiss(server); }
         }
         Message::EditorProbe(probe) => match probe {
             code_editor::Probe::Leave => {
-                state.hover_request = None;
-                if let Some(tab) = state.tabs.get_mut(state.active_tab) { tab.hover = None; }
+                state.ws.hover_request = None;
+                if let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab) { tab.hover = None; }
             }
             code_editor::Probe::Hover { line, index, anchor } => {
-                state.hover_request = Some((line, index, anchor));
-                if let Some((path, column)) = state.lsp_position(line, index) { state.lsp.hover(&path, line, column); }
+                state.ws.hover_request = Some((line, index, anchor));
+                if let Some((path, column)) = state.lsp_position(line, index) { state.ws.lsp.hover(&path, line, column); }
             }
             code_editor::Probe::Definition(line, index) => {
-                if let Some((path, column)) = state.lsp_position(line, index) { state.lsp.definition(&path, line, column); }
+                if let Some((path, column)) = state.lsp_position(line, index) { state.ws.lsp.definition(&path, line, column); }
             }
         },
         Message::GoToDefinition => {
-            if let Some(cursor) = state.tabs.get(state.active_tab).map(|tab| tab.content.cursor) {
+            if let Some(cursor) = state.ws.tabs.get(state.ws.active_tab).map(|tab| tab.content.cursor) {
                 if let Some((path, column)) = state.lsp_position(cursor.line, cursor.index) {
-                    state.lsp.definition(&path, cursor.line, column);
+                    state.ws.lsp.definition(&path, cursor.line, column);
                 }
             }
         }
         Message::ReopenClosedTab => {
-            if let Some(path) = state.closed_tabs.pop() { task = state.open_path(path); }
+            if let Some(path) = state.ws.closed_tabs.pop() { task = state.open_path(path); }
         }
         Message::RevealPath(path) => {
-            if let Some(root) = state.root.clone().filter(|root| path.starts_with(root)) {
-                state.sidebar_mode = SidebarMode::Tree;
+            if let Some(root) = state.ws.root.clone().filter(|root| path.starts_with(root)) {
+                state.ws.sidebar_mode = SidebarMode::Tree;
                 state.show_sidebar();
                 let mut dirs: Vec<_> = path.ancestors().skip(1).take_while(|parent| parent.starts_with(&root)).map(Path::to_path_buf).collect();
                 dirs.reverse();
                 if path.is_dir() { dirs.push(path.clone()); }
                 dirs.dedup();
-                state.reveal_queue = dirs.into();
-                state.reveal_target = Some(path);
-                state.reveal_generation += 1;
-                let generation = state.reveal_generation;
+                state.ws.reveal_queue = dirs.into();
+                state.ws.reveal_target = Some(path);
+                state.ws.reveal_generation += 1;
+                let generation = state.ws.reveal_generation;
                 let mut tree = file_tree(root);
-                if let Some(dir) = state.reveal_queue.pop_front() {
+                if let Some(dir) = state.ws.reveal_queue.pop_front() {
                     task = tree.update(DirectoryTreeEvent::Toggled(dir)).map(move |event| Message::RevealStep(generation, event));
                 }
-                state.tree = Some(tree);
+                state.ws.tree = Some(tree);
             } else { state.notify("This file is outside the open project"); }
         }
         Message::RevealStep(generation, event) => {
-            if generation == state.reveal_generation {
-                if let Some(tree) = &mut state.tree {
+            if generation == state.ws.reveal_generation {
+                if let Some(tree) = &mut state.ws.tree {
                     let loaded = matches!(&event, DirectoryTreeEvent::Loaded(_));
                     task = tree.update(event).map(move |event| Message::RevealStep(generation, event));
                     if loaded {
-                        if let Some(dir) = state.reveal_queue.pop_front() {
+                        if let Some(dir) = state.ws.reveal_queue.pop_front() {
                             task = Task::batch([task, tree.update(DirectoryTreeEvent::Toggled(dir)).map(move |event| Message::RevealStep(generation, event))]);
-                        } else if let Some(path) = state.reveal_target.take() {
+                        } else if let Some(path) = state.ws.reveal_target.take() {
                             task = Task::batch([task, tree.update(DirectoryTreeEvent::Selected(path.clone(), path.is_dir(), iced_swdir_tree::SelectionMode::Replace)).map(Message::Tree)]);
                         }
                     }
@@ -1886,44 +2412,120 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 
         Message::PathDropped(path) => {
             if path.is_dir() {
-                task = open_folder(state, path);
+                return update(state, Message::OpenFolderRequest(path));
             } else {
                 task = state.open_path(path);
-                state.focus = Focus::Editor;
+                state.ws.focus = Focus::Editor;
             }
         }
         Message::FileAction(action) => match action {
             FileAction::OpenFile => {
                 if let Some(path) = rfd::FileDialog::new().pick_file() {
                     task = state.open_path(path);
-                    state.focus = Focus::Editor;
+                    state.ws.focus = Focus::Editor;
                 }
             }
             FileAction::OpenFolder => {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    task = open_folder(state, path);
+                    return update(state, Message::OpenFolderRequest(path));
                 }
             }
-            FileAction::CloseFolder => {
-                state.show_editor();
-                state.root = None;
-                state.tree = None;
-                state.terminal.shutdown();
-                if state.terminal_visible { task = update(state, Message::TerminalToggle); }
-                if let Some(path) = last_project_path() {
-                    let _ = std::fs::remove_file(path);
-                }
-            }
+            // Closes the project's tab; the last tab is emptied instead (see `close_workspace`).
+            FileAction::CloseFolder => return update(state, Message::WorkspaceClose(state.ws.id)),
             FileAction::Save => task = state.save(),
         },
 
+        Message::OpenFolderRequest(path) => {
+            if !path.is_dir() {
+                state.recent_projects.retain(|recent| *recent != path);
+                state.notify(format!("Folder not found: {}", path.display()));
+                return Task::none();
+            }
+            match workspaces::folder_target(&state.workspace_roots(), state.active, &path) {
+                workspaces::FolderTarget::Switch(index) => task = state.activate_workspace(index),
+                workspaces::FolderTarget::Current => task = tag(open_folder(state, path), state.ws.id),
+                workspaces::FolderTarget::Ask => state.folder_prompt = Some(path),
+            }
+        }
+        Message::FolderPromptChoice(choice) => {
+            let Some(path) = state.folder_prompt.take() else { return Task::none() };
+            match choice {
+                None => {}
+                Some(FolderChoice::NewTab) => task = state.new_workspace(Some(path)),
+                Some(FolderChoice::Replace) => {
+                    let unsaved = state.ws.unsaved();
+                    let confirmed = Message::FolderReplaceConfirmed(state.ws.id, path);
+                    task = if unsaved > 0 {
+                        let name = state.workspace_label(state.active);
+                        ask(state.window_handle, "Unsaved changes", format!("Discard unsaved changes in {unsaved} file(s) of \"{name}\" and open the other folder in its place?"), confirmed)
+                    } else {
+                        update(state, confirmed)
+                    };
+                }
+            }
+        }
+        Message::FolderReplaceConfirmed(id, path) => {
+            if let Some(index) = state.workspace_index(id) {
+                let switch = state.activate_workspace(index);
+                task = Task::batch([switch, state.replace_workspace(path)]);
+            }
+        }
+        // `update` unwraps these before calling here; kept for completeness.
+        Message::In(id, message) => return route(state, id, *message),
+        Message::WorkspaceNew => task = state.new_workspace(None),
+        Message::WorkspaceCycle(forward) => {
+            let index = workspaces::cycle(state.active, state.workspaces.len(), forward);
+            task = state.activate_workspace(index);
+        }
+        Message::WorkspaceClose(id) => task = state.request_close(vec![id]),
+        Message::WorkspaceCloseOthers(id) => {
+            if let Some(index) = state.workspace_index(id) {
+                let ids = workspaces::to_close(state.workspaces.len(), index, false).into_iter().map(|index| state.workspaces[index].id).collect();
+                task = state.request_close(ids);
+            }
+        }
+        Message::WorkspaceCloseRight(id) => {
+            if let Some(index) = state.workspace_index(id) {
+                let ids = workspaces::to_close(state.workspaces.len(), index, true).into_iter().map(|index| state.workspaces[index].id).collect();
+                task = state.request_close(ids);
+            }
+        }
+        Message::WorkspacesCloseConfirmed(ids) => {
+            let mut tasks = Vec::new();
+            for id in ids { tasks.push(state.close_workspace(id)); }
+            task = Task::batch(tasks);
+        }
+        Message::WorkspaceCopyPath(id) => {
+            if let Some(root) = state.workspace_index(id).and_then(|index| state.workspace_root(index)) {
+                task = iced::clipboard::write(root.display().to_string());
+            }
+        }
+        Message::WorkspaceReveal(id) => {
+            if let Some(root) = state.workspace_index(id).and_then(|index| state.workspace_root(index)) {
+                reveal_in_file_manager(root);
+            }
+        }
+        Message::WorkspaceDragStart(id) => {
+            if let Some(index) = state.workspace_index(id) { task = state.activate_workspace(index); }
+            state.workspace_drag = Some((id, false));
+        }
+        Message::WorkspaceDragMove(x, width) => {
+            if let Some((id, _)) = state.workspace_drag {
+                if let Some(from) = state.workspace_index(id) {
+                    let to = workspaces::drag_target(x, width, state.workspaces.len());
+                    if to != from { state.move_workspace(from, to); }
+                    state.workspace_drag = Some((id, true));
+                }
+            }
+        }
+
         Message::EditAction(action) => {
             let before = state
-                .tabs
-                .get(state.active_tab)
+                .ws.tabs
+                .get(state.ws.active_tab)
                 .map(|t| t.content.undo_count())
                 .unwrap_or(0);
-            if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+            if let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab) {
                 match action {
                     EditAction::Undo => tab.content.undo(),
                     EditAction::Redo => tab.content.redo(),
@@ -1947,11 +2549,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::EditorPasted(text) => {
             if let (Some(text), false) = (text, state.editor_hidden()) {
                 let before = state
-                    .tabs
-                    .get(state.active_tab)
+                    .ws.tabs
+                    .get(state.ws.active_tab)
                     .map(|t| t.content.undo_count())
                     .unwrap_or(0);
-                if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+                if let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab) {
                     // Clipboard text from other Windows apps uses CRLF; the buffer uses LF.
                     tab.content.replace_selection(&text.replace("\r\n", "\n"));
                 }
@@ -1983,43 +2585,43 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             task = Task::batch(dirs.into_iter().map(refresh_dir_task));
         }
         Message::Tree(event) => {
-            if state.reveal_target.is_some() && matches!(&event, DirectoryTreeEvent::Loaded(_)) { return Task::none(); }
+            if state.ws.reveal_target.is_some() && matches!(&event, DirectoryTreeEvent::Loaded(_)) { return Task::none(); }
             if !matches!(&event, DirectoryTreeEvent::Loaded(_)) {
-                state.reveal_generation += 1;
-                state.reveal_target = None;
-                state.reveal_queue.clear();
+                state.ws.reveal_generation += 1;
+                state.ws.reveal_target = None;
+                state.ws.reveal_queue.clear();
             }
-            state.focus = Focus::Tree;
+            state.ws.focus = Focus::Tree;
             let mut open_task = Task::none();
             if let DirectoryTreeEvent::Selected(path, is_dir, _) = &event {
                 if !*is_dir {
                     open_task = state.open_path(path.clone());
                 }
             }
-            if let Some(tree) = &mut state.tree {
+            if let Some(tree) = &mut state.ws.tree {
                 task = Task::batch([open_task, tree.update(event).map(Message::Tree)]);
             } else {
                 task = open_task;
             }
         }
         Message::RefreshTree => {
-            if let Some(root) = state.root.clone() {
+            if let Some(root) = state.ws.root.clone() {
                 task = refresh_dir_task(root);
             }
         }
         Message::ContextNewFile => {
             if let Some(dir) = state.context_target_dir() {
-                state.renaming = None;
-                let expand = state.tree.as_mut().map(|tree| tree.update(DirectoryTreeEvent::Expand(dir.clone())).map(Message::Tree)).unwrap_or_else(Task::none);
-                state.creating = Some((dir, false, String::new()));
+                state.ws.renaming = None;
+                let expand = state.ws.tree.as_mut().map(|tree| tree.update(DirectoryTreeEvent::Expand(dir.clone())).map(Message::Tree)).unwrap_or_else(Task::none);
+                state.ws.creating = Some((dir, false, String::new()));
                 task = Task::batch([expand, iced::widget::operation::focus("tree-name")]);
             }
         }
         Message::ContextNewFolder => {
             if let Some(dir) = state.context_target_dir() {
-                state.renaming = None;
-                let expand = state.tree.as_mut().map(|tree| tree.update(DirectoryTreeEvent::Expand(dir.clone())).map(Message::Tree)).unwrap_or_else(Task::none);
-                state.creating = Some((dir, true, String::new()));
+                state.ws.renaming = None;
+                let expand = state.ws.tree.as_mut().map(|tree| tree.update(DirectoryTreeEvent::Expand(dir.clone())).map(Message::Tree)).unwrap_or_else(Task::none);
+                state.ws.creating = Some((dir, true, String::new()));
                 task = Task::batch([expand, iced::widget::operation::focus("tree-name")]);
             }
         }
@@ -2029,8 +2631,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                state.creating = None;
-                state.renaming = Some((path, name));
+                state.ws.creating = None;
+                state.ws.renaming = Some((path, name));
                 task = iced::widget::operation::focus("tree-name");
             }
         }
@@ -2047,7 +2649,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::ContextCopyRelativePath => {
             if let Some(path) = state.context_target_path() {
                 let relative = state
-                    .root
+                    .ws.root
                     .as_ref()
                     .and_then(|root| path.strip_prefix(root).ok())
                     .map(Path::to_path_buf)
@@ -2061,12 +2663,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::RenameInput(text) => {
-            if let Some((_, buf)) = &mut state.renaming {
+            if let Some((_, buf)) = &mut state.ws.renaming {
                 *buf = text;
             }
         }
         Message::RenameSubmit => {
-            if let Some((old_path, new_name)) = state.renaming.clone() {
+            if let Some((old_path, new_name)) = state.ws.renaming.clone() {
                 if !new_name.is_empty() {
                     if !valid_entry_name(&new_name) {
                         state.notify("Enter a name without path separators");
@@ -2076,14 +2678,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         .parent()
                         .unwrap_or_else(|| Path::new("."))
                         .join(&new_name);
-                    if new_path == old_path { state.renaming = None; return Task::none(); }
+                    if new_path == old_path { state.ws.renaming = None; return Task::none(); }
                     if std::fs::symlink_metadata(&new_path).is_ok() {
                         state.notify("That name already exists");
                         return iced::widget::operation::focus("tree-name");
                     }
                     let renamed = std::fs::rename(&old_path, &new_path);
                     if renamed.is_ok() {
-                        state.renaming = None;
+                        state.ws.renaming = None;
                         state.notify("Renamed successfully");
                         // Also tabs for files inside a renamed folder.
                         state.paths_moved(&[(old_path.clone(), new_path)]);
@@ -2094,14 +2696,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
             }
         }
-        Message::RenameCancel => state.renaming = None,
+        Message::RenameCancel => state.ws.renaming = None,
         Message::CreateInput(text) => {
-            if let Some((_, _, buf)) = &mut state.creating {
+            if let Some((_, _, buf)) = &mut state.ws.creating {
                 *buf = text;
             }
         }
         Message::CreateSubmit => {
-            if let Some((dir, is_dir, name)) = state.creating.clone() {
+            if let Some((dir, is_dir, name)) = state.ws.creating.clone() {
                 if !name.is_empty() {
                     if !valid_entry_name(&name) {
                         state.notify("Enter a file or folder name without path separators");
@@ -2114,31 +2716,38 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         std::fs::OpenOptions::new().write(true).create_new(true).open(target).map(|_| ())
                     };
                     if result.is_ok() {
-                        state.creating = None;
+                        state.ws.creating = None;
                         state.notify("Created successfully");
                         task = refresh_dir_task(dir);
                     } else if let Err(err) = result { state.notify(format!("Create failed: {err}")); }
                 }
             }
         }
-        Message::CreateCancel => state.creating = None,
+        Message::CreateCancel => state.ws.creating = None,
 
         Message::AppThemeSelected(name) => match state.themes.load_theme(&name) {
             Ok(theme) => {
                 save_app_theme(&theme.name);
                 state.app_theme = theme;
-                for tab in &mut state.tabs {
+                let (highlighter, syntax) = (&state.highlighter, &state.app_theme.syntax);
+                let rehighlight = |workspace: &mut Workspace| for tab in &mut workspace.tabs {
                     let extension = tab.extension();
-                    tab.content.highlight(&state.highlighter, &extension, &state.app_theme.syntax);
+                    tab.content.highlight(highlighter, &extension, syntax);
+                };
+                rehighlight(&mut state.ws);
+                for entry in &mut state.workspaces {
+                    if let Slot::Parked(workspace) = &mut entry.slot { rehighlight(workspace); }
                 }
             }
             Err(err) => state.notify(format!("Theme failed to load: {err}")),
         },
         Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
-            state.panes.resize(split, ratio);
-            if Some(split) == state.sidebar_split {
+            state.ws.panes.resize(split, ratio);
+            if Some(split) == state.ws.sidebar_split {
+                state.ws.sidebar_ratio = ratio;
                 save_sidebar_ratio(ratio);
-            } else if Some(split) == state.ai_split {
+            } else if Some(split) == state.ws.ai_split {
+                state.ws.ai_ratio = ratio;
                 save_ai_ratio(ratio);
             }
         }
@@ -2151,30 +2760,40 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
                 return Task::none();
             }
+            // The open-folder question is modal too: Escape cancels it.
+            if state.folder_prompt.is_some() {
+                if key == keyboard::Key::Named(keyboard::key::Named::Escape) {
+                    return update(state, Message::FolderPromptChoice(None));
+                }
+                return Task::none();
+            }
+            if let Some(forward) = workspace_cycle_key(&key, modifiers) {
+                return update(state, Message::WorkspaceCycle(forward));
+            }
             if modifiers.control() && key.as_ref() == keyboard::Key::Character("`") {
                 return update(state, Message::TerminalToggle);
             }
-            if key == keyboard::Key::Named(keyboard::key::Named::Escape) && state.inline_edit.is_some()
+            if key == keyboard::Key::Named(keyboard::key::Named::Escape) && state.ws.inline_edit.is_some()
                 && !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible && !state.theme_install.visible {
                 return update(state, Message::InlineEditCancel);
             }
-            if state.terminal_visible && state.terminal.focused()
+            if state.ws.terminal_visible && state.ws.terminal.focused()
                 && !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible
                 && !state.theme_install.visible
                 && key == keyboard::Key::Named(keyboard::key::Named::Escape) {
                 return Task::none();
             }
-            if key == keyboard::Key::Named(keyboard::key::Named::Escape) && (state.creating.is_some() || state.renaming.is_some()) {
-                state.creating = None;
-                state.renaming = None;
+            if key == keyboard::Key::Named(keyboard::key::Named::Escape) && (state.ws.creating.is_some() || state.ws.renaming.is_some()) {
+                state.ws.creating = None;
+                state.ws.renaming = None;
                 return Task::none();
             }
-            if key == keyboard::Key::Named(keyboard::key::Named::F12) && state.focus == Focus::Editor {
+            if key == keyboard::Key::Named(keyboard::key::Named::F12) && state.ws.focus == Focus::Editor {
                 return update(state, Message::GoToDefinition);
             }
             // Completion keys come before the editor's own: Ctrl+Space (Ctrl on every platform)
             // asks for suggestions, and while the list shows it takes the arrows, Enter/Tab, Esc.
-            let editing = state.focus == Focus::Editor && !state.editor_hidden() && !state.quick_open.visible
+            let editing = state.ws.focus == Focus::Editor && !state.editor_hidden() && !state.quick_open.visible
                 && !state.command_palette.visible && !state.goto_line.visible && !state.theme_install.visible;
             if editing && modifiers.alt() && !modifiers.command() && !modifiers.shift() && key.as_ref() == keyboard::Key::Character("z") {
                 state.toggle_word_wrap();
@@ -2209,23 +2828,28 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     keyboard::Key::Character(c) if modifiers.shift() && c.eq_ignore_ascii_case("t") => {
                         task = update(state, Message::ReopenClosedTab);
                     }
+                    // Workspace tabs, as in a browser: Cmd/Ctrl+T opens one, +Shift+W closes it.
+                    keyboard::Key::Character("t") => task = update(state, Message::WorkspaceNew),
+                    keyboard::Key::Character(c) if modifiers.shift() && c.eq_ignore_ascii_case("w") => {
+                        task = update(state, Message::WorkspaceClose(state.ws.id));
+                    }
                     keyboard::Key::Character("q") => return update(state, Message::Exit),
                     keyboard::Key::Character("w") => {
                         // A diff opened from the graph closes back to the graph.
-                        if state.git_preview.is_some() { state.git_preview = None; }
-                        else if state.git_graph.is_some() { state.git_graph = None; }
-                        else { task = state.close_tab(state.active_tab); }
+                        if state.ws.git_preview.is_some() { state.ws.git_preview = None; }
+                        else if state.ws.git_graph.is_some() { state.ws.git_graph = None; }
+                        else { task = state.close_tab(state.ws.active_tab); }
                     }
                     keyboard::Key::Character(c) if c.len() == 1 && matches!(c.as_bytes()[0], b'1'..=b'9') => {
                         let index = (c.as_bytes()[0] - b'1') as usize;
-                        if index < state.tabs.len() { state.active_tab = index; state.show_editor(); }
+                        if index < state.ws.tabs.len() { state.ws.active_tab = index; state.show_editor(); }
                     }
                     keyboard::Key::Character("s") => task = state.save(),
                     keyboard::Key::Character("k") if !state.editor_hidden() => task = update(state, Message::InlineEditStart),
                     keyboard::Key::Character("o") => {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
                             task = state.open_path(path);
-                            state.focus = Focus::Editor;
+                            state.ws.focus = Focus::Editor;
                         }
                     }
                     // Checked before the plain "f" arm below: Shift+F usually reports as
@@ -2236,7 +2860,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         state.toggle_sidebar_mode(SidebarMode::ProjectSearch);
                     }
                     keyboard::Key::Character("f") if !state.editor_hidden() => {
-                        if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+                        if let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab) {
                             code_editor::search::update(
                                 &mut tab.search,
                                 &mut tab.content,
@@ -2263,7 +2887,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     keyboard::Key::Character("g") if !state.editor_hidden() => {
                         if state.goto_line.visible {
                             let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
-                        } else if state.tabs.get(state.active_tab).is_some() {
+                        } else if state.ws.tabs.get(state.ws.active_tab).is_some() {
                             state.quick_open.visible = false;
                             state.theme_install.visible = false;
                             let _ = command_palette::update(&mut state.command_palette, command_palette::Message::Close);
@@ -2271,7 +2895,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         }
                     }
                     keyboard::Key::Character("p") => {
-                        let root = state.root.clone();
+                        let root = state.ws.root.clone();
                         let msg = if state.quick_open.visible {
                             quick_open::Message::Close
                         } else {
@@ -2330,12 +2954,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     _ => None,
                 };
                 if let Some(msg) = msg {
-                    let root = state.root.clone();
+                    let root = state.ws.root.clone();
                     let (t, opened) = quick_open::update(&mut state.quick_open, msg, root.as_deref(), &state.recent_files);
                     task = t.map(Message::QuickOpen);
                     if let Some(path) = opened {
                         task = Task::batch([task, state.open_path(path)]);
-                        state.focus = Focus::Editor;
+                        state.ws.focus = Focus::Editor;
                     }
                 }
             } else if state.command_palette.visible {
@@ -2358,18 +2982,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     let _ = goto_line::update(&mut state.goto_line, goto_line::Message::Close);
                 }
             } else if key.as_ref() == keyboard::Key::Named(keyboard::key::Named::Escape)
-                && state.sidebar_mode == SidebarMode::ProjectSearch
+                && state.ws.sidebar_mode == SidebarMode::ProjectSearch
             {
                 // The global key subscription fires regardless of which widget has iced's own
                 // focus (see `input::handle_key`'s docs on why this app doesn't rely on that
                 // system), so this closes the panel even while typing in its search box.
-                state.sidebar_mode = SidebarMode::Tree;
+                state.ws.sidebar_mode = SidebarMode::Tree;
             } else {
                 // No per-widget focus system here (see `input::handle_key`'s docs), so route
-                // by `state.focus`: the tree when it's the last thing the user interacted
+                // by `state.ws.focus`: the tree when it's the last thing the user interacted
                 // with, the active tab's editor otherwise.
-                let tree_event = if state.focus == Focus::Tree {
-                    state.tree.as_ref().and_then(|tree| tree.handle_key(&key, modifiers))
+                let tree_event = if state.ws.focus == Focus::Tree {
+                    state.ws.tree.as_ref().and_then(|tree| tree.handle_key(&key, modifiers))
                 } else {
                     None
                 };
@@ -2381,12 +3005,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             open_task = state.open_path(path.clone());
                         }
                     }
-                    if let Some(tree) = &mut state.tree {
+                    if let Some(tree) = &mut state.ws.tree {
                         task = Task::batch([open_task, tree.update(event).map(Message::Tree)]);
                     } else {
                         task = open_task;
                     }
-                } else if state.focus == Focus::Editor && state.handle_editor_key(&key, modifiers) {
+                } else if state.ws.focus == Focus::Editor && state.handle_editor_key(&key, modifiers) {
                     state.after_editor_key(&key, modifiers);
                 }
             }
@@ -2398,36 +3022,36 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
 
         Message::AiToggle => {
-            state.ai_visible = !state.ai_visible;
-            save_ai_visible(state.ai_visible);
-            if state.ai_visible {
+            state.ws.ai_visible = !state.ws.ai_visible;
+            save_ai_visible(state.ws.ai_visible);
+            if state.ws.ai_visible {
                 let main_pane = state
-                    .panes
+                    .ws.panes
                     .iter()
                     .find(|(_, kind)| **kind == PaneKind::Main)
                     .map(|(pane, _)| *pane);
                 if let Some(main_pane) = main_pane {
                     if let Some((_, split)) =
-                        state.panes.split(pane_grid::Axis::Vertical, main_pane, PaneKind::Ai)
+                        state.ws.panes.split(pane_grid::Axis::Vertical, main_pane, PaneKind::Ai)
                     {
-                        state.panes.resize(split, load_ai_ratio());
-                        state.ai_split = Some(split);
+                        state.ws.panes.resize(split, state.ws.ai_ratio);
+                        state.ws.ai_split = Some(split);
                     }
                 }
             } else {
                 let ai_pane = state
-                    .panes
+                    .ws.panes
                     .iter()
                     .find(|(_, kind)| **kind == PaneKind::Ai)
                     .map(|(pane, _)| *pane);
                 if let Some(ai_pane) = ai_pane {
-                    state.panes.close(ai_pane);
+                    state.ws.panes.close(ai_pane);
                 }
-                state.ai_split = None;
+                state.ws.ai_split = None;
             }
         }
         Message::AiModeSelected(mode) => {
-            state.ai_mode = mode;
+            state.ws.ai_mode = mode;
             state.refresh_mentions();
         }
         Message::Chat(chat::Message::Composer(action))
@@ -2446,7 +3070,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     return Task::none();
                 }
                 ai_composer::Action::Drop(paths) => {
-                    if let Some(tree) = &mut state.tree {
+                    if let Some(tree) = &mut state.ws.tree {
                         let _ = tree.update(DirectoryTreeEvent::Drag(iced_swdir_tree::DragMsg::Cancelled));
                     }
                     Message::AiFiles(paths)
@@ -2458,9 +3082,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // Let the tree process its own release/click before clearing an
             // abandoned drag; raw subscriptions also see captured events.
             task = Task::done(Message::TreeDragCancel);
+            // The same release ends dragging a workspace tab, wherever the pointer is.
+            state.workspace_drag = None;
         }
         Message::TreeDragCancel => {
-            if let Some(tree) = &mut state.tree {
+            if let Some(tree) = &mut state.ws.tree {
                 task = tree.update(DirectoryTreeEvent::Drag(iced_swdir_tree::DragMsg::Cancelled)).map(Message::Tree);
             }
         }
@@ -2468,8 +3094,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             task = Task::perform(async { rfd::AsyncFileDialog::new().pick_files().await.unwrap_or_default().into_iter().map(|f| f.path().to_path_buf()).collect() }, Message::AiFiles);
         }
         Message::AiFiles(paths) => {
-            if state.ai_visible {
-                let mode = state.ai_mode;
+            if state.ws.ai_visible {
+                let mode = state.ws.ai_mode;
                 let project = state.root_or_cwd();
                 task = Task::perform(async move {
                     tokio::task::spawn_blocking(move || paths.iter().take(16).map(|p| ai_context::Attachment::read(p)).collect()).await.unwrap_or_else(|e| vec![Err(e.to_string())])
@@ -2481,7 +3107,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             for file in files {
                 match file {
                     Ok(file) => {
-                        let attachments = match mode { AiMode::Http => &mut state.chat.attachments, AiMode::Acp => &mut state.acp.attachments, AiMode::Codex => &mut state.codex.attachments, AiMode::Grok => &mut state.grok.attachments, AiMode::Cursor => &mut state.cursor.attachments };
+                        let attachments = match mode { AiMode::Http => &mut state.ws.chat.attachments, AiMode::Acp => &mut state.ws.acp.attachments, AiMode::Codex => &mut state.ws.codex.attachments, AiMode::Grok => &mut state.ws.grok.attachments, AiMode::Cursor => &mut state.ws.cursor.attachments };
                         if attachments.len() < 16 { attachments.push(file); }
                         else { state.notice = Some(("Maximum 16 attachments per message.".into(), std::time::Instant::now())); }
                     }
@@ -2490,11 +3116,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::AiRemoveAttachment(index) => {
-            let attachments = match state.ai_mode { AiMode::Http => &mut state.chat.attachments, AiMode::Acp => &mut state.acp.attachments, AiMode::Codex => &mut state.codex.attachments, AiMode::Grok => &mut state.grok.attachments, AiMode::Cursor => &mut state.cursor.attachments };
+            let attachments = match state.ws.ai_mode { AiMode::Http => &mut state.ws.chat.attachments, AiMode::Acp => &mut state.ws.acp.attachments, AiMode::Codex => &mut state.ws.codex.attachments, AiMode::Grok => &mut state.ws.grok.attachments, AiMode::Cursor => &mut state.ws.cursor.attachments };
             if index < attachments.len() { attachments.remove(index); }
         }
         Message::AiPaste => {
-            let mode = state.ai_mode;
+            let mode = state.ws.ai_mode;
             let project = state.root_or_cwd();
             task = Task::perform(
                 async { tokio::task::spawn_blocking(ai_context::Attachment::from_clipboard).await.unwrap_or_else(|e| Err(e.to_string())) },
@@ -2509,7 +3135,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::AiPasteText(Some(text)) => {
             use iced::widget::text_editor;
             let paste = text_editor::Action::Edit(text_editor::Edit::Paste(std::sync::Arc::new(text)));
-            let next = match state.ai_mode {
+            let next = match state.ws.ai_mode {
                 AiMode::Http => Message::Chat(chat::Message::InputChanged(paste)),
                 AiMode::Acp => Message::Acp(acp::Message::InputChanged(paste)),
                 AiMode::Cursor => Message::Cursor(acp::Message::InputChanged(paste)),
@@ -2519,11 +3145,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             return update(state, next);
         }
         Message::AiReference => {
-            if let Some(tab) = state.tabs.get_mut(state.active_tab) {
+            if let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab) {
                 let selection = tab.content.copy_selection();
                 let name = format!("{}{}", tab.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "Untitled".into()), if selection.is_some() { " (selection)" } else { " (editor buffer)" });
                 let content = selection.unwrap_or_else(|| tab.content.text());
-                let attachments = match state.ai_mode { AiMode::Http => &mut state.chat.attachments, AiMode::Acp => &mut state.acp.attachments, AiMode::Codex => &mut state.codex.attachments, AiMode::Grok => &mut state.grok.attachments, AiMode::Cursor => &mut state.cursor.attachments };
+                let attachments = match state.ws.ai_mode { AiMode::Http => &mut state.ws.chat.attachments, AiMode::Acp => &mut state.ws.acp.attachments, AiMode::Codex => &mut state.ws.codex.attachments, AiMode::Grok => &mut state.ws.grok.attachments, AiMode::Cursor => &mut state.ws.cursor.attachments };
                 if content.len() <= ai_context::MAX_BYTES && attachments.len() < 16 { attachments.push(ai_context::Attachment { name, content, mime: None }); }
                 else { state.notice = Some(("Attachment limit reached (16 files, 8 MiB each).".into(), std::time::Instant::now())); }
             }
@@ -2531,26 +3157,26 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::AiAct(act) => task = state.ai_act(act),
         Message::InlineEditStart => task = state.start_inline_edit(),
         Message::InlineEditInput(text) => {
-            if let Some(edit) = state.inline_edit.as_mut().filter(|edit| matches!(edit.stage, inline_edit::Stage::Prompt)) {
+            if let Some(edit) = state.ws.inline_edit.as_mut().filter(|edit| matches!(edit.stage, inline_edit::Stage::Prompt)) {
                 edit.instruction = text;
             }
         }
         Message::InlineEditSubmit => task = state.submit_inline_edit(),
         Message::InlineEditReady(id, result) => {
             let root = state.root_or_cwd();
-            let Some(edit) = state.inline_edit.as_mut().filter(|edit| matches!(edit.stage, inline_edit::Stage::Working(current) if current == id)) else {
+            let Some(edit) = state.ws.inline_edit.as_mut().filter(|edit| matches!(edit.stage, inline_edit::Stage::Working(current) if current == id)) else {
                 return Task::none();
             };
             match result {
                 Ok(reply) => {
                     let replacement = inline_edit::replacement(&reply, &edit.original);
                     let name = edit.path.as_deref().and_then(Path::file_name).map_or_else(|| "Untitled".into(), |name| name.to_string_lossy().into_owned());
-                    state.git_preview = Some(git_preview::Preview {
+                    state.ws.git_preview = Some(git_preview::Preview {
                         root, path: format!("{}{name}", inline_edit::PREVIEW_PREFIX),
                         result: Some(Ok(git_preview::text_patch(&edit.original, &replacement))), live: false,
                     });
                     edit.stage = inline_edit::Stage::Review(replacement);
-                    state.focus = Focus::Editor;
+                    state.ws.focus = Focus::Editor;
                 }
                 Err(err) => {
                     edit.stage = inline_edit::Stage::Prompt;
@@ -2559,14 +3185,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::InlineEditAccept => {
-            if let Some(inline_edit::InlineEdit { path, start, end, original, stage: inline_edit::Stage::Review(replacement), .. }) = state.inline_edit.take() {
-                state.git_preview = None;
-                match state.tabs.iter().position(|tab| tab.path == path) {
-                    Some(index) if state.tabs[index].content.text_between(start, end).as_deref() == Some(original.as_str()) => {
-                        state.active_tab = index;
-                        let before = state.tabs[index].content.undo_count();
-                        state.tabs[index].content.replace_range(start, end, &replacement);
-                        state.focus = Focus::Editor;
+            if let Some(inline_edit::InlineEdit { path, start, end, original, stage: inline_edit::Stage::Review(replacement), .. }) = state.ws.inline_edit.take() {
+                state.ws.git_preview = None;
+                match state.ws.tabs.iter().position(|tab| tab.path == path) {
+                    Some(index) if state.ws.tabs[index].content.text_between(start, end).as_deref() == Some(original.as_str()) => {
+                        state.ws.active_tab = index;
+                        let before = state.ws.tabs[index].content.undo_count();
+                        state.ws.tabs[index].content.replace_range(start, end, &replacement);
+                        state.ws.focus = Focus::Editor;
                         state.mark_edited_if_changed(before);
                     }
                     _ => state.notify("The code changed while the edit was being written; try again"),
@@ -2574,28 +3200,28 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::InlineEditCancel => {
-            if state.inline_edit.take().is_some_and(|edit| matches!(edit.stage, inline_edit::Stage::Review(_))) {
-                state.git_preview = None;
+            if state.ws.inline_edit.take().is_some_and(|edit| matches!(edit.stage, inline_edit::Stage::Review(_))) {
+                state.ws.git_preview = None;
             }
         }
         Message::Acp(acp::Message::ViewDiff(entry, index)) => {
-            let diff = state.acp.diff(entry, index).cloned();
+            let diff = state.ws.acp.diff(entry, index).cloned();
             state.open_ai_diff(diff);
         }
         Message::Cursor(acp::Message::ViewDiff(entry, index)) => {
-            let diff = state.cursor.diff(entry, index).cloned();
+            let diff = state.ws.cursor.diff(entry, index).cloned();
             state.open_ai_diff(diff);
         }
         Message::Grok(acp::Message::ViewDiff(entry, index)) => {
-            let diff = state.grok.diff(entry, index).cloned();
+            let diff = state.ws.grok.diff(entry, index).cloned();
             state.open_ai_diff(diff);
         }
         Message::Codex(acp::Message::ViewDiff(entry, index)) => {
-            let diff = state.codex.diff(entry, index).cloned();
+            let diff = state.ws.codex.diff(entry, index).cloned();
             state.open_ai_diff(diff);
         }
         Message::Chat(chat::Message::ViewDiff(index)) => {
-            let diff = state.chat.diff(index).cloned();
+            let diff = state.ws.chat.diff(index).cloned();
             state.open_ai_diff(diff);
         }
         Message::Chat(chat::Message::Markdown(ai_markdown::Action::Insert(code)))
@@ -2610,42 +3236,44 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         | Message::Grok(acp::Message::Autopilot(on))
         | Message::Codex(acp::Message::Autopilot(on)) => {
             ai_approval::save_autopilot(on);
-            state.chat.set_autopilot(on);
-            for panel in [&mut state.acp, &mut state.cursor, &mut state.grok, &mut state.codex] { panel.set_autopilot(on); }
+            state.for_each_loaded(|workspace| {
+                workspace.chat.set_autopilot(on);
+                for panel in [&mut workspace.acp, &mut workspace.cursor, &mut workspace.grok, &mut workspace.codex] { panel.set_autopilot(on); }
+            });
         }
         Message::Cursor(msg) => {
             let cwd = state.root_or_cwd();
             let input = matches!(msg, acp::Message::InputChanged(_) | acp::Message::UsePrompt(_));
             if matches!(msg, acp::Message::Send) { state.attach_mentions(); }
-            task = acp::update(&mut state.cursor, msg, cwd).map(Message::Cursor);
+            task = acp::update(&mut state.ws.cursor, msg, cwd).map(Message::Cursor);
             if input { state.refresh_mentions(); }
         }
         Message::Grok(msg) => {
             let cwd = state.root_or_cwd();
             let input = matches!(msg, acp::Message::InputChanged(_) | acp::Message::UsePrompt(_));
             if matches!(msg, acp::Message::Send) { state.attach_mentions(); }
-            task = acp::update(&mut state.grok, msg, cwd).map(Message::Grok);
+            task = acp::update(&mut state.ws.grok, msg, cwd).map(Message::Grok);
             if input { state.refresh_mentions(); }
         }
         Message::Codex(msg) => {
             let cwd = state.root_or_cwd();
             let input = matches!(msg, acp::Message::InputChanged(_) | acp::Message::UsePrompt(_));
             if matches!(msg, acp::Message::Send) { state.attach_mentions(); }
-            task = acp::update(&mut state.codex, msg, cwd).map(Message::Codex);
+            task = acp::update(&mut state.ws.codex, msg, cwd).map(Message::Codex);
             if input { state.refresh_mentions(); }
         }
         Message::Chat(msg) => {
             let cwd = state.root_or_cwd();
             let input = matches!(msg, chat::Message::InputChanged(_) | chat::Message::UsePrompt(_));
             if matches!(msg, chat::Message::Send) { state.attach_mentions(); }
-            task = chat::update(&mut state.chat, msg, cwd).map(Message::Chat);
+            task = chat::update(&mut state.ws.chat, msg, cwd).map(Message::Chat);
             if input { state.refresh_mentions(); }
         }
         Message::Acp(msg) => {
             let cwd = state.root_or_cwd();
             let input = matches!(msg, acp::Message::InputChanged(_) | acp::Message::UsePrompt(_));
             if matches!(msg, acp::Message::Send) { state.attach_mentions(); }
-            task = acp::update(&mut state.acp, msg, cwd).map(Message::Acp);
+            task = acp::update(&mut state.ws.acp, msg, cwd).map(Message::Acp);
             if input { state.refresh_mentions(); }
         }
         Message::Tick => {
@@ -2660,51 +3288,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 let detail = state.updater.detail.clone();
                 state.notify(detail);
             }
-            state.terminal.poll();
             if state.notice.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(8)) { state.notice = None; }
-            if state.git_status.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(8)) { state.git_status = None; }
-            let cwd = state.root_or_cwd();
-            state.lsp.set_root(&cwd);
-            task = Task::batch([task, state.poll_lsp()]);
-            state.chat.set_project(&cwd);
-            state.acp.ensure_loaded(&cwd);
-            state.codex.ensure_loaded(&cwd);
-            state.grok.ensure_loaded(&cwd);
-            state.cursor.ensure_loaded(&cwd);
-            // Only an ACP chat needs the shell PATH, so look it up once one is open.
-            if state.ai_visible && matches!(state.ai_mode, AiMode::Acp | AiMode::Codex | AiMode::Grok | AiMode::Cursor) { agent_launch::warm_up(); }
-            // Connect as soon as the panel shows, so it names the model in use straight away.
-            if state.ai_visible {
-                match state.ai_mode {
-                    AiMode::Acp => state.acp.connect_for_display(&cwd),
-                    AiMode::Cursor => state.cursor.connect_for_display(&cwd),
-                    AiMode::Grok => state.grok.connect_for_display(&cwd),
-                    AiMode::Codex => state.codex.connect_for_display(&cwd),
-                    _ => {}
-                }
-            }
-            state.chat.poll();
-            state.acp.poll();
-            if let Some(request) = state.acp.take_terminal_login() {
-                state.terminal.open_claude_login(request, &cwd);
-                if !state.terminal_visible { task = Task::batch([task, update(state, Message::TerminalToggle)]); }
-                state.terminal.set_focused(true);
-                task = Task::batch([task, iced::widget::operation::focus("terminal-canvas")]);
-            }
-            state.codex.poll();
-            state.grok.poll();
-            state.cursor.poll();
-            let cursor_finished = state.cursor.take_finished();
-            let grok_finished = state.grok.take_finished();
-            let codex_finished = state.codex.take_finished();
-            let claude_finished = state.acp.take_finished();
-            let local_changed = state.chat.take_files_changed();
-            if cursor_finished || grok_finished || codex_finished || claude_finished || local_changed {
-                let reload_task = state.reload_open_tabs();
-                if let Some(root) = state.root.clone() {
-                    task = Task::batch([reload_task, refresh_dir_task(root)]);
-                } else { task = reload_task; }
-            }
             if !state.window_revealed && state.started_at.elapsed() > Duration::from_secs(2) {
                 // Safety net in case the frame after `PaintInitialWindow` never arrives: a
                 // brief flicker beats an invisible app.
@@ -2715,6 +3299,63 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 let reveal = iced::window::latest()
                     .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Windowed));
                 task = Task::batch([task, reveal]);
+            }
+            // Every loaded project keeps running while its tab is in the background.
+            let loaded: Vec<WorkspaceId> = state.workspaces.iter()
+                .filter(|entry| !matches!(entry.slot, Slot::Unloaded(_))).map(|entry| entry.id).collect();
+            for id in loaded {
+                task = Task::batch([task, route(state, id, Message::WorkspaceTick)]);
+            }
+        }
+        Message::WorkspaceTick => {
+            if state.ws.terminal.poll() && state.in_background() { state.ws.terminal_activity = true; }
+            if state.ws.git_status.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(8)) { state.ws.git_status = None; }
+            let cwd = state.root_or_cwd();
+            state.ws.lsp.set_root(&cwd);
+            task = Task::batch([task, state.poll_lsp()]);
+            state.ws.chat.set_project(&cwd);
+            state.ws.acp.ensure_loaded(&cwd);
+            state.ws.codex.ensure_loaded(&cwd);
+            state.ws.grok.ensure_loaded(&cwd);
+            state.ws.cursor.ensure_loaded(&cwd);
+            // Only an ACP chat needs the shell PATH, so look it up once one is open.
+            if state.ws.ai_visible && matches!(state.ws.ai_mode, AiMode::Acp | AiMode::Codex | AiMode::Grok | AiMode::Cursor) { agent_launch::warm_up(); }
+            // Connect as soon as the panel shows, so it names the model in use straight away.
+            if state.ws.ai_visible {
+                match state.ws.ai_mode {
+                    AiMode::Acp => state.ws.acp.connect_for_display(&cwd),
+                    AiMode::Cursor => state.ws.cursor.connect_for_display(&cwd),
+                    AiMode::Grok => state.ws.grok.connect_for_display(&cwd),
+                    AiMode::Codex => state.ws.codex.connect_for_display(&cwd),
+                    _ => {}
+                }
+            }
+            state.ws.chat.poll();
+            state.ws.acp.poll();
+            if let Some(request) = state.ws.acp.take_terminal_login() {
+                state.ws.terminal.open_claude_login(request, &cwd);
+                if !state.ws.terminal_visible { task = Task::batch([task, update(state, Message::TerminalToggle)]); }
+                // A background tab's login waits there; focus stays where the user is.
+                if state.in_background() {
+                    state.ws.terminal.set_focused(false);
+                } else {
+                    state.ws.terminal.set_focused(true);
+                    task = Task::batch([task, iced::widget::operation::focus("terminal-canvas")]);
+                }
+            }
+            state.ws.codex.poll();
+            state.ws.grok.poll();
+            state.ws.cursor.poll();
+            let cursor_finished = state.ws.cursor.take_finished();
+            let grok_finished = state.ws.grok.take_finished();
+            let codex_finished = state.ws.codex.take_finished();
+            let claude_finished = state.ws.acp.take_finished();
+            let local_changed = state.ws.chat.take_files_changed();
+            if cursor_finished || grok_finished || codex_finished || claude_finished || local_changed {
+                let reload_task = state.reload_open_tabs();
+                if let Some(root) = state.ws.root.clone() {
+                    task = Task::batch([reload_task, refresh_dir_task(root)]);
+                } else { task = reload_task; }
             }
             task = Task::batch([task, state.poll_git()]);
         }
@@ -2766,9 +3407,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
     }
     // Closing or replacing the proposed edit's preview rejects it.
-    let reviewing = state.git_preview.as_ref().is_some_and(|preview| !preview.live && preview.path.starts_with(inline_edit::PREVIEW_PREFIX));
-    if !reviewing && state.inline_edit.as_ref().is_some_and(|edit| matches!(edit.stage, inline_edit::Stage::Review(_))) {
-        state.inline_edit = None;
+    let reviewing = state.ws.git_preview.as_ref().is_some_and(|preview| !preview.live && preview.path.starts_with(inline_edit::PREVIEW_PREFIX));
+    if !reviewing && state.ws.inline_edit.as_ref().is_some_and(|edit| matches!(edit.stage, inline_edit::Stage::Review(_))) {
+        state.ws.inline_edit = None;
     }
     state.persist_session();
     task
@@ -2778,9 +3419,9 @@ fn view(state: &State) -> Element<'_, Message> {
     let top_bar = view_top_bar(state);
     let status_bar = view_status_bar(state);
 
-    let panes = PaneGrid::new(&state.panes, |_id, kind, _is_maximized| {
+    let panes = PaneGrid::new(&state.ws.panes, |_id, kind, _is_maximized| {
         let content: Element<'_, Message> = match kind {
-            PaneKind::Terminal => state.terminal.view(
+            PaneKind::Terminal => state.ws.terminal.view(
                 !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible
                     && !state.theme_install.visible && !state.about.visible).map(Message::Terminal),
             PaneKind::Sidebar => container(view_sidebar(state))
@@ -2811,7 +3452,7 @@ fn view(state: &State) -> Element<'_, Message> {
     .on_resize(10, Message::PaneResized)
     .height(Length::Fill);
 
-    let base: Element<'_, Message> = column![top_bar, panes, status_bar].into();
+    let base: Element<'_, Message> = column![top_bar, view_workspace_strip(state), panes, status_bar].into();
     let toast: Option<Element<'_, Message>> = state.notice.as_ref().map(|(message, _)| {
         let toast = container(row![text(message).size(13),
             button("×").style(flat_button_style).on_press(Message::DismissNotice),
@@ -2827,7 +3468,7 @@ fn view(state: &State) -> Element<'_, Message> {
             });
         container(toast).padding(16).align_right(Length::Fill).align_bottom(Length::Fill).into()
     });
-    let prompt: Option<Element<'_, Message>> = state.lsp_prompt.map(|server| {
+    let prompt: Option<Element<'_, Message>> = state.ws.lsp_prompt.map(|server| {
         let prompt = container(column![
             text(format!("{} provides diagnostics for this file type but isn't installed.", server.name)).size(13),
             row![
@@ -2847,14 +3488,16 @@ fn view(state: &State) -> Element<'_, Message> {
         container(prompt).padding(16).align_left(Length::Fill).align_bottom(Length::Fill).into()
     });
 
-    let overlay: Option<Element<'_, Message>> = if state.theme_install.visible {
+    let overlay: Option<Element<'_, Message>> = if let Some(path) = &state.folder_prompt {
+        Some(view_folder_prompt(state, path))
+    } else if state.theme_install.visible {
         Some(theme_install::view(&state.theme_install).map(Message::ThemeInstall))
     } else if state.quick_open.visible {
-        Some(quick_open::view(&state.quick_open, state.root.as_deref()).map(Message::QuickOpen))
+        Some(quick_open::view(&state.quick_open, state.ws.root.as_deref()).map(Message::QuickOpen))
     } else if state.command_palette.visible {
         Some(command_palette::view(&state.command_palette).map(Message::CommandPalette))
     } else if state.goto_line.visible {
-        let line_count = state.tabs.get(state.active_tab).map(|t| t.content.line_count()).unwrap_or(0);
+        let line_count = state.ws.tabs.get(state.ws.active_tab).map(|t| t.content.line_count()).unwrap_or(0);
         Some(goto_line::view(&state.goto_line, line_count).map(Message::GotoLine))
     } else if state.about.visible {
         Some(about::view(&state.about, &state.app_theme.iced).map(Message::About))
@@ -2862,6 +3505,141 @@ fn view(state: &State) -> Element<'_, Message> {
         None
     };
     layered(base, toast, prompt, overlay)
+}
+
+/// The workspace tabs under the top bar: one per project, equal widths that shrink until
+/// they'd get too narrow and then scroll, plus "+" for a new tab.
+fn view_workspace_strip(state: &State) -> Element<'_, Message> {
+    let count = state.workspaces.len();
+    let labels = workspaces::labels(&state.workspace_roots());
+    let dragging = state.workspace_drag.is_some();
+    let strip = iced::widget::responsive(move |size| {
+        // Room for the tabs: the strip minus the "+" button after them.
+        let width = workspaces::tab_width(size.width - 34.0, count);
+        let mut tabs = row![].spacing(0);
+        for (index, entry) in state.workspaces.iter().enumerate() {
+            tabs = tabs.push(view_workspace_tab(state, index, entry.id, labels[index].clone(), width));
+        }
+        // While a tab is dragged, the pointer's position over the tabs says where it goes.
+        let mut tabs = iced::widget::mouse_area(tabs);
+        if dragging { tabs = tabs.on_move(move |point| Message::WorkspaceDragMove(point.x, width)); }
+        let new_tab = icon_control(lucide_icons::Icon::Plus, if cfg!(target_os = "macos") { "New tab (⌘T)" } else { "New tab (Ctrl+T)" },
+            Some(Message::WorkspaceNew), false);
+        scrollable(row![tabs, new_tab].spacing(4).align_y(iced::Alignment::Center))
+            .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new().width(3).scroller_width(3)))
+            .width(Length::Fill)
+            .into()
+    });
+    let bar = container(strip).width(Length::Fill).padding([2, 6]).height(34);
+    column![container(bar).width(Length::Fill).style(chrome_style), iced::widget::rule::horizontal(1)].into()
+}
+
+fn view_workspace_tab(state: &State, index: usize, id: WorkspaceId, label: String, width: f32) -> Element<'_, Message> {
+    let is_active = index == state.active;
+    let workspace = state.workspace(index);
+    let root = state.workspace_root(index).map(Path::to_path_buf);
+    let unsaved = state.workspace_unsaved(index) > 0;
+    let busy = workspace.is_some_and(Workspace::ai_busy);
+    let activity = !is_active && workspace.is_some_and(|workspace| workspace.terminal_activity);
+
+    let glyph: char = if root.is_some() { lucide_icons::Icon::Folder } else { lucide_icons::Icon::File }.into();
+    let mut title = row![
+        text(glyph).font(iced::Font::with_name("lucide")).size(13),
+        text(label).size(13).wrapping(iced::widget::text::Wrapping::None).width(Length::Fill),
+    ].spacing(6).align_y(iced::Alignment::Center);
+    if busy {
+        title = title.push(iced::widget::tooltip(
+            iced::widget::canvas(workspaces::Spinner).width(12).height(12),
+            container(text("AI assistant is working").size(12)).padding([4, 8]).style(iced::widget::container::rounded_box),
+            iced::widget::tooltip::Position::Bottom,
+        ));
+    }
+    let dot = |color: fn(&iced::Theme) -> iced::Color, tip: &'static str| -> Element<'_, Message> {
+        iced::widget::tooltip(
+            text("●").size(10).style(move |theme: &iced::Theme| iced::widget::text::Style { color: Some(color(theme)) }),
+            container(text(tip).size(12)).padding([4, 8]).style(iced::widget::container::rounded_box),
+            iced::widget::tooltip::Position::Bottom,
+        ).into()
+    };
+    if activity {
+        title = title.push(dot(|theme| theme.extended_palette().primary.base.color, "New terminal output"));
+    }
+    if unsaved {
+        title = title.push(dot(|theme| theme.extended_palette().background.base.text, "Unsaved changes"));
+    }
+    let close_label = if cfg!(target_os = "macos") { "Close tab (⌘⇧W)" } else { "Close tab (Ctrl+Shift+W)" };
+    let tip = root.as_ref().map_or_else(|| "No folder open".to_string(), |root| root.display().to_string());
+    // Pressing the name selects (and may drag) the tab; the close button sits beside that
+    // area, so closing a background tab never selects it first.
+    let name = iced::widget::tooltip(
+        iced::widget::mouse_area(container(title).width(Length::Fill).height(Length::Fill).align_y(iced::Alignment::Center))
+            .on_press(Message::WorkspaceDragStart(id))
+            .on_middle_press(Message::WorkspaceClose(id))
+            .interaction(iced::mouse::Interaction::Pointer),
+        container(text(tip).size(12)).padding([4, 8]).style(iced::widget::container::rounded_box),
+        iced::widget::tooltip::Position::Bottom,
+    );
+    let content = row![
+        name,
+        icon_control(lucide_icons::Icon::X, close_label, Some(Message::WorkspaceClose(id)), false),
+    ].spacing(4).align_y(iced::Alignment::Center).padding([0, 4]).height(Length::Fill);
+
+    let underline = container(Space::new().width(Length::Fill).height(2))
+        .style(move |theme: &iced::Theme| iced::widget::container::Style {
+            background: Some(if is_active { theme.extended_palette().primary.base.color } else { iced::Color::TRANSPARENT }.into()),
+            ..Default::default()
+        });
+    let body = container(column![content, underline])
+        .width(width).height(30)
+        .style(move |theme: &iced::Theme| iced::widget::container::Style {
+            background: is_active.then(|| theme.extended_palette().background.base.color.into()),
+            text_color: Some(if is_active { theme.extended_palette().background.base.text } else {
+                let text = theme.extended_palette().background.base.text;
+                iced::Color { a: text.a * 0.7, ..text }
+            }),
+            ..Default::default()
+        });
+    let has_root = root.is_some();
+    let count = state.workspaces.len();
+    ContextMenu::new(body, move || {
+        container(column![
+            menu_button("Close Tab".into(), Message::WorkspaceClose(id)),
+            menu_button_maybe("Close Other Tabs".into(), (count > 1).then_some(Message::WorkspaceCloseOthers(id))),
+            menu_button_maybe("Close Tabs to the Right".into(), (index + 1 < count).then_some(Message::WorkspaceCloseRight(id))),
+            iced::widget::rule::horizontal(1),
+            menu_button_maybe("Copy Path".into(), has_root.then_some(Message::WorkspaceCopyPath(id))),
+            menu_button_maybe(reveal_label().into(), has_root.then_some(Message::WorkspaceReveal(id))),
+        ].spacing(2).width(220))
+        .padding(6).style(iced::widget::container::rounded_box).into()
+    }).into()
+}
+
+/// "Replace the current project or open a new tab?" for a folder opened while the shown tab
+/// already has one.
+fn view_folder_prompt<'a>(state: &'a State, path: &'a Path) -> Element<'a, Message> {
+    let name = path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned());
+    let current = state.workspace_label(state.active);
+    let panel = container(column![
+        text(format!("Open \"{name}\"")).size(16),
+        text(path.display().to_string()).size(12).style(iced::widget::text::secondary),
+        text(format!("\"{current}\" is open in this tab.")).size(13),
+        row![
+            button(text("Open in New Tab").size(13)).padding([6, 14]).on_press(Message::FolderPromptChoice(Some(FolderChoice::NewTab))),
+            button(text("Replace Current").size(13)).padding([6, 14]).style(iced::widget::button::secondary)
+                .on_press(Message::FolderPromptChoice(Some(FolderChoice::Replace))),
+            Space::new().width(Length::Fill),
+            button(text("Cancel").size(13)).padding([6, 14]).style(flat_button_style).on_press(Message::FolderPromptChoice(None)),
+        ].spacing(8).align_y(iced::Alignment::Center),
+    ].spacing(12)).padding(16).width(Length::Fill).max_width(480).style(overlay_style);
+    let backdrop = container(Space::new().width(Length::Fill).height(Length::Fill)).style(|theme: &iced::Theme| iced::widget::container::Style {
+        background: Some(iced::Color { a: 0.4, ..theme.extended_palette().background.base.color.inverse() }.into()),
+        ..Default::default()
+    });
+    iced::widget::mouse_area(iced::widget::stack![
+        backdrop,
+        container(iced::widget::opaque(panel)).width(Length::Fill).height(Length::Fill)
+            .align_x(iced::Alignment::Center).padding(iced::Padding { top: 80.0, ..iced::Padding::default() }),
+    ]).on_press(Message::FolderPromptChoice(None)).into()
 }
 
 /// Lays the toast, the language-server prompt and the open overlay over `base` as four layers
@@ -2999,30 +3777,30 @@ mod layer_tests {
 }
 
 fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
-    let controls = match state.ai_mode {
-        AiMode::Http => chat::conversation_controls(&state.chat).map(Message::Chat),
-        AiMode::Cursor => acp::conversation_controls(&state.cursor).map(Message::Cursor),
-        AiMode::Grok => acp::conversation_controls(&state.grok).map(Message::Grok),
-        AiMode::Codex => acp::conversation_controls(&state.codex).map(Message::Codex),
-        AiMode::Acp => acp::conversation_controls(&state.acp).map(Message::Acp),
+    let controls = match state.ws.ai_mode {
+        AiMode::Http => chat::conversation_controls(&state.ws.chat).map(Message::Chat),
+        AiMode::Cursor => acp::conversation_controls(&state.ws.cursor).map(Message::Cursor),
+        AiMode::Grok => acp::conversation_controls(&state.ws.grok).map(Message::Grok),
+        AiMode::Codex => acp::conversation_controls(&state.ws.codex).map(Message::Codex),
+        AiMode::Acp => acp::conversation_controls(&state.ws.acp).map(Message::Acp),
     };
     let mode_row = row![
-        iced::widget::pick_list([AiMode::Http, AiMode::Acp, AiMode::Codex, AiMode::Grok, AiMode::Cursor], Some(state.ai_mode), Message::AiModeSelected).text_size(12),
+        iced::widget::pick_list([AiMode::Http, AiMode::Acp, AiMode::Codex, AiMode::Grok, AiMode::Cursor], Some(state.ws.ai_mode), Message::AiModeSelected).text_size(12),
         Space::new().width(Length::Fill),
         controls
     ].spacing(6).padding(8);
     let composer = ai_composer::Context {
-        sources: state.tree.as_ref().map(|tree| tree.drag_sources()).unwrap_or_default(),
-        can_reference: state.tabs.get(state.active_tab).is_some(),
+        sources: state.ws.tree.as_ref().map(|tree| tree.drag_sources()).unwrap_or_default(),
+        can_reference: state.ws.tabs.get(state.ws.active_tab).is_some(),
         theme: &state.app_theme.iced,
-        mentions: &state.mentions,
+        mentions: &state.ws.mentions,
     };
-    let panel: Element<'_, Message> = match state.ai_mode {
-        AiMode::Http => chat::view(&state.chat, composer).map(Message::Chat),
-        AiMode::Cursor => acp::view(&state.cursor, state.root_or_cwd(), composer).map(Message::Cursor),
-        AiMode::Grok => acp::view(&state.grok, state.root_or_cwd(), composer).map(Message::Grok),
-        AiMode::Codex => acp::view(&state.codex, state.root_or_cwd(), composer).map(Message::Codex),
-        AiMode::Acp => acp::view(&state.acp, state.root_or_cwd(), composer).map(Message::Acp),
+    let panel: Element<'_, Message> = match state.ws.ai_mode {
+        AiMode::Http => chat::view(&state.ws.chat, composer).map(Message::Chat),
+        AiMode::Cursor => acp::view(&state.ws.cursor, state.root_or_cwd(), composer).map(Message::Cursor),
+        AiMode::Grok => acp::view(&state.ws.grok, state.root_or_cwd(), composer).map(Message::Grok),
+        AiMode::Codex => acp::view(&state.ws.codex, state.root_or_cwd(), composer).map(Message::Codex),
+        AiMode::Acp => acp::view(&state.ws.acp, state.root_or_cwd(), composer).map(Message::Acp),
     };
 
     column![mode_row, panel].height(Length::Fill).into()
@@ -3142,10 +3920,10 @@ fn menu_button_maybe<'a>(label: String, msg: Option<Message>) -> iced::widget::b
 fn command_list(state: &State) -> Vec<command_palette::Command> {
     use command_palette::Command;
 
-    let active_content = state.tabs.get(state.active_tab).filter(|tab| tab.image.is_none()).map(|t| &t.content);
+    let active_content = state.ws.tabs.get(state.ws.active_tab).filter(|tab| tab.image.is_none()).map(|t| &t.content);
     let can_undo = active_content.is_some_and(|c| c.can_undo());
     let can_redo = active_content.is_some_and(|c| c.can_redo());
-    let has_active_tab = state.tabs.get(state.active_tab).is_some();
+    let has_active_tab = state.ws.tabs.get(state.ws.active_tab).is_some();
 
     let mut commands = vec![
         Command { label: "Reopen Closed Tab (Cmd+Shift+T)".into(), message: Message::ReopenClosedTab },
@@ -3227,12 +4005,25 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
             Message::FileAction(FileAction::Save)
         )),
     );
+    let mut file_items = file_items;
+    let open_recent = if state.recent_projects.is_empty() {
+        Item::new(menu_button_maybe("Open Recent".into(), None))
+    } else {
+        let roots = state.workspace_roots();
+        let recent: Vec<_> = state.recent_projects.iter().map(|path| {
+            let open = roots.iter().flatten().any(|root| workspaces::same_folder(root, path));
+            let label = format!("{}{}", path.display(), if open { "  (open)" } else { "" });
+            Item::new(menu_button(label, Message::OpenFolderRequest(path.clone())))
+        }).collect();
+        Item::with_menu(menu_button("Open Recent ›".into(), Message::Noop), Menu::new(recent).width(420.0).offset(4.0).spacing(2.0))
+    };
+    file_items.insert(2, open_recent);
 
-    let active_content = state.tabs.get(state.active_tab).filter(|tab| tab.image.is_none()).map(|t| &t.content);
+    let active_content = state.ws.tabs.get(state.ws.active_tab).filter(|tab| tab.image.is_none()).map(|t| &t.content);
     let can_undo = active_content.is_some_and(|c| c.can_undo());
     let can_redo = active_content.is_some_and(|c| c.can_redo());
 
-    let has_active_tab = state.tabs.get(state.active_tab).is_some();
+    let has_active_tab = state.ws.tabs.get(state.ws.active_tab).is_some();
     let edit_menu_button = menu_button("Edit".to_string(), Message::Noop).width(Length::Shrink);
     let edit_items = menu_items!(
         (menu_button_maybe(
@@ -3364,16 +4155,16 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
 
 fn view_status_bar(state: &State) -> Element<'_, Message> {
     let mut bar = row![
-        icon_control(lucide_icons::Icon::Folder, "Toggle files", Some(Message::SidebarToggle), state.sidebar_visible && state.sidebar_mode == SidebarMode::Tree),
-        icon_control(lucide_icons::Icon::GitBranch, "Toggle source control", Some(Message::GitPanelToggle), state.sidebar_visible && state.sidebar_mode == SidebarMode::Git),
-        icon_control(lucide_icons::Icon::Search, "Search project", Some(Message::ToggleProjectSearch), state.sidebar_visible && state.sidebar_mode == SidebarMode::ProjectSearch),
-        text(state.git_status.as_ref().map_or("", |(message, _)| message.as_str()))
+        icon_control(lucide_icons::Icon::Folder, "Toggle files", Some(Message::SidebarToggle), state.ws.sidebar_visible && state.ws.sidebar_mode == SidebarMode::Tree),
+        icon_control(lucide_icons::Icon::GitBranch, "Toggle source control", Some(Message::GitPanelToggle), state.ws.sidebar_visible && state.ws.sidebar_mode == SidebarMode::Git),
+        icon_control(lucide_icons::Icon::Search, "Search project", Some(Message::ToggleProjectSearch), state.ws.sidebar_visible && state.ws.sidebar_mode == SidebarMode::ProjectSearch),
+        text(state.ws.git_status.as_ref().map_or("", |(message, _)| message.as_str()))
             .size(12).width(Length::Fill).wrapping(iced::widget::text::Wrapping::None)
             .style(iced::widget::text::secondary),
     ].spacing(6);
 
 
-    if let Some(tab) = state.tabs.get(state.active_tab).filter(|tab| tab.image.is_none()) {
+    if let Some(tab) = state.ws.tabs.get(state.ws.active_tab).filter(|tab| tab.image.is_none()) {
         let (line, col) = tab.content.cursor_line_col();
         let language = state.highlighter.language_name(&tab.extension());
         bar = bar.push(text(format!("Ln {line}, Col {col}")).size(12));
@@ -3399,8 +4190,8 @@ fn view_status_bar(state: &State) -> Element<'_, Message> {
         }
     }
 
-    let bar = bar.push(icon_control(lucide_icons::Icon::Terminal, "Toggle terminal (Ctrl+`)", Some(Message::TerminalToggle), state.terminal_visible))
-        .push(icon_control(lucide_icons::Icon::Sparkles, "Toggle AI panel", Some(Message::AiToggle), state.ai_visible))
+    let bar = bar.push(icon_control(lucide_icons::Icon::Terminal, "Toggle terminal (Ctrl+`)", Some(Message::TerminalToggle), state.ws.terminal_visible))
+        .push(icon_control(lucide_icons::Icon::Sparkles, "Toggle AI panel", Some(Message::AiToggle), state.ws.ai_visible))
         .align_y(iced::Alignment::Center).padding([0, 6]);
     container(bar).width(Length::Fill).style(chrome_style).into()
 }
@@ -3428,15 +4219,15 @@ pub(crate) fn overlay_style(theme: &iced::Theme) -> iced::widget::container::Sty
 }
 
 fn view_sidebar(state: &State) -> Element<'_, Message> {
-    match state.sidebar_mode {
+    match state.ws.sidebar_mode {
         SidebarMode::Tree => view_tree(state),
-        SidebarMode::ProjectSearch => project_search::view(&state.project_search, state.root.as_deref()).map(Message::ProjectSearch),
-        SidebarMode::Git => git::view(&state.git, state.git_preview.as_ref().map(|preview| preview.path.as_str())).map(Message::Git),
+        SidebarMode::ProjectSearch => project_search::view(&state.ws.project_search, state.ws.root.as_deref()).map(Message::ProjectSearch),
+        SidebarMode::Git => git::view(&state.ws.git, state.ws.git_preview.as_ref().map(|preview| preview.path.as_str())).map(Message::Git),
     }
 }
 
 fn view_tree(state: &State) -> Element<'_, Message> {
-    let Some(tree) = &state.tree else {
+    let Some(tree) = &state.ws.tree else {
         return container(column![
             text("Your workspace").size(16),
             text("Open a folder to browse files, search your project, and review changes.")
@@ -3446,7 +4237,7 @@ fn view_tree(state: &State) -> Element<'_, Message> {
         ].spacing(12)).padding(16).into();
     };
 
-    let entry = if let Some((dir, is_dir, buf)) = &state.creating {
+    let entry = if let Some((dir, is_dir, buf)) = &state.ws.creating {
         let icon: char = if *is_dir { lucide_icons::Icon::Folder } else { lucide_icons::Icon::File }.into();
         Some((dir.as_path(), false, row![
             text(icon).font(iced::Font::with_name("lucide")).size(14),
@@ -3455,7 +4246,7 @@ fn view_tree(state: &State) -> Element<'_, Message> {
                 .on_input(Message::CreateInput).on_submit(Message::CreateSubmit),
             button("×").style(flat_button_style).on_press(Message::CreateCancel),
         ].spacing(4).align_y(iced::Alignment::Center).into()))
-    } else if let Some((path, buf)) = &state.renaming {
+    } else if let Some((path, buf)) = &state.ws.renaming {
         Some((path.as_path(), true, row![
             text_input("Name", buf).id("tree-name").size(13).padding([3, 5])
                 .on_input(Message::RenameInput).on_submit(Message::RenameSubmit),
@@ -3488,7 +4279,7 @@ fn view_tree(state: &State) -> Element<'_, Message> {
         .into()
     });
 
-    let project = state.root.as_ref().and_then(|path| path.file_name())
+    let project = state.ws.root.as_ref().and_then(|path| path.file_name())
         .map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Files".into());
     column![
         row![text(project).size(12), Space::new().width(Length::Fill),
@@ -3501,8 +4292,8 @@ fn view_tree(state: &State) -> Element<'_, Message> {
 fn view_editor(state: &State) -> Element<'_, Message> {
     use iced_swdir_tree::IconTheme;
     let mut tab_row = row![].spacing(1).padding([2, 4]);
-    for (i, tab) in state.tabs.iter().enumerate() {
-        let is_active = state.git_preview.is_none() && state.git_graph.is_none() && i == state.active_tab;
+    for (i, tab) in state.ws.tabs.iter().enumerate() {
+        let is_active = state.ws.git_preview.is_none() && state.ws.git_graph.is_none() && i == state.ws.active_tab;
         let path = tab.path.as_deref().unwrap_or_else(|| Path::new("Untitled"));
         let spec = file_icons::FileIcons.file_glyph(path);
         let color = file_icons::FileIcons.file_color(path);
@@ -3545,7 +4336,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         let tab_content = iced::widget::mouse_area(tab_content)
             .on_middle_press(Message::TabClosed(i));
         tab_row = tab_row.push(ContextMenu::new(tab_content, move || {
-            let count = state.tabs.len();
+            let count = state.ws.tabs.len();
             container(column![
                 menu_button("Close Tab".into(), Message::TabClosed(i)),
                 menu_button_maybe("Close Other Tabs".into(), (count > 1).then_some(Message::CloseTabs(i, TabCloseScope::Others))),
@@ -3553,13 +4344,13 @@ fn view_editor(state: &State) -> Element<'_, Message> {
                 menu_button_maybe("Close Tabs to the Right".into(), (i + 1 < count).then_some(Message::CloseTabs(i, TabCloseScope::Right))),
                 iced::widget::rule::horizontal(1),
                 menu_button("Close All Tabs".into(), Message::CloseTabs(i, TabCloseScope::All)),
-                menu_button_maybe("Reopen Closed Tab".into(), (!state.closed_tabs.is_empty()).then_some(Message::ReopenClosedTab)),
+                menu_button_maybe("Reopen Closed Tab".into(), (!state.ws.closed_tabs.is_empty()).then_some(Message::ReopenClosedTab)),
             ].spacing(2).width(220))
             .padding(6).style(iced::widget::container::rounded_box).into()
         }));
     }
 
-    if let Some(preview) = &state.git_preview {
+    if let Some(preview) = &state.ws.git_preview {
         let path = Path::new(&preview.path);
         let spec = file_icons::FileIcons.file_glyph(path);
         let color = file_icons::FileIcons.file_color(path);
@@ -3588,12 +4379,12 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             text(git_preview::summary(preview)).size(12).style(iced::widget::text::secondary),
             Space::new().width(Length::Fill),
         ].spacing(8).padding([2, 4]).align_y(iced::Alignment::Center);
-        if state.inline_edit.as_ref().is_some_and(|edit| matches!(edit.stage, inline_edit::Stage::Review(_))) {
+        if state.ws.inline_edit.as_ref().is_some_and(|edit| matches!(edit.stage, inline_edit::Stage::Review(_))) {
             header = header
                 .push(button(text("Accept").size(13)).padding([6, 14]).style(iced::widget::button::success).on_press(Message::InlineEditAccept))
                 .push(button(text("Reject").size(13)).padding([6, 14]).style(flat_button_style).on_press(Message::InlineEditCancel));
         }
-        let header = header.push(button(if state.ai_visible { "Hide AI panel" } else { "Show AI panel" }).style(flat_button_style).on_press(Message::AiToggle));
+        let header = header.push(button(if state.ws.ai_visible { "Hide AI panel" } else { "Show AI panel" }).style(flat_button_style).on_press(Message::AiToggle));
         return column![
             scrollable(tab_row).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())),
             container(header).style(chrome_style),
@@ -3601,7 +4392,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             git_preview::view(preview, &state.app_theme.iced, Message::GitPreviewScrolled),
         ].width(Length::Fill).height(Length::Fill).into();
     }
-    if let Some(graph) = &state.git_graph {
+    if let Some(graph) = &state.ws.git_graph {
         return column![
             scrollable(tab_row).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())),
             git_graph::view(graph).map(Message::GitGraph),
@@ -3609,10 +4400,10 @@ fn view_editor(state: &State) -> Element<'_, Message> {
     }
     let mut editor_column = column![];
 
-    if let Some(tab) = state.tabs.get(state.active_tab) {
+    if let Some(tab) = state.ws.tabs.get(state.ws.active_tab) {
         if let Some(path) = &tab.path {
             let mut crumbs = row![].spacing(2).align_y(iced::Alignment::Center);
-            let base = state.root.as_deref().filter(|root| path.starts_with(root));
+            let base = state.ws.root.as_deref().filter(|root| path.starts_with(root));
             let relative = base.and_then(|root| path.strip_prefix(root).ok()).unwrap_or(path);
             let mut current = base.map(Path::to_path_buf).unwrap_or_default();
             for (index, part) in relative.components().enumerate() {
@@ -3644,7 +4435,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         if tab.search.visible {
             editor_column = editor_column.push(code_editor::search::view(&tab.search).map(Message::Search));
         }
-        if let Some(edit) = state.inline_edit.as_ref().filter(|edit| edit.path == tab.path) {
+        if let Some(edit) = state.ws.inline_edit.as_ref().filter(|edit| edit.path == tab.path) {
             let working = matches!(edit.stage, inline_edit::Stage::Working(_));
             let sparkles: char = lucide_icons::Icon::Sparkles.into();
             let placeholder = if edit.original.is_empty() { "Describe the code to insert here…" } else { "Describe how to change the selected code…" };
@@ -3697,7 +4488,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
                 layers = layers.push(container(popup).padding(offset));
         }
         // Completions below the cursor, drawn over the canvas like the hover popup.
-        if let Some(session) = state.completion.as_ref()
+        if let Some(session) = state.ws.completion.as_ref()
             .filter(|session| tab.path.as_deref() == Some(session.path.as_path()) && session.at_cursor(&tab.content))
         {
             if let Some(anchor) = code_editor::caret_anchor(&tab.content, &state.app_theme.editor, state.zoom) {
@@ -3736,6 +4527,21 @@ fn view_editor(state: &State) -> Element<'_, Message> {
                 .width(Length::Fill).padding([6, 10]).style(flat_button_style).on_press(message)
         };
         let cmd = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
+        let roots = state.workspace_roots();
+        let mut recent = column![].spacing(2);
+        for path in &state.recent_projects {
+            let name = path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned());
+            let open = roots.iter().flatten().any(|root| workspaces::same_folder(root, path));
+            let location = path.parent().map(|parent| parent.display().to_string()).unwrap_or_default();
+            recent = recent.push(button(row![
+                text(name).size(14),
+                text(location).size(12).style(iced::widget::text::secondary).wrapping(iced::widget::text::Wrapping::None),
+                Space::new().width(Length::Fill),
+                text(if open { "open" } else { "" }).size(11).style(iced::widget::text::secondary),
+            ].spacing(8).align_y(iced::Alignment::Center))
+                .width(Length::Fill).padding([6, 10]).style(flat_button_style)
+                .on_press(Message::OpenFolderRequest(path.clone())));
+        }
         let welcome = column![
             text("A little space to build.").size(24),
             text("Open your project and make something useful.").size(14).style(iced::widget::text::secondary),
@@ -3748,6 +4554,9 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             shortcut("Run a command", if cmd == "⌘" { "⌘ Shift P" } else { "Ctrl Shift P" }, Message::ToggleCommandPalette),
             shortcut("Ask your AI assistant", "", Message::AiToggle),
         ].spacing(8).max_width(420);
+        let welcome = if state.recent_projects.is_empty() { welcome } else {
+            welcome.push(Space::new().height(12)).push(text("Recent projects").size(13).style(iced::widget::text::secondary)).push(recent)
+        };
         editor_column = editor_column.push(container(scrollable(container(welcome).padding(32)))
             .center_x(Length::Fill).center_y(Length::Fill));
     }
@@ -3790,31 +4599,56 @@ fn handle_raw_key_event(
     };
     let is_escape = modified_key == keyboard::Key::Named(keyboard::key::Named::Escape);
     let terminal_shortcut = modifiers.control() && modified_key.as_ref() == keyboard::Key::Character("`");
-    if status == iced::event::Status::Ignored || is_escape || terminal_shortcut {
+    // Ctrl+Tab switches workspace tabs from anywhere, even a focused text box.
+    let workspace_switch = !cfg!(target_os = "macos") && workspace_cycle_key(&modified_key, modifiers).is_some();
+    if status == iced::event::Status::Ignored || is_escape || terminal_shortcut || workspace_switch {
         Some(Message::KeyPressed(modified_key, modifiers))
     } else {
         None
     }
 }
 
-/// Opens `path` as the project: remembers it, shows its tree and points the shells at it.
+/// The key switching workspace tabs, if `key` is one: `Some(true)` for the next tab,
+/// `Some(false)` for the previous. Ctrl+Tab and Ctrl+Shift+Tab on Windows and Linux;
+/// Cmd+Shift+] and Cmd+Shift+[ on macOS, where Control+Tab stays the editor's.
+pub(crate) fn workspace_cycle_key(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Option<bool> {
+    workspace_cycle_key_on(cfg!(target_os = "macos"), key, modifiers)
+}
+
+fn workspace_cycle_key_on(macos: bool, key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Option<bool> {
+    use keyboard::Key;
+    if macos {
+        if !modifiers.logo() || !modifiers.shift() || modifiers.control() || modifiers.alt() { return None; }
+        match key.as_ref() {
+            Key::Character("]" | "}") => Some(true),
+            Key::Character("[" | "{") => Some(false),
+            _ => None,
+        }
+    } else {
+        if !modifiers.control() || modifiers.alt() || modifiers.logo() { return None; }
+        (key.as_ref() == Key::Named(keyboard::key::Named::Tab)).then_some(!modifiers.shift())
+    }
+}
+
+/// Opens `path` as the project of the tab in `ws`: remembers it among the recent projects,
+/// shows its tree and points the shells at it.
 fn open_folder(state: &mut State, path: PathBuf) -> Task<Message> {
     let mut task = Task::none();
-    save_last_project(&path);
-    state.tree = Some(file_tree(path.clone()));
+    recent_projects::record(&mut state.recent_projects, path.clone(), state.recent_projects_path.as_deref());
+    state.ws.tree = Some(file_tree(path.clone()));
     state.show_editor();
-    if let Some(tree) = &mut state.tree {
+    if let Some(tree) = &mut state.ws.tree {
         task = tree.update(DirectoryTreeEvent::Toggled(path.clone())).map(Message::Tree);
     }
-    let changed = state.root.as_deref() != Some(path.as_path());
-    state.root = Some(path);
+    let changed = state.ws.root.as_deref() != Some(path.as_path());
+    state.ws.root = Some(path);
     // Shells left in the previous project would run commands against it.
     if changed {
-        let focused = state.terminal.focused();
-        state.terminal.shutdown();
-        if state.terminal_visible {
-            state.terminal.ensure_started(&state.root_or_cwd());
-            state.terminal.set_focused(focused);
+        let focused = state.ws.terminal.focused();
+        state.ws.terminal.shutdown();
+        if state.ws.terminal_visible {
+            state.ws.terminal.ensure_started(&state.root_or_cwd());
+            state.ws.terminal.set_focused(focused);
         }
     }
     task
@@ -3930,14 +4764,8 @@ fn last_project_path() -> Option<PathBuf> {
     config_path("last_project")
 }
 
-fn save_last_project(root: &Path) {
-    let Some(path) = last_project_path() else { return };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, root.to_string_lossy().as_bytes());
-}
-
+/// The project folder saved by versions before workspace tabs; only read to migrate their
+/// session (see `workspaces::read_session`).
 fn load_last_project() -> Option<PathBuf> {
     let text = std::fs::read_to_string(last_project_path()?).ok()?;
     let path = PathBuf::from(text.trim());
@@ -4174,7 +5002,7 @@ fn refresh_dir_task(dir: PathBuf) -> Task<Message> {
 /// Computes diff markers for `text`, the buffer of `path`, against its staged version,
 /// producing `Message::GitDiffLoaded`. A no-op outside the open project (`root`). A free
 /// function rather than a `State` method so callers already holding a `&mut` borrow of part
-/// of `state` (e.g. iterating `&mut self.tabs`) can still call it without a borrow conflict.
+/// of `state` (e.g. iterating `&mut self.ws.tabs`) can still call it without a borrow conflict.
 fn load_diff_task(repo: Option<std::sync::Arc<git::repo::Repo>>, root: Option<&Path>, path: PathBuf, text: String) -> Task<Message> {
     let Some(relative) = root.and_then(|root| path.strip_prefix(root).ok()).map(Path::to_path_buf) else {
         return Task::none();
@@ -4484,6 +5312,258 @@ mod tree_refresh_tests {
         apply(&mut tree, DirectoryTreeEvent::Refresh(root.clone())).await;
         assert!(!iced_swdir_tree::__testing::root(&tree).children.iter().any(|child| child.path == root.join("renamed.ts")));
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+    use iced::futures::StreamExt;
+
+    /// Settings that save nothing: the session and recent projects stay in memory.
+    fn settings() -> Settings {
+        Settings {
+            themes: theme::ThemeRegistry::load(),
+            app_theme: theme::EditorTheme::default_dark(),
+            zoom: code_editor::ZOOM_DEFAULT,
+            word_wrap: false,
+            recent_files: Vec::new(),
+            session_store: SessionStore::Memory,
+            recent_projects_path: None,
+        }
+    }
+
+    fn layout() -> Layout {
+        Layout {
+            sidebar_visible: true, sidebar_mode: SidebarMode::Tree, ai_visible: false, ai_mode: AiMode::Http,
+            terminal_visible: false, sidebar_ratio: 0.2, ai_ratio: 0.65,
+        }
+    }
+
+    /// A tab without a folder holding one unsaved file per draft, named after its text. The
+    /// files don't exist and none is opened from disk, so nothing touches the user's files or
+    /// recent files; `.txt` has no language server.
+    fn tab(drafts: &[&str]) -> EditorSession {
+        let path = |text: &str| std::env::temp_dir().join(format!("editor-workspace-test-{}-{text}.txt", std::process::id()));
+        EditorSession {
+            recovery: drafts.iter().map(|text| RecoveryBuffer { path: Some(path(text)), text: text.to_string() }).collect(),
+            layout: Some(layout()),
+            ..Default::default()
+        }
+    }
+
+    fn state(tabs: Vec<EditorSession>, active: usize) -> State {
+        State::start(settings(), workspaces::SessionFile { workspaces: tabs, active_workspace: active }).0
+    }
+
+    fn ids(state: &State) -> Vec<WorkspaceId> {
+        state.workspaces.iter().map(|entry| entry.id).collect()
+    }
+
+    fn loaded(state: &State, index: usize) -> bool {
+        !matches!(state.workspaces[index].slot, Slot::Unloaded(_))
+    }
+
+    /// The texts of tab `index`'s files.
+    fn texts(state: &State, index: usize) -> Vec<String> {
+        state.workspace(index).map(|workspace| workspace.tabs.iter().map(|tab| tab.content.text()).collect()).unwrap_or_default()
+    }
+
+    async fn outputs(task: Task<Message>) -> Vec<Message> {
+        let mut messages = Vec::new();
+        if let Some(mut stream) = iced_runtime::task::into_stream(task) {
+            while let Some(action) = stream.next().await {
+                if let iced_runtime::Action::Output(message) = action { messages.push(message); }
+            }
+        }
+        messages
+    }
+
+    #[tokio::test]
+    async fn what_a_tab_starts_reports_back_to_that_tab() {
+        let messages = outputs(tag(Task::batch([Task::done(Message::RefreshTree), Task::done(Message::Tick)]), 7)).await;
+        assert!(matches!(&messages[0], Message::In(7, message) if matches!(**message, Message::RefreshTree)));
+        assert!(matches!(messages[1], Message::Tick), "app-wide messages are not addressed to a tab");
+        // Already addressed messages keep their tab.
+        let messages = outputs(tag(Task::done(Message::In(3, Box::new(Message::RefreshTree))), 7)).await;
+        assert!(matches!(&messages[0], Message::In(3, _)));
+    }
+
+    #[test]
+    fn only_the_shown_tab_loads_at_startup_and_others_on_first_show() {
+        let mut state = state(vec![tab(&["a"]), tab(&["b1", "b2"]), tab(&[])], 1);
+        assert_eq!(state.active, 1);
+        assert!(!loaded(&state, 0) && loaded(&state, 1) && !loaded(&state, 2));
+        assert_eq!(texts(&state, 1), ["b1", "b2"]);
+        // Unsaved edits of a tab not loaded yet still count.
+        assert_eq!(state.workspace_unsaved(0), 1);
+        assert_eq!(state.workspace_unsaved(2), 0);
+
+        let _ = update(&mut state, Message::WorkspaceCycle(true));
+        assert_eq!((state.active, state.current), (2, 2));
+        assert!(loaded(&state, 2) && matches!(state.workspaces[1].slot, Slot::Parked(_)));
+        let _ = update(&mut state, Message::WorkspaceCycle(true));
+        assert_eq!(state.active, 0, "wraps around");
+        assert_eq!(texts(&state, 0), ["a"], "its unsaved edits came back on first show");
+        let _ = update(&mut state, Message::WorkspaceCycle(false));
+        assert_eq!(state.active, 2);
+        assert_eq!(texts(&state, 1), ["b1", "b2"], "a tab in the background keeps its files");
+    }
+
+    #[test]
+    fn replies_reach_their_own_tab_even_in_the_background() {
+        let mut state = state(vec![tab(&["a1", "a2"]), tab(&["b1", "b2"])], 1);
+        let _ = update(&mut state, Message::WorkspaceCycle(true));
+        let [a, b] = ids(&state)[..] else { panic!() };
+        assert_eq!(state.active, 0);
+        // A reply for tab B (here: a confirmed close of its first file) while A is shown.
+        let _ = update(&mut state, Message::In(b, Box::new(Message::CloseTabConfirmed(0))));
+        assert_eq!(texts(&state, 1), ["b2"]);
+        assert_eq!(texts(&state, 0), ["a1", "a2"], "the shown tab is untouched");
+        assert_eq!((state.active, state.current, state.ws.id), (0, 0, a), "the shown tab is back in place");
+        // A notice from the background says which tab it is about.
+        let missing = std::env::temp_dir().join(format!("editor-missing-{}", std::process::id()));
+        let _ = update(&mut state, Message::In(b, Box::new(Message::DeleteConfirmed(missing))));
+        assert!(state.notice.as_ref().is_some_and(|(text, _)| text.starts_with("[New Tab] Delete failed")), "{:?}", state.notice);
+        // Replies for a closed tab are dropped.
+        let _ = update(&mut state, Message::WorkspacesCloseConfirmed(vec![b]));
+        let _ = update(&mut state, Message::In(b, Box::new(Message::CloseTabConfirmed(0))));
+        assert_eq!(texts(&state, 0), ["a1", "a2"]);
+    }
+
+    #[test]
+    fn new_tabs_open_at_the_end_and_closing_shows_the_neighbour() {
+        let mut state = state(vec![tab(&[])], 0);
+        for _ in 0..3 { let _ = update(&mut state, Message::WorkspaceNew); }
+        assert_eq!(state.workspaces.len(), 4);
+        assert_eq!(state.active, 3, "a new tab is shown");
+        let all = ids(&state);
+        // Closing the shown tab shows the one to its right...
+        let _ = update(&mut state, Message::WorkspaceCycle(true));
+        let _ = update(&mut state, Message::WorkspaceCycle(true));
+        assert_eq!(state.active, 1);
+        let _ = update(&mut state, Message::WorkspaceClose(all[1]));
+        assert_eq!(ids(&state), [all[0], all[2], all[3]]);
+        assert_eq!(state.ws.id, all[2]);
+        // ...or, at the end, the one to its left.
+        let _ = update(&mut state, Message::WorkspaceCycle(true));
+        let _ = update(&mut state, Message::WorkspaceClose(all[3]));
+        assert_eq!(state.ws.id, all[2]);
+        // Closing a tab in the background keeps the shown one.
+        let _ = update(&mut state, Message::WorkspaceClose(all[0]));
+        assert_eq!(ids(&state), [all[2]]);
+        assert_eq!((state.active, state.current), (0, 0));
+        // The last tab is emptied, not removed, under a new id so late replies are dropped.
+        let _ = update(&mut state, Message::WorkspaceClose(all[2]));
+        assert_eq!(state.workspaces.len(), 1);
+        assert_ne!(state.ws.id, all[2]);
+        assert!(state.ws.root.is_none() && state.ws.tabs.is_empty());
+    }
+
+    #[test]
+    fn close_others_and_close_to_the_right() {
+        let mut state = state(vec![tab(&[]), tab(&[]), tab(&[]), tab(&[])], 0);
+        let all = ids(&state);
+        let _ = update(&mut state, Message::WorkspaceCloseRight(all[1]));
+        assert_eq!(ids(&state), [all[0], all[1]]);
+        let _ = update(&mut state, Message::WorkspaceCloseOthers(all[1]));
+        assert_eq!(ids(&state), [all[1]]);
+        assert_eq!(state.ws.id, all[1]);
+    }
+
+    #[test]
+    fn close_folder_with_several_tabs_closes_its_tab() {
+        let mut state = state(vec![tab(&[]), tab(&[])], 0);
+        let all = ids(&state);
+        let _ = update(&mut state, Message::FileAction(FileAction::CloseFolder));
+        assert_eq!(ids(&state), [all[1]]);
+    }
+
+    #[test]
+    fn dragging_a_tab_moves_it_and_keeps_it_shown() {
+        let mut state = state(vec![tab(&[]), tab(&[]), tab(&[])], 2);
+        let all = ids(&state);
+        let _ = update(&mut state, Message::WorkspaceDragStart(all[0]));
+        assert_eq!(state.ws.id, all[0], "pressing a tab shows it");
+        // Over the third tab's place (tabs 150 wide).
+        let _ = update(&mut state, Message::WorkspaceDragMove(320.0, 150.0));
+        assert_eq!(ids(&state), [all[1], all[2], all[0]]);
+        assert_eq!((state.active, state.ws.id), (2, all[0]));
+        let _ = update(&mut state, Message::WorkspaceDragMove(10.0, 150.0));
+        assert_eq!(ids(&state), [all[0], all[1], all[2]]);
+        // Releasing the mouse ends the drag; moving no longer moves tabs.
+        let _ = update(&mut state, Message::TreeDragReleased);
+        let _ = update(&mut state, Message::WorkspaceDragMove(320.0, 150.0));
+        assert_eq!(ids(&state), [all[0], all[1], all[2]]);
+    }
+
+    #[test]
+    fn the_session_keeps_every_tab_and_tabs_not_loaded_exactly_as_read() {
+        let mut background = tab(&["draft"]);
+        background.tabs = vec![PathBuf::from("never-opened.rs")];
+        background.layout = Some(Layout { ai_visible: true, terminal_visible: true, ..layout() });
+        let mut state = state(vec![tab(&["shown"]), background.clone()], 0);
+        let session = state.session();
+        assert_eq!(session.active_workspace, 0);
+        assert_eq!(session.workspaces[1], background);
+        assert_eq!(session.workspaces[0].recovery, tab(&["shown"]).recovery);
+        assert_eq!(session.workspaces[0].layout, Some(layout()));
+        assert!(state.recovery_saved(), "every tab's unsaved edits are in the saved session");
+        assert_eq!(State::all_recovery(&state.saved_session).len(), 2);
+        let _ = update(&mut state, Message::WorkspaceNew);
+        assert_eq!(state.session().active_workspace, 2);
+    }
+
+    #[test]
+    fn a_layout_is_restored_per_tab() {
+        let wide = Layout { sidebar_visible: false, ai_visible: true, ai_mode: AiMode::Codex, sidebar_mode: SidebarMode::Git, ai_ratio: 0.5, ..layout() };
+        let state = state(vec![EditorSession { layout: Some(wide), ..Default::default() }], 0);
+        assert_eq!(state.ws.layout(), wide);
+        assert!(state.ws.panes.iter().any(|(_, kind)| *kind == PaneKind::Ai));
+        assert!(!state.ws.panes.iter().any(|(_, kind)| *kind == PaneKind::Sidebar));
+    }
+
+    #[test]
+    fn workspace_keys_are_ctrl_tab_except_on_macos() {
+        use keyboard::{key::Named, Key, Modifiers};
+        let tab = Key::Named(Named::Tab);
+        let (ctrl, shift, alt, cmd) = (Modifiers::CTRL, Modifiers::SHIFT, Modifiers::ALT, Modifiers::LOGO);
+        assert_eq!(workspace_cycle_key_on(false, &tab, ctrl), Some(true));
+        assert_eq!(workspace_cycle_key_on(false, &tab, ctrl | shift), Some(false));
+        assert_eq!(workspace_cycle_key_on(false, &tab, Modifiers::empty()), None);
+        assert_eq!(workspace_cycle_key_on(false, &tab, ctrl | alt), None);
+        assert_eq!(workspace_cycle_key_on(false, &Key::Character("]".into()), cmd | shift), None);
+        // macOS: Cmd+Shift+] / [ (reported as } / { with Shift); Control+Tab stays the editor's.
+        assert_eq!(workspace_cycle_key_on(true, &Key::Character("}".into()), cmd | shift), Some(true));
+        assert_eq!(workspace_cycle_key_on(true, &Key::Character("]".into()), cmd | shift), Some(true));
+        assert_eq!(workspace_cycle_key_on(true, &Key::Character("{".into()), cmd | shift), Some(false));
+        assert_eq!(workspace_cycle_key_on(true, &Key::Character("]".into()), cmd), None);
+        assert_eq!(workspace_cycle_key_on(true, &tab, ctrl), None);
+        assert_eq!(workspace_cycle_key_on(true, &tab, ctrl | shift), None);
+    }
+
+    #[test]
+    fn ctrl_tab_gets_through_a_focused_text_box_except_on_macos() {
+        let tab = keyboard::Key::Named(keyboard::key::Named::Tab);
+        let press = |modifiers| iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: tab.clone(), modified_key: tab.clone(),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab),
+            location: keyboard::Location::Standard, modifiers, text: None, repeat: false,
+        });
+        let window = iced::window::Id::unique();
+        let captured = handle_raw_key_event(press(keyboard::Modifiers::CTRL), iced::event::Status::Captured, window);
+        assert_eq!(captured.is_some(), !cfg!(target_os = "macos"));
+        // Other captured keys still stay with the text box.
+        assert!(handle_raw_key_event(press(keyboard::Modifiers::empty()), iced::event::Status::Captured, window).is_none());
+    }
+
+    #[test]
+    fn mac_control_tab_still_indents_in_the_editor() {
+        // On macOS the editor's Tab handling ignores Control, so Control+Tab indents; the
+        // workspace keys don't take it there (see `workspace_cycle_key_on`). Unchanged here.
+        let mut buffer = code_editor::Buffer::new("x", code_editor::metrics_for_zoom(1.0));
+        let handled = code_editor::input::handle_key(&mut buffer, &keyboard::Key::Named(keyboard::key::Named::Tab), keyboard::Modifiers::CTRL);
+        assert_eq!(handled, cfg!(target_os = "macos"));
     }
 }
 
