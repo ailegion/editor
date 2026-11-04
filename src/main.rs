@@ -476,6 +476,10 @@ struct EditorSession {
     active: Option<PathBuf>,
     #[serde(default)]
     recovery: Vec<RecoveryBuffer>,
+    /// When the active file is untitled (so `active` can't name it): which of the untitled
+    /// drafts in `recovery` it is, counting from 0. Absent in older sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_untitled: Option<usize>,
     /// The tab's panels and their sizes. Absent in sessions saved before workspace tabs, which
     /// open with the saved defaults like before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -581,13 +585,15 @@ impl Workspace {
     /// hidden; `State::restore_layout` opens it when the layout says so.
     fn new(id: WorkspaceId, root: Option<PathBuf>, layout: Layout) -> Self {
         let tree = root.clone().map(file_tree);
-        let (mut panes, first_pane) = if layout.sidebar_visible {
+        // No sidebar without a folder (see `State::sidebar_shown`); the setting is kept.
+        let sidebar = layout.sidebar_visible && root.is_some();
+        let (mut panes, first_pane) = if sidebar {
             pane_grid::State::new(PaneKind::Sidebar)
         } else {
             pane_grid::State::new(PaneKind::Main)
         };
 
-        let (main_pane, sidebar_split) = if layout.sidebar_visible {
+        let (main_pane, sidebar_split) = if sidebar {
             let (main_pane, split) = panes
                 .split(pane_grid::Axis::Vertical, first_pane, PaneKind::Main)
                 .expect("splitting a freshly created single-pane state always succeeds");
@@ -676,6 +682,9 @@ impl Workspace {
             tabs: self.tabs.iter().filter_map(|tab| tab.path.clone()).collect(),
             active: self.tabs.get(self.active_tab).and_then(|tab| tab.path.clone()),
             recovery: self.recovery(),
+            active_untitled: self.tabs.get(self.active_tab).filter(|tab| tab.path.is_none() && tab.dirty).map(|_| {
+                self.tabs[..self.active_tab].iter().filter(|tab| tab.path.is_none() && tab.dirty).count()
+            }),
             layout: Some(self.layout()),
         }
     }
@@ -921,13 +930,21 @@ impl State {
                     diagnostics: Vec::new(), blame: Vec::new(), hover: None, preview: None, image: None,
                 };
                 tab.refresh_dirty();
-                if let Some(index) = self.ws.tabs.iter().position(|tab| tab.path == recovery.path) {
+                // A file's edits go into its reopened tab. Untitled drafts have no path to
+                // match by, so each gets its own tab.
+                let reopened = recovery.path.as_ref().and_then(|_| self.ws.tabs.iter().position(|tab| tab.path == recovery.path));
+                if let Some(index) = reopened {
                     self.ws.tabs[index] = tab;
                 } else { self.ws.tabs.push(tab); }
                 self.notify("Recovered unsaved edits");
             }
             self.ws.tabs.sort_by_key(|tab| session.tabs.iter().position(|path| tab.path.as_ref() == Some(path)).unwrap_or(usize::MAX));
-            if let Some(index) = self.ws.tabs.iter().position(|tab| tab.path == session.active) {
+            let active = match (&session.active, session.active_untitled) {
+                // The untitled draft that was active, among the untitled tabs in saved order.
+                (None, Some(nth)) => self.ws.tabs.iter().enumerate().filter(|(_, tab)| tab.path.is_none()).nth(nth).map(|(index, _)| index),
+                _ => self.ws.tabs.iter().position(|tab| tab.path == session.active),
+            };
+            if let Some(index) = active {
                 self.ws.active_tab = index;
             }
         }
@@ -1206,17 +1223,39 @@ impl State {
         }
         self.ws.sidebar_visible = true;
         save_sidebar_visible(true);
-        let main_pane = self.ws.panes.iter().find(|(_, kind)| **kind == PaneKind::Main).map(|(pane, _)| *pane);
-        if let Some(main_pane) = main_pane {
-            if let Some((sidebar_pane, split)) =
-                self.ws.panes.split(pane_grid::Axis::Vertical, main_pane, PaneKind::Sidebar)
-            {
-                // `split` always inserts the new pane after the target, i.e. to Main's
-                // right; swap them so the sidebar ends up on the left.
-                self.ws.panes.swap(main_pane, sidebar_pane);
-                self.ws.panes.resize(split, self.ws.sidebar_ratio);
-                self.ws.sidebar_split = Some(split);
+        self.sync_sidebar();
+    }
+
+    /// The sidebar shows when it is switched on and the tab has a folder: everything in it
+    /// (files, project search, source control) needs one. Without a folder the welcome screen
+    /// gets the whole width, and the on/off setting is kept for when a folder opens.
+    fn sidebar_shown(&self) -> bool {
+        self.ws.sidebar_visible && self.ws.root.is_some()
+    }
+
+    /// Adds or removes the sidebar pane so it matches `sidebar_shown`.
+    fn sync_sidebar(&mut self) {
+        let sidebar_pane = self.ws.panes.iter().find(|(_, kind)| **kind == PaneKind::Sidebar).map(|(pane, _)| *pane);
+        match (self.sidebar_shown(), sidebar_pane) {
+            (true, None) => {
+                let main_pane = self.ws.panes.iter().find(|(_, kind)| **kind == PaneKind::Main).map(|(pane, _)| *pane);
+                if let Some(main_pane) = main_pane {
+                    if let Some((sidebar_pane, split)) =
+                        self.ws.panes.split(pane_grid::Axis::Vertical, main_pane, PaneKind::Sidebar)
+                    {
+                        // `split` always inserts the new pane after the target, i.e. to Main's
+                        // right; swap them so the sidebar ends up on the left.
+                        self.ws.panes.swap(main_pane, sidebar_pane);
+                        self.ws.panes.resize(split, self.ws.sidebar_ratio);
+                        self.ws.sidebar_split = Some(split);
+                    }
+                }
             }
+            (false, Some(sidebar_pane)) => {
+                self.ws.panes.close(sidebar_pane);
+                self.ws.sidebar_split = None;
+            }
+            _ => {}
         }
     }
 
@@ -1235,7 +1274,11 @@ impl State {
     /// familiar "activity bar" pattern); clicking any other button switches to that panel,
     /// opening the sidebar first if it was closed. Returns `true` if `mode` ended up visible
     /// (as opposed to the sidebar collapsing), so callers can decide whether to e.g. refresh.
+    /// Without a folder there is nothing to show, so nothing happens.
     fn toggle_sidebar_mode(&mut self, mode: SidebarMode) -> bool {
+        if self.ws.root.is_none() {
+            return false;
+        }
         if self.ws.sidebar_visible && self.ws.sidebar_mode == mode {
             self.hide_sidebar();
             false
@@ -3972,6 +4015,10 @@ fn command_list(state: &State) -> Vec<command_palette::Command> {
         commands.push(Command { label: "AI: Fix Problem on This Line".into(), message: Message::AiAct(AiAct::Fix) });
     }
     commands.push(Command { label: "AI: Write Commit Message from Staged Changes".into(), message: Message::Git(git::Message::GenerateMessage) });
+    // Like the status bar's buttons, the sidebar's panels are only offered with a folder open.
+    if state.ws.root.is_none() {
+        commands.retain(|command| !matches!(command.message, Message::ToggleProjectSearch | Message::SidebarToggle | Message::GitPanelToggle));
+    }
 
     for (label, mode) in [("Install Theme...", theme_install::Mode::Install), ("Uninstall Theme...", theme_install::Mode::Uninstall)] {
         commands.push(Command { label: label.to_string(), message: Message::ThemeInstall(theme_install::Message::Open(mode)) });
@@ -4054,9 +4101,9 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
             "Find (Cmd+F)".to_string(),
             has_active_tab.then_some(Message::Search(code_editor::search::Message::Toggle)),
         )),
-        (menu_button(
+        (menu_button_maybe(
             "Find in Project (Cmd+Shift+F)".to_string(),
-            Message::ToggleProjectSearch
+            state.ws.root.is_some().then_some(Message::ToggleProjectSearch),
         )),
         (menu_button(
             "Quick Open (Cmd+P)".to_string(),
@@ -4154,10 +4201,12 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
 }
 
 fn view_status_bar(state: &State) -> Element<'_, Message> {
+    // The sidebar's panels need a folder: without one these are greyed out.
+    let (shown, project) = (state.sidebar_shown(), state.ws.root.is_some());
     let mut bar = row![
-        icon_control(lucide_icons::Icon::Folder, "Toggle files", Some(Message::SidebarToggle), state.ws.sidebar_visible && state.ws.sidebar_mode == SidebarMode::Tree),
-        icon_control(lucide_icons::Icon::GitBranch, "Toggle source control", Some(Message::GitPanelToggle), state.ws.sidebar_visible && state.ws.sidebar_mode == SidebarMode::Git),
-        icon_control(lucide_icons::Icon::Search, "Search project", Some(Message::ToggleProjectSearch), state.ws.sidebar_visible && state.ws.sidebar_mode == SidebarMode::ProjectSearch),
+        icon_control(lucide_icons::Icon::Folder, "Toggle files", project.then_some(Message::SidebarToggle), shown && state.ws.sidebar_mode == SidebarMode::Tree),
+        icon_control(lucide_icons::Icon::GitBranch, "Toggle source control", project.then_some(Message::GitPanelToggle), shown && state.ws.sidebar_mode == SidebarMode::Git),
+        icon_control(lucide_icons::Icon::Search, "Search project", project.then_some(Message::ToggleProjectSearch), shown && state.ws.sidebar_mode == SidebarMode::ProjectSearch),
         text(state.ws.git_status.as_ref().map_or("", |(message, _)| message.as_str()))
             .size(12).width(Length::Fill).wrapping(iced::widget::text::Wrapping::None)
             .style(iced::widget::text::secondary),
@@ -4642,6 +4691,8 @@ fn open_folder(state: &mut State, path: PathBuf) -> Task<Message> {
     }
     let changed = state.ws.root.as_deref() != Some(path.as_path());
     state.ws.root = Some(path);
+    // The sidebar, hidden while the tab had no folder, comes back if it is switched on.
+    state.sync_sidebar();
     // Shells left in the previous project would run commands against it.
     if changed {
         let focused = state.ws.terminal.focused();
@@ -5521,6 +5572,80 @@ mod workspace_tests {
         assert_eq!(state.ws.layout(), wide);
         assert!(state.ws.panes.iter().any(|(_, kind)| *kind == PaneKind::Ai));
         assert!(!state.ws.panes.iter().any(|(_, kind)| *kind == PaneKind::Sidebar));
+    }
+
+    fn sidebar_pane(state: &State) -> bool {
+        state.ws.panes.iter().any(|(_, kind)| *kind == PaneKind::Sidebar)
+    }
+
+    #[test]
+    fn the_sidebar_only_shows_with_a_folder_and_keeps_its_setting() {
+        // Switched on (see `layout`), but the tab has no folder.
+        let mut state = state(vec![tab(&[])], 0);
+        assert!(!sidebar_pane(&state));
+        assert!(state.ws.sidebar_visible && !state.sidebar_shown());
+        // Its buttons, menu entries and Ctrl/Cmd+Shift+F do nothing without a folder.
+        let find = Message::KeyPressed(keyboard::Key::Character("F".into()), keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT);
+        for message in [Message::SidebarToggle, Message::ToggleProjectSearch, Message::GitPanelToggle, find] {
+            let _ = update(&mut state, message);
+            assert!(!sidebar_pane(&state));
+            assert!(state.ws.sidebar_visible, "the setting is not switched off");
+            assert_eq!(state.ws.sidebar_mode, SidebarMode::Tree);
+        }
+        assert!(!command_list(&state).iter().any(|command| matches!(command.message,
+            Message::SidebarToggle | Message::ToggleProjectSearch | Message::GitPanelToggle)));
+        // A folder opening in the tab brings it back as it was set.
+        let dir = tempfile::tempdir().unwrap();
+        state.ws.root = Some(dir.path().to_path_buf());
+        state.sync_sidebar();
+        assert!(sidebar_pane(&state) && state.sidebar_shown());
+        assert!(command_list(&state).iter().any(|command| matches!(command.message, Message::SidebarToggle)));
+        // Emptying the tab hides it again, still switched on.
+        let id = state.ws.id;
+        let _ = update(&mut state, Message::WorkspaceClose(id));
+        assert!(!sidebar_pane(&state));
+        assert!(state.ws.sidebar_visible);
+        // Switched off, a folder doesn't bring it back.
+        state.ws.sidebar_visible = false;
+        state.ws.root = Some(dir.path().to_path_buf());
+        state.sync_sidebar();
+        assert!(!sidebar_pane(&state));
+    }
+
+    fn untitled(text: &str) -> RecoveryBuffer {
+        RecoveryBuffer { path: None, text: text.into() }
+    }
+
+    #[test]
+    fn every_untitled_draft_comes_back_as_its_own_tab() {
+        let mut session = tab(&["file"]);
+        session.recovery.insert(0, untitled("one"));
+        session.recovery.push(untitled("two"));
+        let state = state(vec![session.clone()], 0);
+        assert_eq!(texts(&state, 0), ["one", "file", "two"]);
+        assert_eq!(state.ws.tabs[1].path, session.recovery[1].path, "a file's draft is in its own tab");
+        assert!(state.ws.tabs.iter().all(|tab| tab.dirty));
+    }
+
+    #[test]
+    fn the_active_untitled_draft_is_active_again_after_a_restart() {
+        let drafts = EditorSession { recovery: vec![untitled("a"), untitled("b")], layout: Some(layout()), ..Default::default() };
+        let state_with = |active_untitled| state(vec![EditorSession { active_untitled, ..drafts.clone() }], 0);
+        let restored = state_with(Some(1));
+        assert_eq!(restored.ws.tabs[restored.ws.active_tab].content.text(), "b");
+        // A session from before this was saved still opens on the first untitled draft.
+        let old = state_with(None);
+        assert_eq!(old.ws.tabs[old.ws.active_tab].content.text(), "a");
+        // What is saved: the active draft's place among the untitled drafts, else nothing.
+        let mut both = state_with(Some(1));
+        assert_eq!(both.ws.session().active_untitled, Some(1));
+        both.ws.active_tab = 0;
+        assert_eq!(both.ws.session().active_untitled, Some(0));
+        let mut with_file = tab(&["file"]);
+        with_file.recovery.push(untitled("c"));
+        let mut mixed = state(vec![with_file], 0);
+        mixed.ws.active_tab = mixed.ws.tabs.iter().position(|tab| tab.path.is_some()).unwrap();
+        assert_eq!(mixed.ws.session().active_untitled, None, "a file is named by its path instead");
     }
 
     #[test]
