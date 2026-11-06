@@ -13,7 +13,7 @@ pub mod repo;
 pub mod status;
 mod watch;
 
-use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_editor, Space};
+use iced::widget::{button, checkbox, column, container, row, text, text_editor, Space};
 use iced::{Element, Length, Task};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -417,12 +417,12 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
         let discard = crate::icon_control(lucide_icons::Icon::Undo2, "Discard unstaged changes", (!state.committing && !discard.is_empty()).then_some(Message::Discard(discard)), false);
         files_col = files_col.push(row![indent, check, label, discard].spacing(4).align_y(iced::Alignment::Center));
     }
-    let files_list = scrollable(files_col).height(Length::Fill);
+    let files_list = crate::scrollbar::scrollable(files_col).height(Length::Fill);
 
     // Keyed, so the message box keeps its widget state (focus) when the error above it comes or goes.
     let mut bottom = iced::widget::keyed::Column::new().spacing(4);
     if let Some(err) = &state.error {
-        bottom = bottom.push("error", scrollable(text(err.clone()).size(12).font(iced::Font::MONOSPACE).style(iced::widget::text::danger)).height(Length::Shrink));
+        bottom = bottom.push("error", crate::scrollbar::scrollable(text(err.clone()).size(12).font(iced::Font::MONOSPACE).style(iced::widget::text::danger)).height(Length::Shrink));
     }
     let has_staged = state.status.files.iter().any(ChangedFile::staged);
     bottom = bottom.push(
@@ -522,7 +522,7 @@ fn branch_picker<'a>(picker: &'a BranchPicker, current: &str) -> Element<'a, Mes
     } else if visible.is_empty() {
         list = list.push(text(if picker.branches.is_empty() { "No branches yet. Type a name to create one." } else { "No matching branches" }).size(12).style(secondary));
     }
-    content = content.push(container(scrollable(list)).max_height(320));
+    content = content.push(container(crate::scrollbar::scrollable(list)).max_height(320));
     container(content).padding(6).width(Length::Fill).style(crate::overlay_style).into()
 }
 

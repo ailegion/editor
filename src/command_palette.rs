@@ -10,7 +10,7 @@
 
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use iced::widget::{button, column, container, mouse_area, scrollable, text, text_input, Space};
+use iced::widget::{button, column, container, mouse_area, text, text_input, Space};
 use iced::{Element, Length, Task};
 
 /// One selectable action: a label shown in the palette, and the app-level `Message` it
@@ -156,7 +156,7 @@ pub fn view(state: &PaletteState) -> Element<'_, Message> {
     }
 
     let panel = container(
-        column![text("Run a command").size(14), input, scrollable(results_col).id(results_id()).height(Length::Fixed(320.0)), text("↑ ↓ Navigate    Enter Run    Esc Close").size(11).style(iced::widget::text::secondary)].spacing(12),
+        column![text("Run a command").size(14), input, crate::scrollbar::scrollable(results_col).id(results_id()).height(Length::Fixed(320.0)), text("↑ ↓ Navigate    Enter Run    Esc Close").size(11).style(iced::widget::text::secondary)].spacing(12),
     )
     .padding(16)
     .width(Length::Fill)

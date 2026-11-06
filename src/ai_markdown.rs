@@ -2,7 +2,7 @@
 //! Rendered text can be selected with the mouse and copied; see `ai_select.rs`.
 use std::cell::Cell;
 
-use iced::widget::{column, container, markdown, row, scrollable, text, Space};
+use iced::widget::{column, container, markdown, row, text, Space};
 use iced::{Element, Length};
 
 use crate::ai_select::{SelectableText, Selection};
@@ -144,9 +144,9 @@ impl<'a> markdown::Viewer<'a, Action> for Viewer {
                 .into()
         }));
         let block = container(
-            scrollable(container(lines).padding(settings.code_size))
-                .direction(scrollable::Direction::Horizontal(
-                    scrollable::Scrollbar::default().width(settings.code_size / 2).scroller_width(settings.code_size / 2),
+            crate::scrollbar::scrollable(container(lines).padding(settings.code_size))
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    crate::scrollbar::rail(),
                 )),
         ).width(Length::Fill).padding(settings.code_size / 4).style(container::dark);
         column![header, block].spacing(2).into()

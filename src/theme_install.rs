@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use iced::widget::{button, column, container, mouse_area, row, scrollable, text, text_input, Space};
+use iced::widget::{button, column, container, mouse_area, row, text, text_input, Space};
 use iced::{Element, Length, Task};
 
 use crate::theme::openvsx::{self, Extension, Installed};
@@ -280,7 +280,7 @@ pub fn view(state: &ThemeInstallState) -> Element<'_, Message> {
         text(format!("↑ ↓ Navigate    Enter {action}    Esc Close")).size(11).style(iced::widget::text::secondary),
         Space::new().width(Length::Fill),
     ];
-    let mut body = column![text(title).size(14), input, status, scrollable(list).id(results_id()).height(Length::Fixed(360.0)), hint].spacing(12);
+    let mut body = column![text(title).size(14), input, status, crate::scrollbar::scrollable(list).id(results_id()).height(Length::Fixed(360.0)), hint].spacing(12);
     if state.mode == Mode::Install {
         body = body.push(
             text("Themes come from open-vsx.org and keep their own licenses; check a theme's license before redistributing it.")

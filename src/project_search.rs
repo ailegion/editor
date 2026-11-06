@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use iced::widget::{button, column, container, row, rich_text, span, scrollable, text, text_input, Space};
+use iced::widget::{button, column, container, row, rich_text, span, text, text_input, Space};
 use iced::{Element, Length, Task};
 
 /// Directories skipped during the walk. Not `.gitignore`-aware -- just the usual noisy,
@@ -267,7 +267,7 @@ pub fn view<'a>(state: &'a SearchState, root: Option<&Path>) -> Element<'a, Mess
         crate::panel_heading("SEARCH"),
         input,
         text(summary).size(12).style(crate::metadata_text_style),
-        scrollable(results_col).height(Length::Fill),
+        crate::scrollbar::scrollable(results_col).height(Length::Fill),
     ]
     .spacing(6)
     .padding(8)

@@ -53,7 +53,18 @@ impl DirectoryTree {
 
     /// Render an inline editor beneath a directory, or in place of an existing row.
     pub fn view_with_entry<'a, Message, F>(
+        &'a self, on_event: F, entry: Option<(&'a Path, bool, Element<'a, Message>)>,
+    ) -> Element<'a, Message>
+    where Message: Clone + 'a, F: Fn(DirectoryTreeEvent) -> Message + Copy + 'a,
+    {
+        self.view_with_entry_and_scrollbar(on_event, entry, scrollable::Scrollbar::default(), scrollable::default)
+    }
+
+    /// Render with application-provided scrollbar geometry and appearance.
+    pub fn view_with_entry_and_scrollbar<'a, Message, F>(
         &'a self, on_event: F, mut entry: Option<(&'a Path, bool, Element<'a, Message>)>,
+        scrollbar: scrollable::Scrollbar,
+        style: fn(&Theme, scrollable::Status) -> scrollable::Style,
     ) -> Element<'a, Message>
     where Message: Clone + 'a, F: Fn(DirectoryTreeEvent) -> Message + Copy + 'a,
     {
@@ -87,6 +98,8 @@ impl DirectoryTree {
         let list = column(rows).spacing(2).padding(4).width(Length::Fill);
 
         scrollable(list)
+            .direction(scrollable::Direction::Vertical(scrollbar))
+            .style(style)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()

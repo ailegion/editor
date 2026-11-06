@@ -1,5 +1,5 @@
 //! Approval presentation shared by local tools and ACP agents.
-use iced::widget::{button, checkbox, column, container, row, scrollable, text, Space};
+use iced::widget::{button, checkbox, column, container, row, text, Space};
 use iced::{Element, Length};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -67,9 +67,9 @@ pub fn view<'a, M: Clone + 'a>(card: Card<M>) -> Element<'a, M> {
         let preview = column![
             row![text("REQUEST DETAILS").size(10).style(iced::widget::text::secondary), Space::new().width(Length::Fill),
                 crate::icon_control(lucide_icons::Icon::Copy, "Copy request details", Some(card.copy), false)].align_y(iced::Alignment::Center),
-            scrollable(text(details).size(12).font(iced::Font::MONOSPACE)
+            crate::scrollbar::scrollable(text(details).size(12).font(iced::Font::MONOSPACE)
                 .wrapping(iced::widget::text::Wrapping::None))
-                .direction(scrollable::Direction::Both { vertical: Default::default(), horizontal: Default::default() })
+                .direction(iced::widget::scrollable::Direction::Both { vertical: crate::scrollbar::rail(), horizontal: crate::scrollbar::rail() })
                 .height(height).width(Length::Fill),
         ].spacing(4);
         body = body.push(container(preview).padding(8).width(Length::Fill).style(|theme: &iced::Theme| {
@@ -120,7 +120,7 @@ pub fn view<'a, M: Clone + 'a>(card: Card<M>) -> Element<'a, M> {
     }
     // Everything above the buttons scrolls within a bounded height, so the decision
     // stays reachable however much the request carries.
-    let body = column![container(scrollable(body)).max_height(320), actions, extra].spacing(10);
+    let body = column![container(crate::scrollbar::scrollable(body)).max_height(320), actions, extra].spacing(10);
     container(body).padding(12).width(Length::Fill).style(|theme: &iced::Theme| {
         let palette = theme.extended_palette();
         container::Style {

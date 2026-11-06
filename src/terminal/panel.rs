@@ -1,5 +1,5 @@
 use super::Terminal;
-use iced::widget::{Space, button, column, container, row, scrollable, text};
+use iced::widget::{Space, button, column, container, row, text};
 use iced::{Element, Length, Task};
 use std::path::{Path, PathBuf};
 
@@ -465,7 +465,7 @@ impl Panel {
                 Some(Message::ToggleMenu),
                 self.menu_open,
             ),
-            container(scrollable(menu).height(Length::Shrink))
+            container(crate::scrollbar::scrollable(menu).height(Length::Shrink))
                 .padding(6)
                 .max_height(240)
                 .style(container::rounded_box),
@@ -474,9 +474,9 @@ impl Panel {
         .width(220)
         .on_dismiss(Message::DismissMenu);
         let header = row![
-            scrollable(tabs)
-                .direction(scrollable::Direction::Horizontal(
-                    scrollable::Scrollbar::default()
+            crate::scrollbar::scrollable(tabs)
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    crate::scrollbar::rail()
                 ))
                 .width(Length::Shrink),
             new_terminal,

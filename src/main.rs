@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod about;
+mod scrollbar;
 mod agent_launch;
 mod claude_agent;
 mod ai_usage;
@@ -47,7 +48,7 @@ mod workspaces;
 
 use iced::keyboard;
 use iced::widget::{
-    button, column, container, pane_grid, row, scrollable, text, text_input, PaneGrid, Space,
+    button, column, container, pane_grid, row, text, text_input, PaneGrid, Space,
 };
 use iced::{Element, Length, Subscription, Task};
 use iced_aw::context_menu::ContextMenu;
@@ -2322,7 +2323,7 @@ fn handle(state: &mut State, message: Message) -> Task<Message> {
         Message::GitPreviewScrolled(left, y) => {
             task = iced::widget::operation::scroll_to(
                 if left { git_preview::RIGHT_SCROLL } else { git_preview::LEFT_SCROLL },
-                scrollable::AbsoluteOffset { x: None, y: Some(y) },
+                iced::widget::scrollable::AbsoluteOffset { x: None, y: Some(y) },
             );
         }
         Message::Git(git::Message::ShowGraph) => {
@@ -3645,8 +3646,8 @@ fn view_workspace_strip(state: &State) -> Element<'_, Message> {
         if dragging { tabs = tabs.on_move(move |point| Message::WorkspaceDragMove(point.x, width)); }
         let new_tab = icon_control(lucide_icons::Icon::Plus, if cfg!(target_os = "macos") { "New tab (⌘T)" } else { "New tab (Ctrl+T)" },
             Some(Message::WorkspaceNew), false);
-        scrollable(row![tabs, new_tab].spacing(4).align_y(iced::Alignment::Center))
-            .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new().width(3).scroller_width(3)))
+        crate::scrollbar::scrollable(row![tabs, new_tab].spacing(4).align_y(iced::Alignment::Center))
+            .direction(iced::widget::scrollable::Direction::Horizontal(crate::scrollbar::rail()))
             .width(Length::Fill)
             .into()
     });
@@ -3813,7 +3814,7 @@ fn view_diff_popup(hunk: &git_diff::Hunk) -> Element<'_, Message> {
         Space::new().width(Length::Fill),
         icon_control(lucide_icons::Icon::X, "Close (Esc)", Some(Message::DiffPopupClose), false),
     ].spacing(8).align_y(iced::Alignment::Center);
-    let popup = container(column![header, scrollable(lines).height(Length::Shrink)].spacing(6))
+    let popup = container(column![header, crate::scrollbar::scrollable(lines).height(Length::Shrink)].spacing(6))
         .padding(6).max_width(720).max_height(360).clip(true)
         .style(|theme: &iced::Theme| {
             let palette = theme.extended_palette();
@@ -4486,7 +4487,7 @@ fn view_tree(state: &State) -> Element<'_, Message> {
             icon_control(lucide_icons::Icon::X, "Cancel rename", Some(Message::RenameCancel), false),
         ].spacing(4).into()))
     } else { None };
-    let content = ContextMenu::new(tree.view_with_entry(Message::Tree, entry), || {
+    let content = ContextMenu::new(tree.view_with_entry_and_scrollbar(Message::Tree, entry, scrollbar::rail(), scrollbar::style), || {
         container(
             column![
                 menu_button("New File".to_string(), Message::ContextNewFile),
@@ -4615,7 +4616,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         }
         let header = header.push(secondary_button(if state.ws.ai_visible { "Hide AI panel" } else { "Show AI panel" }).on_press(Message::AiToggle));
         return column![
-            scrollable(tab_row).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())),
+            crate::scrollbar::scrollable(tab_row).direction(iced::widget::scrollable::Direction::Horizontal(crate::scrollbar::rail())),
             container(header).style(chrome_style),
 
             git_preview::view(preview, &state.app_theme.iced, Message::GitPreviewScrolled),
@@ -4623,7 +4624,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
     }
     if let Some(graph) = &state.ws.git_graph {
         return column![
-            scrollable(tab_row).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())),
+            crate::scrollbar::scrollable(tab_row).direction(iced::widget::scrollable::Direction::Horizontal(crate::scrollbar::rail())),
             git_graph::view(graph).map(Message::GitGraph),
         ].width(Length::Fill).height(Length::Fill).into();
     }
@@ -4650,14 +4651,14 @@ fn view_editor(state: &State) -> Element<'_, Message> {
                     Some(Message::MarkdownPreviewToggle), previewing));
             }
             crumbs = crumbs.push(icon_control(lucide_icons::Icon::Folder, "Reveal in files", Some(Message::RevealPath(path.clone())), false));
-            editor_column = editor_column.push(scrollable(crumbs.padding([0, 8]))
-                .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())));
+            editor_column = editor_column.push(crate::scrollbar::scrollable(crumbs.padding([0, 8]))
+                .direction(iced::widget::scrollable::Direction::Horizontal(crate::scrollbar::rail())));
         }
         if let Some(preview) = &tab.image {
             return editor_frame(tab_row, editor_column.push(image_preview::view(preview)));
         }
         if let Some(document) = tab.preview.as_ref().and_then(|preview| ai_markdown::view_document(preview, &state.app_theme.iced, Message::MarkdownPreview)) {
-            editor_column = editor_column.push(scrollable(container(container(document).max_width(860))
+            editor_column = editor_column.push(crate::scrollbar::scrollable(container(container(document).max_width(860))
                 .center_x(Length::Fill).padding([16, 24])).height(Length::Fill));
             return editor_frame(tab_row, editor_column);
         }
@@ -4799,7 +4800,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         let welcome = if state.recent_projects.is_empty() { welcome } else {
             welcome.push(Space::new().height(12)).push(text("Recent projects").size(13).style(iced::widget::text::secondary)).push(recent)
         };
-        editor_column = editor_column.push(container(scrollable(container(welcome).padding(32)))
+        editor_column = editor_column.push(container(crate::scrollbar::scrollable(container(welcome).padding(32)))
             .center_x(Length::Fill).center_y(Length::Fill));
     }
 
@@ -4807,9 +4808,9 @@ fn view_editor(state: &State) -> Element<'_, Message> {
 }
 
 fn editor_frame<'a>(tab_row: iced::widget::Row<'a, Message>, editor_column: iced::widget::Column<'a, Message>) -> Element<'a, Message> {
-    let tab_strip = scrollable(tab_row)
-        .direction(scrollable::Direction::Horizontal(
-            scrollable::Scrollbar::default(),
+    let tab_strip = crate::scrollbar::scrollable(tab_row)
+        .direction(iced::widget::scrollable::Direction::Horizontal(
+            crate::scrollbar::rail(),
         ))
         .width(Length::Fill);
 

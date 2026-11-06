@@ -1,7 +1,7 @@
 //! About: the running version and its GitHub release notes, fetched the first time the panel
 //! opens. Uses the same overlay presentation as `goto_line`.
 
-use iced::widget::{column, container, markdown, mouse_area, opaque, row, scrollable, text, Space};
+use iced::widget::{column, container, markdown, mouse_area, opaque, row, text, Space};
 use iced::{Element, Length, Task};
 
 #[derive(Default)]
@@ -64,7 +64,7 @@ pub fn view<'a>(state: &'a AboutState, theme: &iced::Theme) -> Element<'a, Messa
         Notes::Idle | Notes::Loading => text("Loading release notes...").size(12).into(),
         Notes::Missing => text("No release notes are published for this version.").size(12).into(),
         Notes::Failed(err) => text(err).size(12).style(iced::widget::text::danger).into(),
-        Notes::Loaded(items) => scrollable(
+        Notes::Loaded(items) => crate::scrollbar::scrollable(
             markdown::view(items, markdown::Settings::with_text_size(13, theme)).map(Message::LinkClicked),
         )
         .height(Length::Fixed(360.0))

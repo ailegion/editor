@@ -1,5 +1,5 @@
 use iced::widget::{
-    button, column, container, pick_list, row, scrollable, text, text_editor, text_input, Space,
+    button, column, container, pick_list, row, text, text_editor, text_input, Space,
 };
 use iced::{Element, Length, Task};
 use serde::{Deserialize, Serialize};
@@ -766,7 +766,7 @@ fn settings_view(state: &ChatState) -> Element<'_, Message> {
             crate::icon_control(if state.connection_form_open { Icon::Minus } else { Icon::Plus }, "Add or edit connection", Some(Message::ToggleConnectionForm), state.connection_form_open),
         ].align_y(iced::Alignment::Center).spacing(6),
     ].spacing(8).padding(12);
-    container(column![header, scrollable(content).id("local-ai-settings-scroll").height(Length::Shrink)])
+    container(column![header, crate::scrollbar::scrollable(content).id("local-ai-settings-scroll").height(Length::Shrink)])
         .width(Length::Fill).max_height(480).style(crate::overlay_style).into()
 }
 
@@ -839,7 +839,7 @@ pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>)
         }
         messages_col = messages_col.push(entry);
     }
-    let messages = scrollable(messages_col.spacing(16)).anchor_bottom().height(Length::Fill);
+    let messages = crate::scrollbar::scrollable(messages_col.spacing(16)).anchor_bottom().height(Length::Fill);
 
     // Everything above the composer is one column, present only when it has something in it,
     // so the keyed column only ever gains or loses its first child: the one change iced's

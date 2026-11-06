@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use iced::advanced::{layout, mouse, overlay, renderer, widget::{self, Tree}, Clipboard, Layout, Shell, Widget};
-use iced::widget::{column, container, row, scrollable, text, Space};
+use iced::widget::{column, container, row, text, Space};
 use iced::{Element, Event, Length, Rectangle, Renderer, Size, Theme, Vector};
 use crate::ai_context::Attachment;
 
@@ -69,7 +69,7 @@ pub fn view<'a, M: Clone + 'a>(
     // diff handles while keeping the input's widget state (its focus).
     let mut extras: Vec<Element<'a, M>> = Vec::new();
     if !attachments.is_empty() {
-        extras.push(container(scrollable(chips)).max_height(110).into());
+        extras.push(container(crate::scrollbar::scrollable(chips)).max_height(110).into());
     }
     if !context.mentions.is_empty() {
         let mut suggestions = column![text("Attach file").size(11).style(iced::widget::text::secondary)].spacing(1);

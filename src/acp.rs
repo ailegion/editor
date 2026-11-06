@@ -1,4 +1,4 @@
-use iced::widget::{button, column, container, row, scrollable, text, text_editor, Space};
+use iced::widget::{button, column, container, row, text, text_editor, Space};
 use iced::{Element, Length, Task};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1460,7 +1460,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
         messages = messages.push(container(text(if state.stopping { "Stopping..." } else { "Assistant is working..." })
             .size(12).style(iced::widget::text::secondary)).padding(12));
     }
-    let messages = scrollable(messages).anchor_bottom().height(Length::Fill);
+    let messages = crate::scrollbar::scrollable(messages).anchor_bottom().height(Length::Fill);
 
     // Everything above the composer is one column, present only when it has something in it,
     // so the keyed column only ever gains or loses its first child: the one change iced's
@@ -1495,7 +1495,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
                 .on_press_maybe(can_switch.then(|| select(id.clone()))))
         })
     };
-    let dropdown = |menu: iced::widget::Column<'a, Message>| container(scrollable(menu)).padding(4).max_height(240).style(|theme: &iced::Theme| {
+    let dropdown = |menu: iced::widget::Column<'a, Message>| container(crate::scrollbar::scrollable(menu)).padding(4).max_height(240).style(|theme: &iced::Theme| {
         let palette = theme.extended_palette();
         iced::widget::container::Style {
             background: Some(palette.background.weak.color.into()),

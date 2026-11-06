@@ -1,6 +1,6 @@
 //! Read-only, on-disk Git changes. Keep index and working-tree patches separate.
 //! Versions are read and diffed in-process; see [`crate::git::repo`].
-use iced::widget::{column, container, responsive, rich_text, row, scrollable, span, text};
+use iced::widget::{column, container, responsive, rich_text, row, span, text};
 use iced::{Element, Length};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -289,15 +289,15 @@ pub fn view<'a, Message: 'static>(
         // Viewport-sized scrollables keep horizontal bars visible. Synchronize
         // only their vertical offsets so each side can still pan independently.
         row![
-            scrollable(left.width(content_width))
+            crate::scrollbar::scrollable(left.width(content_width))
                 .id(LEFT_SCROLL)
-                .direction(scrollable::Direction::Both { vertical: Default::default(), horizontal: Default::default() })
+                .direction(iced::widget::scrollable::Direction::Both { vertical: crate::scrollbar::rail(), horizontal: crate::scrollbar::rail() })
                 .on_scroll(move |viewport| on_scroll(true, viewport.absolute_offset().y))
                 .width(viewport_half).height(Length::Fill),
             iced::widget::rule::vertical(1),
-            scrollable(right.width(content_width))
+            crate::scrollbar::scrollable(right.width(content_width))
                 .id(RIGHT_SCROLL)
-                .direction(scrollable::Direction::Both { vertical: Default::default(), horizontal: Default::default() })
+                .direction(iced::widget::scrollable::Direction::Both { vertical: crate::scrollbar::rail(), horizontal: crate::scrollbar::rail() })
                 .on_scroll(move |viewport| on_scroll(false, viewport.absolute_offset().y))
                 .width(viewport_half).height(Length::Fill),
         ].width(Length::Fill).height(Length::Fill).into()

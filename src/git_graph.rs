@@ -2,7 +2,7 @@
 //! the selected commit's message and files, and each file's change in the diff view.
 //! History is read with the real `git` ([`cli`]), like the rest of the source control panel.
 
-use iced::widget::{button, canvas, column, container, row, scrollable, text, Space};
+use iced::widget::{button, canvas, column, container, row, text, Space};
 use iced::{Color, Element, Length, Point};
 use std::path::{Path, PathBuf};
 
@@ -370,7 +370,7 @@ pub fn view<'a>(graph: &'a Graph) -> Element<'a, Message> {
         button("×").style(crate::flat_button_style).on_press(Message::Close),
         Space::new().width(Length::Fill),
     ].spacing(12).padding(8).align_y(iced::Alignment::Center);
-    let mut body = column![header, scrollable(list).height(Length::Fill)];
+    let mut body = column![header, crate::scrollbar::scrollable(list).height(Length::Fill)];
     if graph.selected.is_some() {
         body = body.push(iced::widget::rule::horizontal(1)).push(container(details_view(graph)).height(220).padding(8));
     }
@@ -404,8 +404,8 @@ fn details_view(graph: &Graph) -> Element<'_, Message> {
             .on_press(Message::OpenFile(details.hash.clone(), file.clone())));
     }
     row![
-        scrollable(message).width(Length::FillPortion(1)).height(Length::Fill),
-        scrollable(files).width(Length::FillPortion(1)).height(Length::Fill),
+        crate::scrollbar::scrollable(message).width(Length::FillPortion(1)).height(Length::Fill),
+        crate::scrollbar::scrollable(files).width(Length::FillPortion(1)).height(Length::Fill),
     ].spacing(16).into()
 }
 

@@ -1,6 +1,6 @@
 //! The conversation history menu shared by the AI panels: most recently active first,
 //! searchable, with rename and delete, and "Show all" past the first [`RECENT`].
-use iced::widget::{button, column, container, row, scrollable, text, text_input};
+use iced::widget::{button, column, container, row, text, text_input};
 use iced::{Element, Length};
 
 pub const RECENT: usize = 10;
@@ -155,7 +155,7 @@ pub fn view<'a>(menu: &'a Menu, items: Vec<Item>, active: usize, enabled: bool) 
             .style(crate::flat_button_style).on_press(Message::ShowAll));
     }
     let search = text_input("Search conversations", &menu.query).size(13).padding([4, 8]).on_input(Message::Query);
-    container(column![search, scrollable(list).height(Length::Shrink)].spacing(6)).padding(4).max_height(360)
+    container(column![search, crate::scrollbar::scrollable(list).height(Length::Shrink)].spacing(6)).padding(4).max_height(360)
         .style(|theme: &iced::Theme| iced::widget::container::Style {
             background: Some(theme.extended_palette().background.weak.color.into()),
             border: iced::Border::default().rounded(6.0),

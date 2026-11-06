@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use iced::widget::{button, column, container, mouse_area, scrollable, text, text_input, Space};
+use iced::widget::{button, column, container, mouse_area, text, text_input, Space};
 use iced::{Element, Length, Task};
 
 const MAX_RESULTS: usize = 50;
@@ -225,7 +225,7 @@ pub fn view<'a>(state: &'a QuickOpenState, root: Option<&Path>) -> Element<'a, M
     }
 
     let panel = container(
-        column![text("Find a file").size(14), input, scrollable(results_col).id(results_id()).height(Length::Fixed(320.0)), text("↑ ↓ Navigate    Enter Open    Esc Close").size(11).style(iced::widget::text::secondary)].spacing(12),
+        column![text("Find a file").size(14), input, crate::scrollbar::scrollable(results_col).id(results_id()).height(Length::Fixed(320.0)), text("↑ ↓ Navigate    Enter Open    Esc Close").size(11).style(iced::widget::text::secondary)].spacing(12),
     )
     .padding(16)
     .width(Length::Fill)
