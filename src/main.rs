@@ -3651,7 +3651,7 @@ fn view_workspace_strip(state: &State) -> Element<'_, Message> {
             .into()
     });
     let bar = container(strip).width(Length::Fill).padding([2, 6]).height(34);
-    column![container(bar).width(Length::Fill).style(chrome_style), iced::widget::rule::horizontal(1)].into()
+    column![container(bar).width(Length::Fill).style(chrome_style), iced::widget::rule::horizontal(1).style(panel_divider_style)].into()
 }
 
 fn view_workspace_tab(state: &State, index: usize, id: WorkspaceId, label: String, width: f32) -> Element<'_, Message> {
@@ -4390,9 +4390,9 @@ fn view_status_bar(state: &State) -> Element<'_, Message> {
     if let Some(tab) = state.ws.tabs.get(state.ws.active_tab).filter(|tab| tab.image.is_none()) {
         let (line, col) = tab.content.cursor_line_col();
         let language = state.highlighter.language_name(&tab.extension());
-        bar = bar.push(text(format!("Ln {line}, Col {col}")).size(12));
-        bar = bar.push(text(tab.line_ending.to_string()).size(12).style(iced::widget::text::secondary));
-        bar = bar.push(text(language.to_string()).size(12).style(iced::widget::text::secondary));
+        bar = bar.push(text(format!("Ln {line}, Col {col}")).size(12).style(metadata_text_style));
+        bar = bar.push(text(tab.line_ending.to_string()).size(12).style(metadata_text_style));
+        bar = bar.push(text(language.to_string()).size(12).style(metadata_text_style));
         // The most severe diagnostic under the cursor, plus the file's error/warning totals.
         let errors = tab.diagnostics.iter().filter(|d| d.severity == lsp::Severity::Error).count();
         let warnings = tab.diagnostics.iter().filter(|d| d.severity == lsp::Severity::Warning).count();
@@ -4417,6 +4417,22 @@ fn view_status_bar(state: &State) -> Element<'_, Message> {
         .push(icon_control(lucide_icons::Icon::Sparkles, "Toggle AI panel", Some(Message::AiToggle), state.ws.ai_visible))
         .align_y(iced::Alignment::Center).padding([0, 6]);
     container(bar).width(Length::Fill).style(chrome_style).into()
+}
+
+/// Subtle structural lines keep attention on the editor rather than its chrome.
+pub(crate) fn panel_divider_style(theme: &iced::Theme) -> iced::widget::rule::Style {
+    let mut style = iced::widget::rule::default(theme);
+    style.color.a *= 0.45;
+    style
+}
+
+pub(crate) fn metadata_text_style(theme: &iced::Theme) -> iced::widget::text::Style {
+    let color = theme.extended_palette().background.base.text;
+    iced::widget::text::Style { color: Some(iced::Color { a: color.a * 0.72, ..color }) }
+}
+
+pub(crate) fn panel_heading<'a>(label: impl Into<String>) -> iced::widget::Text<'a> {
+    text(label.into()).size(11).style(metadata_text_style)
 }
 
 /// A shared, theme-aware surface for application chrome.
@@ -4505,7 +4521,7 @@ fn view_tree(state: &State) -> Element<'_, Message> {
     let project = state.ws.root.as_ref().and_then(|path| path.file_name())
         .map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Files".into());
     column![
-        row![text(project).size(12), Space::new().width(Length::Fill),
+        row![panel_heading(project), Space::new().width(Length::Fill),
             icon_control(lucide_icons::Icon::RefreshCw, "Refresh files", Some(Message::RefreshTree), false),
         ].padding([2, 8]).align_y(iced::Alignment::Center),
         container(content).padding([0, 8]).height(Length::Fill),
@@ -4803,7 +4819,7 @@ fn editor_frame<'a>(tab_row: iced::widget::Row<'a, Message>, editor_column: iced
         ))
         .width(Length::Fill);
 
-    column![container(tab_strip).style(chrome_style), iced::widget::rule::horizontal(1), editor_column.height(Length::Fill)]
+    column![container(tab_strip).style(chrome_style), iced::widget::rule::horizontal(1).style(panel_divider_style), editor_column.height(Length::Fill)]
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -5559,6 +5575,25 @@ mod tree_refresh_tests {
 mod workspace_tests {
     use super::*;
     use iced::futures::StreamExt;
+
+    #[test]
+    fn panel_hierarchy_softens_chrome_without_changing_theme_colors_or_rule_geometry() {
+        for theme in [iced::Theme::Light, iced::Theme::Dark] {
+            let original = iced::widget::rule::default(&theme);
+            let divider = panel_divider_style(&theme);
+            assert!(divider.color.a > 0.0 && divider.color.a < original.color.a);
+            assert_eq!((divider.color.r, divider.color.g, divider.color.b),
+                (original.color.r, original.color.g, original.color.b));
+            assert_eq!(divider.radius, original.radius);
+            assert_eq!(divider.snap, original.snap);
+            assert!(matches!(divider.fill_mode, iced::widget::rule::FillMode::Full));
+            let foreground = theme.extended_palette().background.base.text;
+            let metadata = metadata_text_style(&theme).color.unwrap();
+            assert!(metadata.a >= foreground.a * 0.7 && metadata.a < foreground.a);
+            assert_eq!((metadata.r, metadata.g, metadata.b),
+                (foreground.r, foreground.g, foreground.b));
+        }
+    }
 
     #[test]
     fn toolbar_utilities_are_quiet_without_dimming_primary_selected_or_disabled_states() {

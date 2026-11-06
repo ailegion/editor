@@ -315,7 +315,7 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
     ].spacing(8).align_y(iced::Alignment::Center);
     let (ahead, behind) = (state.status.branch.ahead, state.status.branch.behind);
     if ahead > 0 || behind > 0 {
-        branch = branch.push(text(format!("↑{ahead} ↓{behind}")).size(12).style(iced::widget::text::secondary));
+        branch = branch.push(text(format!("↑{ahead} ↓{behind}")).size(12).style(crate::metadata_text_style));
     }
     let branch_button = button(branch.push(Space::new().width(Length::Fill)))
         .padding([2, 4]).width(Length::Fill).style(crate::flat_button_style)
@@ -369,7 +369,7 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
                     text(chevron).font(lucide).size(12),
                     text(folder).font(lucide).size(13).style(iced::widget::text::secondary),
                     text(name.clone()).size(13).width(Length::Fill),
-                    text(files.len().to_string()).size(11).style(iced::widget::text::secondary),
+                    text(files.len().to_string()).size(11).style(crate::metadata_text_style),
                 ].spacing(6).align_y(iced::Alignment::Center))
                 .padding([4, 6]).width(Length::Fill).style(crate::flat_button_style)
                 .on_press(Message::ToggleDir(path.clone())).into()
@@ -383,7 +383,7 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
                 let mut label = row![text(name).size(13)].spacing(6).align_y(iced::Alignment::Center);
                 // The tree already shows the directory; the flat list needs it on the row.
                 if !state.tree_view && !parent.is_empty() {
-                    label = label.push(text(parent).size(11).style(iced::widget::text::secondary));
+                    label = label.push(text(parent).size(11).style(crate::metadata_text_style));
                 }
                 button(row![
                         label.width(Length::Fill),
@@ -458,7 +458,7 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
     let staged_count = to_unstage.len();
     let changes = row![
         text("Changes").size(13),
-        text(format!("{} staged of {}", staged_count, state.status.files.len())).size(12).style(iced::widget::text::secondary),
+        text(format!("{} staged of {}", staged_count, state.status.files.len())).size(12).style(crate::metadata_text_style),
         Space::new().width(Length::Fill),
         crate::icon_control(lucide_icons::Icon::Plus, "Stage all", (!state.committing && !to_stage.is_empty()).then(|| Message::Stage(to_stage.clone(), true)), false),
         crate::icon_control(lucide_icons::Icon::Minus, "Unstage all", (!state.committing && !to_unstage.is_empty()).then(|| Message::Stage(to_unstage.clone(), false)), false),
@@ -466,7 +466,7 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
         crate::icon_control(lucide_icons::Icon::ListTree, if state.tree_view { "Show as flat list" } else { "Show as tree" }, Some(Message::ToggleTreeView), state.tree_view),
     ].spacing(6).align_y(iced::Alignment::Center);
 
-    container(column![header, bottom, iced::widget::rule::horizontal(1), changes, files_list].spacing(8))
+    container(column![header, bottom, iced::widget::rule::horizontal(1).style(crate::panel_divider_style), changes, files_list].spacing(8))
         .padding(8)
         .height(Length::Fill)
         .into()

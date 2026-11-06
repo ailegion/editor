@@ -1309,7 +1309,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
         header = header.push(crate::ai_history::view(&state.history, state.history_items(), state.active_thread, !state.streaming).map(Message::History));
     }
     let project = cwd.file_name().unwrap_or(cwd.as_os_str()).to_string_lossy().into_owned();
-    header = header.push(text(format!("Project · {project}")).size(12).style(iced::widget::text::secondary));
+    header = header.push(text(format!("Project · {project}")).size(12).style(crate::metadata_text_style));
     if let Some(missing) = crate::agent_launch::provider_missing(state.provider) {
         header = header.push(container(text(missing).size(12)).padding(8).width(Length::Fill).style(container::danger));
     }
@@ -1364,7 +1364,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
             (_, Some(selectable)) => crate::ai_selectable::view(selectable, 13.0, move |action| Message::Selectable(index, action)),
             _ => text(content.to_string()).size(13).into(),
         };
-        let heading = row![text(label).size(12), Space::new().width(Length::Fill)].spacing(6).align_y(iced::Alignment::Center);
+        let heading = row![crate::panel_heading(label), Space::new().width(Length::Fill)].spacing(6).align_y(iced::Alignment::Center);
         column![
             heading.push(crate::icon_control(lucide_icons::Icon::Copy, "Copy message", Some(Message::Copy(content.to_string())), false)),
             body,

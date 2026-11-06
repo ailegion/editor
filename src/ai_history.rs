@@ -139,7 +139,7 @@ pub fn view<'a>(menu: &'a Menu, items: Vec<Item>, active: usize, enabled: bool) 
         list = list.push(row![
             button(row![
                 text(label).size(13).width(Length::Fill),
-                text(ago(now, item.updated)).size(11).style(text::secondary),
+                text(ago(now, item.updated)).size(11).style(crate::metadata_text_style),
             ].spacing(6).align_y(iced::Alignment::Center))
                 .width(Length::Fill).padding([4, 8]).style(crate::flat_button_style)
                 .on_press_maybe(enabled.then_some(Message::Switch(index))),

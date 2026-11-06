@@ -239,10 +239,10 @@ pub fn view<'a>(state: &'a SearchState, root: Option<&Path>) -> Element<'a, Mess
         let parent = relative.parent().filter(|parent| !parent.as_os_str().is_empty());
         let mut title = column![row![
             text(name).size(13), Space::new().width(Length::Fill),
-            text(results.len().to_string()).size(11).style(iced::widget::text::secondary),
+            text(results.len().to_string()).size(11).style(crate::metadata_text_style),
         ]].spacing(2);
         if let Some(parent) = parent {
-            title = title.push(text(parent.display().to_string()).size(11).style(iced::widget::text::secondary));
+            title = title.push(text(parent.display().to_string()).size(11).style(crate::metadata_text_style));
         }
         let mut group = column![container(title).padding([6, 8])].spacing(1);
         for (index, result) in results {
@@ -259,7 +259,7 @@ pub fn view<'a>(state: &'a SearchState, root: Option<&Path>) -> Element<'a, Mess
             pieces.push(span(result.preview[offset..].to_owned()));
             let preview: iced::widget::text::Rich<'_, (), Message> = rich_text(pieces);
             group = group.push(button(row![
-                text(result.line.to_string()).size(11).width(32).style(iced::widget::text::secondary),
+                text(result.line.to_string()).size(11).width(32).style(crate::metadata_text_style),
                 preview.size(12).font(crate::fonts::FONT),
             ].spacing(6)).width(Length::Fill).padding([5, 8])
                 .style(crate::flat_button_style).on_press(Message::ResultClicked(index)));
@@ -271,9 +271,9 @@ pub fn view<'a>(state: &'a SearchState, root: Option<&Path>) -> Element<'a, Mess
     }
 
     column![
-        text("SEARCH").size(12),
+        crate::panel_heading("SEARCH"),
         input,
-        text(summary).size(12).style(iced::widget::text::secondary),
+        text(summary).size(12).style(crate::metadata_text_style),
         scrollable(results_col).height(Length::Fill),
     ]
     .spacing(6)

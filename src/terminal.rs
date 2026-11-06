@@ -343,11 +343,11 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
 pub fn view(terminal: &Terminal, enabled: bool) -> Element<'_, Message> {
     use lucide_icons::Icon;
     let header = row![
-        text("TERMINAL").size(11),
+        crate::panel_heading("TERMINAL"),
         text(&terminal.status)
             .size(11)
             .wrapping(iced::widget::text::Wrapping::None)
-            .style(iced::widget::text::secondary),
+            .style(crate::metadata_text_style),
         Space::new().width(Length::Fill),
         crate::icon_control(
             Icon::Copy,

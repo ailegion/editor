@@ -803,7 +803,7 @@ pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>)
         if message.content.is_empty() {
             if i == last && state.streaming {
                 messages_col = messages_col.push(column![
-                    text(message.role.label()).size(12),
+                    crate::panel_heading(message.role.label()),
                     text("Waiting for response...").style(|theme: &iced::Theme| {
                         let palette = theme.extended_palette();
                         iced::widget::text::Style { color: Some(palette.background.strong.color) }
@@ -822,7 +822,7 @@ pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>)
             (_, Some(selectable)) => crate::ai_selectable::view(selectable, 13.0, move |action| Message::Selectable(i, action)),
             _ => text(message.content.clone()).size(13).into(),
         };
-        let heading = row![text(message.role.label()).size(12), Space::new().width(Length::Fill)]
+        let heading = row![crate::panel_heading(message.role.label()), Space::new().width(Length::Fill)]
             .spacing(6).align_y(iced::Alignment::Center);
         let mut entry = column![
             heading.push(crate::icon_control(lucide_icons::Icon::Copy, "Copy message", Some(Message::Copy(message.content.clone())), false)),
@@ -882,7 +882,7 @@ pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>)
                 } else {
                     state.model.clone()
                 })
-                .size(12),
+                .size(12).style(crate::metadata_text_style),
                 Space::new().width(Length::Fill),
                 crate::ai_approval::autopilot_toggle(state.autopilot, Message::Autopilot),
                 if state.streaming {

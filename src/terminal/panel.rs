@@ -445,7 +445,7 @@ impl Panel {
                 iced::widget::mouse_area(tab_content).on_middle_press(Message::Close(tab.id)),
             );
         }
-        let mut menu = column![text("New terminal").size(12)].spacing(2);
+        let mut menu = column![crate::panel_heading("New terminal")].spacing(2);
         for (index, profile) in self.profiles.iter().enumerate() {
             menu = menu.push(
                 button(text(&profile.name).size(13))
@@ -493,7 +493,7 @@ impl Panel {
         .align_y(iced::Alignment::Center);
         let mut content = column![
             container(header).style(crate::chrome_style),
-            iced::widget::rule::horizontal(1),
+            iced::widget::rule::horizontal(1).style(crate::panel_divider_style),
         ];
         if let Some(tab) = self.tabs.iter().find(|tab| Some(tab.id) == self.active) {
             let id = tab.id;
