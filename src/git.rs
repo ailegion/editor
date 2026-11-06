@@ -417,7 +417,7 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
         let discard = crate::icon_control(lucide_icons::Icon::Undo2, "Discard unstaged changes", (!state.committing && !discard.is_empty()).then_some(Message::Discard(discard)), false);
         files_col = files_col.push(row![indent, check, label, discard].spacing(4).align_y(iced::Alignment::Center));
     }
-    let files_list = crate::scrollbar::scrollable(files_col).height(Length::Fill);
+    let files_list = crate::scrollbar::scrollable(files_col.padding(files_list_padding())).height(Length::Fill);
 
     // Keyed, so the message box keeps its widget state (focus) when the error above it comes or goes.
     let mut bottom = iced::widget::keyed::Column::new().spacing(4);
@@ -470,6 +470,11 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
         .padding(8)
         .height(Length::Fill)
         .into()
+}
+
+/// Leave the overlay scrollbar its own gutter beside the discard buttons.
+fn files_list_padding() -> iced::Padding {
+    iced::Padding { right: 16.0, ..iced::Padding::default() }
 }
 
 /// Search box, filter menu, the matching branches and a "Create Branch" row for the typed name.
@@ -691,6 +696,14 @@ fn stage_files(cwd: &Path, files: &[ChangedFile], stage: bool, unborn: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_actions_leave_room_for_the_overlay_scrollbar() {
+        let padding = files_list_padding();
+        // The existing rail is 8 px wide with 2 px margin on either side.
+        assert!(padding.right >= 8.0 + 2.0 * 2.0 + 4.0);
+        assert_eq!((padding.top, padding.bottom, padding.left), (0.0, 0.0, 0.0));
+    }
 
     #[test]
     fn an_error_coming_or_going_keeps_the_commit_message_focused() {
