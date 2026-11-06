@@ -747,8 +747,7 @@ fn settings_view(state: &ChatState) -> Element<'_, Message> {
             .size(13).padding(8).secure(true).on_input(Message::ApiKeyChanged)].spacing(4),
         column![label("Model"), model].spacing(4),
         row![
-            button(text("Test connection").size(12)).padding([6, 10])
-                .style(crate::flat_button_style).on_press(Message::TestConnection),
+            crate::secondary_button("Test connection").on_press(Message::TestConnection),
             Space::new().width(Length::Fill),
             button(text("Save connection").size(12)).padding([6, 10]).on_press(Message::SaveConnection),
         ].spacing(6).align_y(iced::Alignment::Center),
@@ -763,8 +762,7 @@ fn settings_view(state: &ChatState) -> Element<'_, Message> {
             crate::icon_control(Icon::X, "Close model settings", Some(Message::ToggleSettings), false),
         ].align_y(iced::Alignment::Center),
         row![label("Saved connections"), Space::new().width(Length::Fill),
-            button(text("Use Ollama").size(12)).padding([4, 8])
-                .style(crate::flat_button_style).on_press(Message::OllamaPreset),
+            crate::secondary_button("Use Ollama").on_press(Message::OllamaPreset),
             crate::icon_control(if state.connection_form_open { Icon::Minus } else { Icon::Plus }, "Add or edit connection", Some(Message::ToggleConnectionForm), state.connection_form_open),
         ].align_y(iced::Alignment::Center).spacing(6),
     ].spacing(8).padding(12);
@@ -865,7 +863,7 @@ pub fn view<'a>(state: &'a ChatState, composer: crate::ai_composer::Context<'a>)
             copy: Message::Copy(details),
         }));
     }
-    if !state.session_grants.is_empty() { extras.push(button("Reset session approvals").style(crate::flat_button_style).on_press(Message::ResetPermissions).into()); }
+    if !state.session_grants.is_empty() { extras.push(crate::secondary_button("Reset session approvals").on_press(Message::ResetPermissions).into()); }
     let mut bottom = iced::widget::keyed::Column::new().spacing(4);
     if !extras.is_empty() {
         bottom = bottom.push("extras", iced::widget::column(extras).spacing(4));

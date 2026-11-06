@@ -277,7 +277,7 @@ pub fn view<'a>(state: &'a SearchState, root: Option<&Path>) -> Element<'a, Mess
         scrollable(results_col).height(Length::Fill),
     ]
     .spacing(6)
-    .padding(6)
+    .padding(8)
     .into()
 }
 

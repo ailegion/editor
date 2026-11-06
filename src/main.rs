@@ -3748,7 +3748,7 @@ fn view_folder_prompt<'a>(state: &'a State, path: &'a Path) -> Element<'a, Messa
             button(text("Replace Current").size(13)).padding([6, 14]).style(iced::widget::button::secondary)
                 .on_press(Message::FolderPromptChoice(Some(FolderChoice::Replace))),
             Space::new().width(Length::Fill),
-            button(text("Cancel").size(13)).padding([6, 14]).style(flat_button_style).on_press(Message::FolderPromptChoice(None)),
+            secondary_button("Cancel").on_press(Message::FolderPromptChoice(None)),
         ].spacing(8).align_y(iced::Alignment::Center),
     ].spacing(12)).padding(16).width(Length::Fill).max_width(480).style(overlay_style);
     let backdrop = container(Space::new().width(Length::Fill).height(Length::Fill)).style(|theme: &iced::Theme| iced::widget::container::Style {
@@ -3777,7 +3777,7 @@ fn view_passphrase_prompt<'a>(state: &'a State, request: &'a git::askpass::Reque
             .on_toggle(Message::RememberPassphrase),
         row![
             Space::new().width(Length::Fill),
-            button(text("Cancel").size(13)).padding([6, 14]).style(flat_button_style).on_press(Message::PassphraseDone(false)),
+            secondary_button("Cancel").on_press(Message::PassphraseDone(false)),
             button(text("OK").size(13)).padding([6, 14]).on_press(Message::PassphraseDone(true)),
         ].spacing(8).align_y(iced::Alignment::Center),
     ].spacing(12)).padding(16).width(Length::Fill).max_width(480).style(overlay_style);
@@ -3970,10 +3970,10 @@ fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
         AiMode::Acp => acp::conversation_controls(&state.ws.acp).map(Message::Acp),
     };
     let mode_row = row![
-        iced::widget::pick_list([AiMode::Http, AiMode::Acp, AiMode::Codex, AiMode::Grok, AiMode::Cursor], Some(state.ws.ai_mode), Message::AiModeSelected).text_size(12),
+        iced::widget::pick_list([AiMode::Http, AiMode::Acp, AiMode::Codex, AiMode::Grok, AiMode::Cursor], Some(state.ws.ai_mode), Message::AiModeSelected).text_size(12).padding([4, 8]),
         Space::new().width(Length::Fill),
         controls
-    ].spacing(6).padding(8);
+    ].spacing(6).padding([4, 8]).align_y(iced::Alignment::Center);
     let composer = ai_composer::Context {
         sources: state.ws.tree.as_ref().map(|tree| tree.drag_sources()).unwrap_or_default(),
         can_reference: state.ws.tabs.get(state.ws.active_tab).is_some(),
@@ -3991,7 +3991,7 @@ fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
     column![mode_row, panel].height(Length::Fill).into()
 }
 
-/// Shared 26px toolbar target with a 14px glyph and a discoverable label.
+/// Shared 26px target; utility glyphs stay quieter than send/stop actions.
 pub(crate) fn icon_control<'a, M: Clone + 'a>(
     icon: lucide_icons::Icon,
     label: &'a str,
@@ -3999,19 +3999,33 @@ pub(crate) fn icon_control<'a, M: Clone + 'a>(
     selected: bool,
 ) -> Element<'a, M> {
     let glyph: char = icon.into();
-    let control = button(container(text(glyph).font(iced::Font::with_name("lucide")).size(14))
+    let primary = matches!(icon, lucide_icons::Icon::SendHorizonal | lucide_icons::Icon::CircleStop);
+    let control = button(container(text(glyph).font(iced::Font::with_name("lucide")).size(if primary { 14 } else { 13 }))
         .center_x(Length::Fill).center_y(Length::Fill))
         .width(26).height(26).padding(0)
-        .style(move |theme: &iced::Theme, status| {
-            let mut style = flat_button_style(theme, status);
-            if selected && status != iced::widget::button::Status::Disabled {
-                style.background = Some(theme.extended_palette().primary.weak.color.into());
-                style.text_color = theme.extended_palette().primary.weak.text;
-            }
-            style
-        }).on_press_maybe(message);
+        .style(move |theme, status| toolbar_button_style(theme, status, selected, primary))
+        .on_press_maybe(message);
     iced::widget::tooltip(control, container(text(label).size(12)).padding([4, 8]).style(iced::widget::container::rounded_box),
         iced::widget::tooltip::Position::FollowCursor).into()
+}
+
+fn toolbar_button_style(theme: &iced::Theme, status: iced::widget::button::Status, selected: bool, primary: bool) -> iced::widget::button::Style {
+    use iced::widget::button::Status;
+    let mut style = flat_button_style(theme, status);
+    if status != Status::Disabled {
+        if selected {
+            style.background = Some(theme.extended_palette().primary.weak.color.into());
+            style.text_color = theme.extended_palette().primary.weak.text;
+        } else if !primary && status == Status::Active {
+            style.text_color.a *= 0.7;
+        }
+    }
+    style
+}
+
+/// Compact text actions share a baseline and padding across panels and dialogs.
+pub(crate) fn secondary_button<'a, M: 'a>(label: impl Into<String>) -> iced::widget::button::Button<'a, M> {
+    button(text(label.into()).size(12)).padding([4, 8]).style(flat_button_style)
 }
 
 /// A quiet close glyph with the same comfortable target as toolbar controls.
@@ -4453,13 +4467,13 @@ fn view_tree(state: &State) -> Element<'_, Message> {
             text_input(if *is_dir { "Folder name" } else { "File name" }, buf)
                 .id("tree-name").size(13).padding([3, 5])
                 .on_input(Message::CreateInput).on_submit(Message::CreateSubmit),
-            button("×").style(flat_button_style).on_press(Message::CreateCancel),
+            icon_control(lucide_icons::Icon::X, "Cancel new item", Some(Message::CreateCancel), false),
         ].spacing(4).align_y(iced::Alignment::Center).into()))
     } else if let Some((path, buf)) = &state.ws.renaming {
         Some((path.as_path(), true, row![
             text_input("Name", buf).id("tree-name").size(13).padding([3, 5])
                 .on_input(Message::RenameInput).on_submit(Message::RenameSubmit),
-            button("×").style(flat_button_style).on_press(Message::RenameCancel),
+            icon_control(lucide_icons::Icon::X, "Cancel rename", Some(Message::RenameCancel), false),
         ].spacing(4).into()))
     } else { None };
     let content = ContextMenu::new(tree.view_with_entry(Message::Tree, entry), || {
@@ -4494,7 +4508,7 @@ fn view_tree(state: &State) -> Element<'_, Message> {
         row![text(project).size(12), Space::new().width(Length::Fill),
             icon_control(lucide_icons::Icon::RefreshCw, "Refresh files", Some(Message::RefreshTree), false),
         ].padding([2, 8]).align_y(iced::Alignment::Center),
-        container(content).padding([0, 6]).height(Length::Fill),
+        container(content).padding([0, 8]).height(Length::Fill),
     ].height(Length::Fill).into()
 }
 
@@ -4587,9 +4601,9 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         if state.ws.inline_edit.as_ref().is_some_and(|edit| matches!(edit.stage, inline_edit::Stage::Review(_))) {
             header = header
                 .push(button(text("Accept").size(13)).padding([6, 14]).style(iced::widget::button::success).on_press(Message::InlineEditAccept))
-                .push(button(text("Reject").size(13)).padding([6, 14]).style(flat_button_style).on_press(Message::InlineEditCancel));
+                .push(secondary_button("Reject").on_press(Message::InlineEditCancel));
         }
-        let header = header.push(button(if state.ws.ai_visible { "Hide AI panel" } else { "Show AI panel" }).style(flat_button_style).on_press(Message::AiToggle));
+        let header = header.push(secondary_button(if state.ws.ai_visible { "Hide AI panel" } else { "Show AI panel" }).on_press(Message::AiToggle));
         return column![
             scrollable(tab_row).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())),
             container(header).style(chrome_style),
@@ -5545,6 +5559,38 @@ mod tree_refresh_tests {
 mod workspace_tests {
     use super::*;
     use iced::futures::StreamExt;
+
+    #[test]
+    fn toolbar_utilities_are_quiet_without_dimming_primary_selected_or_disabled_states() {
+        use iced::widget::button::Status;
+        for theme in [iced::Theme::Light, iced::Theme::Dark] {
+            let palette = theme.extended_palette();
+            let utility = toolbar_button_style(&theme, Status::Active, false, false);
+            let primary = toolbar_button_style(&theme, Status::Active, false, true);
+            assert!(utility.text_color.a < primary.text_color.a);
+            assert_eq!(primary.text_color, palette.background.base.text);
+            assert_eq!(utility.background, Some(iced::Color::TRANSPARENT.into()));
+            for primary in [false, true] {
+                for status in [Status::Active, Status::Hovered, Status::Pressed] {
+                    let selected = toolbar_button_style(&theme, status, true, primary);
+                    assert_eq!(selected.background, Some(palette.primary.weak.color.into()));
+                    assert_eq!(selected.text_color, palette.primary.weak.text);
+                }
+                for selected in [false, true] {
+                    let disabled = toolbar_button_style(&theme, Status::Disabled, selected, primary);
+                    let expected = flat_button_style(&theme, Status::Disabled);
+                    assert_eq!(disabled.text_color, expected.text_color);
+                    assert_eq!(disabled.background, expected.background);
+                }
+            }
+            for status in [Status::Hovered, Status::Pressed] {
+                let utility = toolbar_button_style(&theme, status, false, false);
+                let expected = flat_button_style(&theme, status);
+                assert_eq!(utility.text_color, expected.text_color);
+                assert_eq!(utility.background, expected.background);
+            }
+        }
+    }
 
     #[test]
     fn tab_surfaces_and_close_controls_keep_a_quiet_visual_hierarchy() {

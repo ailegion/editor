@@ -1484,7 +1484,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
         }));
     }
     if !state.session_grants.is_empty() {
-        extras.push(button("Reset session approvals").style(crate::flat_button_style).on_press(Message::ResetPermissions).into());
+        extras.push(crate::secondary_button("Reset session approvals").on_press(Message::ResetPermissions).into());
     }
     let can_switch = !state.streaming && !state.model_switching && !state.effort_switching;
     let choice_buttons = |options: &'a ModelOptions, select: fn(String) -> Message| {
@@ -1525,11 +1525,10 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
         bottom = bottom.push("extras", iced::widget::column(extras).spacing(6));
     }
     let model_name = state.models.as_ref().map(ModelOptions::current_name);
-    let model_button = button(text(state.model_label()).size(12))
-        .padding([2, 6]).style(crate::flat_button_style).on_press(Message::ToggleModelMenu);
+    let model_button = crate::secondary_button(state.model_label()).on_press(Message::ToggleModelMenu);
     let effort_button = effort.map(|effort| {
-        button(text(if state.effort_switching { "Switching…".into() } else { format!("{} ▾", effort.current_name()) }).size(12))
-            .padding([2, 6]).style(crate::flat_button_style).on_press(Message::ToggleEffortMenu)
+        crate::secondary_button(if state.effort_switching { "Switching…".to_string() } else { format!("{} ▾", effort.current_name()) })
+            .on_press(Message::ToggleEffortMenu)
     });
     let usage_ring = crate::ai_usage::view(crate::ai_usage::Info {
         provider: format!("{} ACP", state.provider), model: model_name,
