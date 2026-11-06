@@ -4065,7 +4065,7 @@ pub(crate) fn flat_button_style(theme: &iced::Theme, status: iced::widget::butto
             .with_background(iced::Color::TRANSPARENT),
         Status::Active => base.with_background(iced::Color::TRANSPARENT),
         Status::Hovered => base.with_background(palette.background.strong.color),
-        Status::Pressed => base.with_background(palette.primary.strong.color),
+        Status::Pressed => base.with_background(palette.background.strong.color),
     }
 }
 
@@ -4111,23 +4111,7 @@ fn menu_button_maybe<'a>(label: String, msg: Option<Message>) -> iced::widget::b
     button(text(label).size(13))
         .width(Length::Fill)
         .padding([4, 8])
-        .style(|theme: &iced::Theme, status| {
-            use iced::widget::button::{Status, Style};
-
-            let palette = theme.extended_palette();
-            let base = Style {
-                text_color: palette.background.base.text,
-                border: iced::Border::default().rounded(6.0),
-                ..Style::default()
-            };
-            match status {
-                Status::Disabled => Style { text_color: iced::Color { a: 0.35, ..base.text_color }, ..base }
-            .with_background(iced::Color::TRANSPARENT),
-        Status::Active => base.with_background(iced::Color::TRANSPARENT),
-                Status::Hovered => base.with_background(palette.primary.weak.color),
-                Status::Pressed => base.with_background(palette.primary.strong.color),
-            }
-        })
+        .style(flat_button_style)
         .on_press_maybe(msg)
 }
 
@@ -4433,6 +4417,16 @@ pub(crate) fn metadata_text_style(theme: &iced::Theme) -> iced::widget::text::St
 
 pub(crate) fn panel_heading<'a>(label: impl Into<String>) -> iced::widget::Text<'a> {
     text(label.into()).size(11).style(metadata_text_style)
+}
+
+/// Hover stays neutral; only keyboard/input focus receives the accent border.
+pub(crate) fn search_input_style(theme: &iced::Theme, status: iced::widget::text_input::Status) -> iced::widget::text_input::Style {
+    let mut style = iced::widget::text_input::default(theme, status);
+    if status == iced::widget::text_input::Status::Hovered {
+        let color = theme.extended_palette().background.base.text;
+        style.border.color = iced::Color { a: color.a * 0.4, ..color };
+    }
+    style
 }
 
 /// A shared, theme-aware surface for application chrome.
@@ -5575,6 +5569,36 @@ mod tree_refresh_tests {
 mod workspace_tests {
     use super::*;
     use iced::futures::StreamExt;
+
+    #[test]
+    fn interaction_feedback_keeps_hover_neutral_and_focus_and_selection_clear() {
+        use iced::widget::{button::Status, text_input};
+        for theme in [iced::Theme::Light, iced::Theme::Dark] {
+            let palette = theme.extended_palette();
+            for status in [Status::Hovered, Status::Pressed] {
+                let button = flat_button_style(&theme, status);
+                assert_eq!(button.background, Some(palette.background.strong.color.into()));
+                assert_eq!(button.text_color, palette.background.base.text);
+                let result = quick_open::result_style(&theme, status, false);
+                assert_eq!(result.background, button.background);
+            }
+            for status in [Status::Active, Status::Hovered, Status::Pressed] {
+                let selected = quick_open::result_style(&theme, status, true);
+                assert_eq!(selected.background, Some(palette.primary.weak.color.into()));
+                assert_eq!(selected.text_color, palette.primary.weak.text);
+            }
+            let disabled = quick_open::result_style(&theme, Status::Disabled, true);
+            assert_eq!(disabled.background, Some(iced::Color::TRANSPARENT.into()));
+            assert!(disabled.text_color.a < palette.background.base.text.a);
+            let hovered = search_input_style(&theme, text_input::Status::Hovered);
+            assert!(hovered.border.color.a < palette.background.base.text.a);
+            for status in [text_input::Status::Active, text_input::Status::Disabled,
+                text_input::Status::Focused { is_hovered: false },
+                text_input::Status::Focused { is_hovered: true }] {
+                assert_eq!(search_input_style(&theme, status), text_input::default(&theme, status));
+            }
+        }
+    }
 
     #[test]
     fn panel_hierarchy_softens_chrome_without_changing_theme_colors_or_rule_geometry() {

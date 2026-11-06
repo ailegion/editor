@@ -189,6 +189,7 @@ fn walk_into(dir: &Path, out: &mut Vec<PathBuf>) {
 
 pub fn view<'a>(state: &'a QuickOpenState, root: Option<&Path>) -> Element<'a, Message> {
     let input = text_input("Search files by name...", &state.query)
+        .style(crate::search_input_style)
         .id(query_input_id())
         .on_input(Message::QueryChanged)
         .on_submit(Message::Confirm)
@@ -261,12 +262,13 @@ pub(crate) fn result_style(theme: &iced::Theme, status: button::Status, selected
         border: iced::Border::default().rounded(4.0),
         ..Style::default()
     };
-    if selected {
-        return base.with_background(palette.primary.weak.color);
+    if selected && status != Status::Disabled {
+        return Style { text_color: palette.primary.weak.text, ..base }.with_background(palette.primary.weak.color);
     }
     match status {
-        Status::Active | Status::Disabled => base.with_background(iced::Color::TRANSPARENT),
-        Status::Hovered => base.with_background(palette.background.weak.color),
+        Status::Disabled => crate::flat_button_style(theme, status),
+        Status::Active => base.with_background(iced::Color::TRANSPARENT),
+        Status::Hovered => base.with_background(palette.background.strong.color),
         Status::Pressed => base.with_background(palette.background.strong.color),
     }
 }

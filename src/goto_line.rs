@@ -57,6 +57,7 @@ pub fn update(state: &mut GotoLineState, message: Message) -> Option<usize> {
 
 pub fn view(state: &GotoLineState, line_count: usize) -> Element<'_, Message> {
     let input = text_input("Line number...", &state.query)
+        .style(crate::search_input_style)
         .id(query_input_id())
         .on_input(Message::QueryChanged)
         .on_submit(Message::Confirm)

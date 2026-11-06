@@ -132,6 +132,7 @@ pub fn update(state: &mut PaletteState, message: Message) -> (Task<Message>, Opt
 
 pub fn view(state: &PaletteState) -> Element<'_, Message> {
     let input = text_input("Type a command...", &state.query)
+        .style(crate::search_input_style)
         .id(query_input_id())
         .on_input(Message::QueryChanged)
         .on_submit(Message::Confirm)
@@ -184,20 +185,5 @@ pub fn view(state: &PaletteState) -> Element<'_, Message> {
 }
 
 fn result_style(theme: &iced::Theme, status: button::Status, selected: bool) -> button::Style {
-    use button::{Status, Style};
-
-    let palette = theme.extended_palette();
-    let base = Style {
-        text_color: palette.background.base.text,
-        border: iced::Border::default().rounded(4.0),
-        ..Style::default()
-    };
-    if selected {
-        return base.with_background(palette.primary.weak.color);
-    }
-    match status {
-        Status::Active | Status::Disabled => base.with_background(iced::Color::TRANSPARENT),
-        Status::Hovered => base.with_background(palette.background.weak.color),
-        Status::Pressed => base.with_background(palette.background.strong.color),
-    }
+    crate::quick_open::result_style(theme, status, selected)
 }

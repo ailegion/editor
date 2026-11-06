@@ -185,7 +185,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 pub fn view<'a>(state: &'a SearchState, root: Option<&Path>) -> Element<'a, Message> {
     if root.is_none() {
         return column![
-            text_input("Find in project", &state.query),
+            text_input("Find in project", &state.query).style(crate::search_input_style),
             text("Open a folder (File > Open Folder) to search its files."),
         ]
         .spacing(6)
@@ -196,19 +196,12 @@ pub fn view<'a>(state: &'a SearchState, root: Option<&Path>) -> Element<'a, Mess
     let regex = state.regex;
     let regex_toggle = button(text(".*").size(13)).padding([4, 8])
         .style(move |theme: &iced::Theme, status| {
-            use iced::widget::button::{Status, Style};
-            let palette = theme.extended_palette();
-            let base = Style { text_color: palette.background.base.text, border: iced::Border::default().rounded(4.0), ..Style::default() };
-            match (regex, status) {
-                (true, _) => base.with_background(palette.primary.weak.color),
-                (false, Status::Hovered) => base.with_background(palette.background.weak.color),
-                (false, Status::Pressed) => base.with_background(palette.background.strong.color),
-                (false, _) => base.with_background(iced::Color::TRANSPARENT),
-            }
+            crate::toolbar_button_style(theme, status, regex, false)
         })
         .on_press(Message::ToggleRegex);
     let input = row![
         text_input("Find in project", &state.query)
+            .style(crate::search_input_style)
             .size(13).padding([5, 8])
             .on_input(Message::QueryChanged)
             .on_submit(Message::Submit),
