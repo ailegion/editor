@@ -3701,7 +3701,7 @@ fn view_workspace_tab(state: &State, index: usize, id: WorkspaceId, label: Strin
     );
     let content = row![
         name,
-        icon_control(lucide_icons::Icon::X, close_label, Some(Message::WorkspaceClose(id)), false),
+        tab_close_control(close_label, Message::WorkspaceClose(id)),
     ].spacing(4).align_y(iced::Alignment::Center).padding([0, 4]).height(Length::Fill);
 
     let underline = container(Space::new().width(Length::Fill).height(2))
@@ -4014,6 +4014,26 @@ pub(crate) fn icon_control<'a, M: Clone + 'a>(
         iced::widget::tooltip::Position::FollowCursor).into()
 }
 
+/// A quiet close glyph with the same comfortable target as toolbar controls.
+pub(crate) fn tab_close_control<'a, M: Clone + 'a>(label: &'a str, message: M) -> Element<'a, M> {
+    let control = button(container(text(char::from(lucide_icons::Icon::X))
+        .font(iced::Font::with_name("lucide")).size(11))
+        .center_x(Length::Fill).center_y(Length::Fill))
+        .width(26).height(26).padding(0)
+        .style(tab_close_style).on_press(message);
+    iced::widget::tooltip(control,
+        container(text(label).size(12)).padding([4, 8]).style(iced::widget::container::rounded_box),
+        iced::widget::tooltip::Position::FollowCursor).into()
+}
+
+fn tab_close_style(theme: &iced::Theme, status: iced::widget::button::Status) -> iced::widget::button::Style {
+    let mut style = flat_button_style(theme, status);
+    if status == iced::widget::button::Status::Active {
+        style.text_color.a *= 0.45;
+    }
+    style
+}
+
 /// Transparent-background button style, so a title + close button pair placed inside a
 /// pill-shaped `container` (see `view_editor`'s tab strip) reads as one merged tab rather
 /// than two separate button-shaped elements.
@@ -4035,9 +4055,7 @@ pub(crate) fn flat_button_style(theme: &iced::Theme, status: iced::widget::butto
     }
 }
 
-/// Text-only tab title style: no background at rest (even when active -- the underline in
-/// `view_editor` carries that signal), a subtle highlight on hover, dimmer text for inactive
-/// tabs so the active one reads clearly without needing a button-like fill.
+/// One surface for the entire tab, including the independently clickable close control.
 fn tab_button_style(
     theme: &iced::Theme,
     status: iced::widget::button::Status,
@@ -4056,14 +4074,14 @@ fn tab_button_style(
     };
     let base = Style {
         text_color,
-        border: iced::Border::default().rounded(4.0),
+        border: iced::Border::default(),
         ..Style::default()
     };
     match status {
         Status::Disabled => Style { text_color: iced::Color { a: 0.35, ..base.text_color }, ..base }
             .with_background(iced::Color::TRANSPARENT),
-        Status::Active => base.with_background(iced::Color::TRANSPARENT),
-        Status::Hovered => base.with_background(palette.background.weak.color),
+        Status::Active => base.with_background(if is_active { palette.background.base.color } else { iced::Color::TRANSPARENT }),
+        Status::Hovered => base.with_background(palette.background.strong.color),
         Status::Pressed => base.with_background(palette.background.strong.color),
     }
 }
@@ -4495,11 +4513,9 @@ fn view_editor(state: &State) -> Element<'_, Message> {
                 color: Some(color.unwrap_or(theme.extended_palette().background.base.text)),
             });
         let tab_title = row![
-            button(row![icon, text(tab.title()).size(13)].spacing(6).align_y(iced::Alignment::Center))
-                .padding([4, 8])
-                .style(move |theme, status| tab_button_style(theme, status, is_active))
-                .on_press(Message::TabSelected(i)),
-            icon_control(lucide_icons::Icon::X, "Close tab", Some(Message::TabClosed(i)), false),
+            container(row![icon, text(tab.title()).size(13)].spacing(6).align_y(iced::Alignment::Center))
+                .padding([0, 8]),
+            tab_close_control("Close tab", Message::TabClosed(i)),
         ]
         .spacing(2)
         .align_y(iced::Alignment::Center);
@@ -4519,11 +4535,9 @@ fn view_editor(state: &State) -> Element<'_, Message> {
                 ..iced::widget::container::Style::default()
             });
 
-        let tab_content = container(column![tab_title, underline].spacing(2))
-            .style(move |theme: &iced::Theme| iced::widget::container::Style {
-                background: is_active.then(|| theme.extended_palette().background.weak.color.into()),
-                ..Default::default()
-            });
+        let tab_content = button(column![tab_title, underline].spacing(2)).padding(0)
+            .on_press(Message::TabSelected(i))
+            .style(move |theme, status| tab_button_style(theme, status, is_active));
         let tab_content = iced::widget::mouse_area(tab_content)
             .on_middle_press(Message::TabClosed(i));
         tab_row = tab_row.push(ContextMenu::new(tab_content, move || {
@@ -4553,7 +4567,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         let title = row![
             container(row![icon, text(&preview.path).size(13)].spacing(6).align_y(iced::Alignment::Center))
                 .padding([4, 8]),
-            icon_control(lucide_icons::Icon::X, "Close diff", Some(Message::CloseGitPreview), false),
+            tab_close_control("Close diff", Message::CloseGitPreview),
         ].spacing(2).align_y(iced::Alignment::Center);
         let underline = container(Space::new().width(Length::Fill).height(2))
             .style(|theme: &iced::Theme| iced::widget::container::Style {
@@ -5531,6 +5545,31 @@ mod tree_refresh_tests {
 mod workspace_tests {
     use super::*;
     use iced::futures::StreamExt;
+
+    #[test]
+    fn tab_surfaces_and_close_controls_keep_a_quiet_visual_hierarchy() {
+        use iced::widget::button::Status;
+        for theme in [iced::Theme::Dark, iced::Theme::Light] {
+            let palette = theme.extended_palette();
+            let active = tab_button_style(&theme, Status::Active, true);
+            let inactive = tab_button_style(&theme, Status::Active, false);
+            assert_eq!(active.background, Some(palette.background.base.color.into()));
+            assert_eq!(inactive.background, Some(iced::Color::TRANSPARENT.into()));
+            assert!(active.text_color.a > inactive.text_color.a);
+            for selected in [false, true] {
+                let hovered = tab_button_style(&theme, Status::Hovered, selected);
+                assert_eq!(hovered.background, Some(palette.background.strong.color.into()));
+                assert_eq!(hovered.border.radius, iced::border::Radius::default());
+            }
+            let resting = tab_close_style(&theme, Status::Active);
+            let hovered = tab_close_style(&theme, Status::Hovered);
+            assert!(resting.text_color.a < hovered.text_color.a);
+            assert_eq!(hovered.text_color, palette.background.base.text);
+            assert_eq!(resting.background, Some(iced::Color::TRANSPARENT.into()));
+            assert_eq!(tab_close_style(&theme, Status::Disabled).text_color,
+                flat_button_style(&theme, Status::Disabled).text_color);
+        }
+    }
 
     /// Settings that save nothing: the session and recent projects stay in memory.
     fn settings() -> Settings {

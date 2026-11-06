@@ -409,7 +409,7 @@ impl Panel {
             let selected = Some(tab.id) == self.active;
             let glyph: char = Icon::Terminal.into();
             let title = row![
-                button(
+                container(
                     row![
                         text(glyph).font(iced::Font::with_name("lucide")).size(14),
                         text(format!("{} {}", tab.name, tab.id)).size(13),
@@ -417,14 +417,10 @@ impl Panel {
                     .spacing(6)
                     .align_y(iced::Alignment::Center)
                 )
-                .padding([4, 8])
-                .on_press(Message::Select(tab.id))
-                .style(move |theme, status| crate::tab_button_style(theme, status, selected)),
-                crate::icon_control(
-                    Icon::X,
+                .padding([0, 8]),
+                crate::tab_close_control(
                     "Close terminal (ends session)",
-                    Some(Message::Close(tab.id)),
-                    false
+                    Message::Close(tab.id)
                 ),
             ]
             .spacing(2)
@@ -442,13 +438,9 @@ impl Panel {
                     ..Default::default()
                 },
             );
-            let tab_content = container(column![title, underline].spacing(2)).style(
-                move |theme: &iced::Theme| container::Style {
-                    background: selected
-                        .then(|| theme.extended_palette().background.weak.color.into()),
-                    ..Default::default()
-                },
-            );
+            let tab_content = button(column![title, underline].spacing(2)).padding(0)
+                .on_press(Message::Select(tab.id))
+                .style(move |theme, status| crate::tab_button_style(theme, status, selected));
             tabs = tabs.push(
                 iced::widget::mouse_area(tab_content).on_middle_press(Message::Close(tab.id)),
             );
