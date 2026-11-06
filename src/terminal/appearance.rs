@@ -19,7 +19,7 @@ pub(super) fn get() -> &'static Appearance {
         let settings = windows_terminal_settings().unwrap_or(Value::Null);
         let (name, size, foreground, background, cursor, ansi) = settings_values(&settings);
         // Iced font handles require static names; this allocation happens once per app.
-        let font = name.map_or(Font::MONOSPACE, |name| {
+        let font = name.map_or(crate::fonts::FONT, |name| {
             Font::with_name(Box::leak(name.into_boxed_str()))
         });
         let mut font_system = iced::advanced::graphics::text::font_system()

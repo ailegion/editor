@@ -260,7 +260,7 @@ pub fn view<'a>(state: &'a SearchState, root: Option<&Path>) -> Element<'a, Mess
             let preview: iced::widget::text::Rich<'_, (), Message> = rich_text(pieces);
             group = group.push(button(row![
                 text(result.line.to_string()).size(11).width(32).style(iced::widget::text::secondary),
-                preview.size(12).font(iced::Font::MONOSPACE),
+                preview.size(12).font(crate::fonts::FONT),
             ].spacing(6)).width(Length::Fill).padding([5, 8])
                 .style(crate::flat_button_style).on_press(Message::ResultClicked(index)));
         }

@@ -29,6 +29,7 @@ mod code_editor;
 mod command_palette;
 mod git;
 mod file_icons;
+mod fonts;
 mod git_diff;
 mod titlebar;
 mod completion;
@@ -93,6 +94,10 @@ struct Tab {
     /// in-process from the buffer (see `Message::GitDiffLoaded`) when the tab opens, shortly
     /// after edits, and when the index changes.
     diff: std::collections::HashMap<usize, git_diff::LineStatus>,
+    /// The changes those markers mark, loaded with them.
+    hunks: Vec<git_diff::Hunk>,
+    /// The change whose old and new lines are shown after a click on its marker.
+    diff_popup: Option<git_diff::Hunk>,
     /// Latest diagnostics from the file's language server, sorted by line.
     diagnostics: Vec<lsp::Diagnostic>,
     blame: Vec<String>,
@@ -314,7 +319,16 @@ enum Message {
     GitGraphOpen,
     GitGraph(git_graph::Message),
     GitGraphPatchLoaded(String, Result<String, String>),
-    GitDiffLoaded(PathBuf, String, Vec<(usize, git_diff::LineStatus)>),
+    GitDiffLoaded(PathBuf, String, (Vec<(usize, git_diff::LineStatus)>, Vec<git_diff::Hunk>)),
+    /// The diff marker on this line of the active tab was clicked: show its change's popup.
+    DiffMarkerClicked(usize),
+    DiffPopupClose,
+    /// Put the popup's change back to the staged lines.
+    DiffRestore,
+    PassphraseInput(String),
+    RememberPassphrase(bool),
+    /// OK (`true`) or Cancel (`false`) on the passphrase dialog.
+    PassphraseDone(bool),
     GitBlameLoaded(PathBuf, String, Vec<String>),
     TabSelected(usize),
     TabClosed(usize),
@@ -794,6 +808,10 @@ struct State {
     next_workspace_id: WorkspaceId,
     /// A folder waiting for the user to choose between replacing the current project and a new tab.
     folder_prompt: Option<PathBuf>,
+    /// SSH key passphrase prompts from fetch, pull and push, the first one shown.
+    passphrase_prompts: std::collections::VecDeque<git::askpass::Request>,
+    passphrase: String,
+    remember_passphrase: bool,
     /// The workspace tab being dragged, and whether the pointer has moved since the press.
     workspace_drag: Option<(WorkspaceId, bool)>,
     recent_projects: Vec<PathBuf>,
@@ -844,6 +862,9 @@ impl State {
             current: 0,
             next_workspace_id: 2,
             folder_prompt: None,
+            passphrase_prompts: Default::default(),
+            passphrase: String::new(),
+            remember_passphrase: false,
             workspace_drag: None,
             recent_projects,
             recent_projects_path: settings.recent_projects_path,
@@ -926,7 +947,7 @@ impl State {
                     path: recovery.path.clone(), content, dirty: true,
                     saved_text: recovery.path.as_ref().and_then(|path| std::fs::read_to_string(path).ok())
                         .map(|text| text.replace("\r\n", "\n").replace('\r', "\n")),
-                    search: Default::default(), line_ending: LineEnding::detect(&recovery.text), diff: Default::default(),
+                    search: Default::default(), line_ending: LineEnding::detect(&recovery.text), diff: Default::default(), hunks: Vec::new(), diff_popup: None,
                     diagnostics: Vec::new(), blame: Vec::new(), hover: None, preview: None, image: None,
                 };
                 tab.refresh_dirty();
@@ -1401,7 +1422,7 @@ impl State {
             search: code_editor::search::SearchState::default(),
             dirty: false,
             line_ending,
-            diff: std::collections::HashMap::new(),
+            diff: std::collections::HashMap::new(), hunks: Vec::new(), diff_popup: None,
             diagnostics: Vec::new(), blame: Vec::new(),
             hover: None,
             preview: None, image,
@@ -2105,6 +2126,7 @@ fn handle(state: &mut State, message: Message) -> Task<Message> {
             if let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab) {
                 tab.content.perform(action);
                 tab.hover = None;
+                tab.diff_popup = None;
             }
             state.mark_edited_if_changed(before);
         }
@@ -2364,8 +2386,44 @@ fn handle(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::GitDiffLoaded(path, snapshot, diff) => {
             if let Some(tab) = state.ws.tabs.iter_mut().find(|t| t.path.as_deref() == Some(path.as_path())) {
-                if tab.content.text() == snapshot { tab.diff = diff.into_iter().collect(); }
+                if tab.content.text() == snapshot {
+                    let (lines, hunks) = diff;
+                    tab.diff = lines.into_iter().collect();
+                    tab.hunks = hunks;
+                    // A change that is gone, or was edited, has nothing left to show.
+                    if tab.diff_popup.as_ref().is_some_and(|hunk| !tab.hunks.contains(hunk)) { tab.diff_popup = None; }
+                }
             }
+        }
+        Message::DiffMarkerClicked(line) => {
+            state.ws.focus = Focus::Editor;
+            if let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab) {
+                let hunk = tab.hunks.iter().find(|hunk| hunk.marks(line)).cloned();
+                // A second click on the same marker closes the popup.
+                tab.diff_popup = if hunk == tab.diff_popup { None } else { hunk };
+                tab.hover = None;
+            }
+        }
+        Message::DiffPopupClose => {
+            if let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab) { tab.diff_popup = None; }
+        }
+        Message::DiffRestore => {
+            state.ws.focus = Focus::Editor;
+            let Some(tab) = state.ws.tabs.get_mut(state.ws.active_tab) else { return Task::none() };
+            let Some(hunk) = tab.diff_popup.take() else { return Task::none() };
+            let before = tab.content.undo_count();
+            git_diff::restore(&mut tab.content, &hunk);
+            state.mark_edited_if_changed(before);
+        }
+        Message::PassphraseInput(passphrase) => state.passphrase = passphrase,
+        Message::RememberPassphrase(remember) => state.remember_passphrase = remember,
+        Message::PassphraseDone(ok) => {
+            let passphrase = std::mem::take(&mut state.passphrase);
+            let remember = std::mem::replace(&mut state.remember_passphrase, false);
+            if let Some(request) = state.passphrase_prompts.pop_front() {
+                git::askpass::answer(request.id, ok.then_some((passphrase, remember)));
+            }
+            if !state.passphrase_prompts.is_empty() { task = iced::widget::operation::focus(passphrase_input_id()); }
         }
         Message::TabSelected(i) => { state.show_editor(); state.ws.active_tab = i; },
         Message::TabClosed(i) => task = state.close_tab(i),
@@ -2810,6 +2868,13 @@ fn handle(state: &mut State, message: Message) -> Task<Message> {
                 }
                 return Task::none();
             }
+            // So is the passphrase dialog: Escape cancels it.
+            if !state.passphrase_prompts.is_empty() {
+                if key == keyboard::Key::Named(keyboard::key::Named::Escape) {
+                    return update(state, Message::PassphraseDone(false));
+                }
+                return Task::none();
+            }
             if let Some(forward) = workspace_cycle_key(&key, modifiers) {
                 return update(state, Message::WorkspaceCycle(forward));
             }
@@ -2819,6 +2884,11 @@ fn handle(state: &mut State, message: Message) -> Task<Message> {
             if key == keyboard::Key::Named(keyboard::key::Named::Escape) && state.ws.inline_edit.is_some()
                 && !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible && !state.theme_install.visible {
                 return update(state, Message::InlineEditCancel);
+            }
+            if key == keyboard::Key::Named(keyboard::key::Named::Escape)
+                && state.ws.tabs.get(state.ws.active_tab).is_some_and(|tab| tab.diff_popup.is_some())
+                && !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible && !state.theme_install.visible {
+                return update(state, Message::DiffPopupClose);
             }
             if state.ws.terminal_visible && state.ws.terminal.focused()
                 && !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible
@@ -3326,6 +3396,11 @@ fn handle(state: &mut State, message: Message) -> Task<Message> {
                 None => {}
             }
             state.updater.poll();
+            let was_asking = !state.passphrase_prompts.is_empty();
+            while let Some(request) = git::askpass::next_request() { state.passphrase_prompts.push_back(request); }
+            if !was_asking && !state.passphrase_prompts.is_empty() {
+                task = Task::batch([task, iced::widget::operation::focus(passphrase_input_id())]);
+            }
             if state.announce_update_check && !state.updater.busy() {
                 state.announce_update_check = false;
                 let detail = state.updater.detail.clone();
@@ -3531,7 +3606,9 @@ fn view(state: &State) -> Element<'_, Message> {
         container(prompt).padding(16).align_left(Length::Fill).align_bottom(Length::Fill).into()
     });
 
-    let overlay: Option<Element<'_, Message>> = if let Some(path) = &state.folder_prompt {
+    let overlay: Option<Element<'_, Message>> = if let Some(request) = state.passphrase_prompts.front() {
+        Some(view_passphrase_prompt(state, request))
+    } else if let Some(path) = &state.folder_prompt {
         Some(view_folder_prompt(state, path))
     } else if state.theme_install.visible {
         Some(theme_install::view(&state.theme_install).map(Message::ThemeInstall))
@@ -3683,6 +3760,71 @@ fn view_folder_prompt<'a>(state: &'a State, path: &'a Path) -> Element<'a, Messa
         container(iced::widget::opaque(panel)).width(Length::Fill).height(Length::Fill)
             .align_x(iced::Alignment::Center).padding(iced::Padding { top: 80.0, ..iced::Padding::default() }),
     ]).on_press(Message::FolderPromptChoice(None)).into()
+}
+
+fn passphrase_input_id() -> iced::widget::Id {
+    iced::widget::Id::new("ssh-passphrase")
+}
+
+/// "Enter the passphrase for this SSH key", for a fetch, pull or push waiting on ssh.
+fn view_passphrase_prompt<'a>(state: &'a State, request: &'a git::askpass::Request) -> Element<'a, Message> {
+    let panel = container(column![
+        text("SSH key passphrase").size(16),
+        text(request.key.clone()).size(12).style(iced::widget::text::secondary),
+        text_input("Passphrase", &state.passphrase).id(passphrase_input_id()).secure(true).size(13).padding(8)
+            .on_input(Message::PassphraseInput).on_submit(Message::PassphraseDone(true)),
+        iced::widget::checkbox(state.remember_passphrase).label("Remember for this session").size(14).text_size(12)
+            .on_toggle(Message::RememberPassphrase),
+        row![
+            Space::new().width(Length::Fill),
+            button(text("Cancel").size(13)).padding([6, 14]).style(flat_button_style).on_press(Message::PassphraseDone(false)),
+            button(text("OK").size(13)).padding([6, 14]).on_press(Message::PassphraseDone(true)),
+        ].spacing(8).align_y(iced::Alignment::Center),
+    ].spacing(12)).padding(16).width(Length::Fill).max_width(480).style(overlay_style);
+    let backdrop = container(Space::new().width(Length::Fill).height(Length::Fill)).style(|theme: &iced::Theme| iced::widget::container::Style {
+        background: Some(iced::Color { a: 0.4, ..theme.extended_palette().background.base.color.inverse() }.into()),
+        ..Default::default()
+    });
+    // Clicks outside the panel do nothing: a stray click must not cancel the push.
+    iced::widget::opaque(iced::widget::stack![
+        backdrop,
+        container(iced::widget::opaque(panel)).width(Length::Fill).height(Length::Fill)
+            .align_x(iced::Alignment::Center).padding(iced::Padding { top: 80.0, ..iced::Padding::default() }),
+    ])
+}
+
+/// A change's staged lines (removed, red) above its buffer lines (added, green), with Restore.
+fn view_diff_popup(hunk: &git_diff::Hunk) -> Element<'_, Message> {
+    let line = |prefix: &'static str, line: &str, removed: bool| -> Element<'_, Message> {
+        container(text(format!("{prefix}{line}")).font(fonts::FONT).size(12).wrapping(iced::widget::text::Wrapping::None))
+            .width(Length::Fill).padding([0, 6])
+            .style(move |theme: &iced::Theme| {
+                let palette = theme.extended_palette();
+                let color = if removed { palette.danger.base.color } else { palette.success.base.color };
+                iced::widget::container::Style { background: Some(iced::Color { a: 0.18, ..color }.into()), ..Default::default() }
+            })
+            .into()
+    };
+    let mut lines = column![].spacing(0);
+    for old in &hunk.old { lines = lines.push(line("- ", old, true)); }
+    for new in &hunk.new { lines = lines.push(line("+ ", new, false)); }
+    let header = row![
+        button(text("Restore").size(12)).padding([3, 10]).on_press(Message::DiffRestore),
+        Space::new().width(Length::Fill),
+        icon_control(lucide_icons::Icon::X, "Close (Esc)", Some(Message::DiffPopupClose), false),
+    ].spacing(8).align_y(iced::Alignment::Center);
+    let popup = container(column![header, scrollable(lines).height(Length::Shrink)].spacing(6))
+        .padding(6).max_width(720).max_height(360).clip(true)
+        .style(|theme: &iced::Theme| {
+            let palette = theme.extended_palette();
+            iced::widget::container::Style {
+                background: Some(palette.background.weak.color.into()),
+                border: iced::Border { color: palette.background.strong.color, width: 1.0, radius: 6.0.into() },
+                shadow: iced::Shadow { color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.3), offset: iced::Vector::new(0.0, 2.0), blur_radius: 8.0 },
+                ..Default::default()
+            }
+        });
+    iced::widget::opaque(popup)
 }
 
 /// Lays the toast, the language-server prompt and the open overlay over `base` as four layers
@@ -4347,7 +4489,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         let spec = file_icons::FileIcons.file_glyph(path);
         let color = file_icons::FileIcons.file_color(path);
         let icon = text(spec.glyph.into_owned())
-            .font(spec.font.unwrap_or_default())
+            .font(spec.font.unwrap_or(fonts::FONT))
             .size(spec.size.unwrap_or(14.0))
             .style(move |theme: &iced::Theme| iced::widget::text::Style {
                 color: Some(color.unwrap_or(theme.extended_palette().background.base.text)),
@@ -4404,7 +4546,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         let spec = file_icons::FileIcons.file_glyph(path);
         let color = file_icons::FileIcons.file_color(path);
         let icon = text(spec.glyph.into_owned())
-            .font(spec.font.unwrap_or_default()).size(spec.size.unwrap_or(14.0))
+            .font(spec.font.unwrap_or(fonts::FONT)).size(spec.size.unwrap_or(14.0))
             .style(move |theme: &iced::Theme| iced::widget::text::Style {
                 color: Some(color.unwrap_or(theme.extended_palette().background.base.text)),
             });
@@ -4511,6 +4653,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
             state.zoom,
             Message::EditorAction,
             Message::ToggleFold,
+            Message::DiffMarkerClicked,
             Message::EditorProbe,
             Message::EditorViewport,
         );
@@ -4521,7 +4664,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         if let Some(hover) = &tab.hover {
                 let mut lines = column![].spacing(2);
                 for line in &hover.lines {
-                    lines = lines.push(text(line.clone()).size(12).font(iced::Font::MONOSPACE)
+                    lines = lines.push(text(line.clone()).size(12).font(fonts::FONT)
                         .wrapping(iced::widget::text::Wrapping::None));
                 }
                 let popup = container(lines).padding([6, 10]).max_width(640).style(|theme: &iced::Theme| {
@@ -4535,6 +4678,18 @@ fn view_editor(state: &State) -> Element<'_, Message> {
                 });
                 let offset = iced::Padding { top: hover.anchor.y.max(0.0) + 2.0, left: hover.anchor.x.max(0.0), right: 0.0, bottom: 0.0 };
                 layers = layers.push(container(popup).padding(offset));
+        }
+        // A clicked diff marker's change below its lines, drawn over the canvas like the hover popup.
+        if let Some(hunk) = &tab.diff_popup {
+            let anchor = if hunk.lines.is_empty() && hunk.lines.start < tab.content.line_count() {
+                code_editor::line_anchor(&tab.content, &state.app_theme.editor, state.zoom, hunk.lines.start, false)
+            } else {
+                code_editor::line_anchor(&tab.content, &state.app_theme.editor, state.zoom, hunk.lines.end.max(1) - 1, true)
+            };
+            if let Some(anchor) = anchor {
+                let offset = iced::Padding { top: anchor.y.max(0.0) + 2.0, left: anchor.x.max(0.0), right: 0.0, bottom: 0.0 };
+                layers = layers.push(container(view_diff_popup(hunk)).padding(offset));
+            }
         }
         // Completions below the cursor, drawn over the canvas like the hover popup.
         if let Some(session) = state.ws.completion.as_ref()
@@ -5068,7 +5223,7 @@ fn load_diff_task(repo: Option<std::sync::Arc<git::repo::Repo>>, root: Option<&P
         Message::GitBlameLoaded(blame_path, snapshot, result)
     }, |message| message);
     let snapshot = text.clone();
-    Task::batch([blame, Task::perform(git_diff::diff_for_buffer(repo, relative, text), move |diff| {
+    Task::batch([blame, Task::perform(git_diff::diff_for_buffer(repo, relative, text), move |diff: (Vec<(usize, git_diff::LineStatus)>, Vec<git_diff::Hunk>)| {
         Message::GitDiffLoaded(path.clone(), snapshot.clone(), diff)
     })])
 }
@@ -5227,6 +5382,8 @@ fn paint_hidden_window(raw: u64, maximized: bool) -> bool {
 }
 
 pub fn main() -> iced::Result {
+    // Started by ssh to ask for a key's passphrase: answers and exits.
+    if git::askpass::run_helper() { return Ok(()); }
     if updater::run_helper() { return Ok(()); }
     let _update_guard = updater::running_guard();
     let icon = iced::window::icon::from_file_data(include_bytes!("../icon.png"), None).ok();
@@ -5235,6 +5392,11 @@ pub fn main() -> iced::Result {
         .theme(|state: &State| state.app_theme.iced.clone())
         .subscription(subscription)
         .font(iced_swdir_tree::LUCIDE_FONT_BYTES)
+        .font(fonts::FILES[0])
+        .font(fonts::FILES[1])
+        .font(fonts::FILES[2])
+        .font(fonts::FILES[3])
+        .default_font(fonts::FONT)
         .window(iced::window::Settings {
             icon,
             size: load_window_size(),
@@ -5409,6 +5571,60 @@ mod workspace_tests {
 
     fn ids(state: &State) -> Vec<WorkspaceId> {
         state.workspaces.iter().map(|entry| entry.id).collect()
+    }
+
+    #[test]
+    fn the_passphrase_dialog_answers_one_prompt_at_a_time_and_forgets_what_was_typed() {
+        let mut state = state(vec![tab(&["passphrase"])], 0);
+        let request = |id: u64| git::askpass::Request { id, key: format!("/keys/{id}") };
+        state.passphrase_prompts.extend([request(1), request(2)]);
+        let _ = update(&mut state, Message::PassphraseInput("secret".into()));
+        let _ = update(&mut state, Message::RememberPassphrase(true));
+        assert_eq!(state.passphrase, "secret");
+        let _ = update(&mut state, Message::PassphraseDone(true));
+        assert_eq!(state.passphrase_prompts.front(), Some(&request(2)), "the next prompt is shown");
+        assert_eq!(state.passphrase, "", "the passphrase is not kept in the dialog");
+        assert!(!state.remember_passphrase, "remember is off by default for each prompt");
+        // The dialog is modal: other keys do nothing, Escape cancels.
+        let _ = update(&mut state, Message::KeyPressed(keyboard::Key::Character("p".into()), keyboard::Modifiers::COMMAND));
+        assert!(!state.quick_open.visible);
+        let _ = update(&mut state, Message::PassphraseInput("typed".into()));
+        let _ = update(&mut state, Message::KeyPressed(keyboard::Key::Named(keyboard::key::Named::Escape), keyboard::Modifiers::default()));
+        assert!(state.passphrase_prompts.is_empty());
+        assert_eq!(state.passphrase, "");
+    }
+
+    #[test]
+    fn a_clicked_diff_marker_shows_its_change_and_restore_puts_the_staged_lines_back() {
+        let mut state = state(vec![tab(&["diff-popup"])], 0);
+        let hunk = git_diff::Hunk { lines: 1..2, old: vec!["b".into()], new: vec!["B".into()] };
+        {
+            let tab = &mut state.ws.tabs[0];
+            tab.content = code_editor::Buffer::new("a\nB\nc", code_editor::metrics_for_zoom(1.0));
+            tab.saved_text = Some("a\nB\nc".into());
+            tab.dirty = false;
+            tab.diff = [(1, git_diff::LineStatus::Modified)].into();
+            tab.hunks = vec![hunk.clone()];
+        }
+        let popup = |state: &State| state.ws.tabs[0].diff_popup.clone();
+        let _ = update(&mut state, Message::DiffMarkerClicked(1));
+        assert_eq!(popup(&state), Some(hunk.clone()));
+        let _ = update(&mut state, Message::DiffMarkerClicked(1));
+        assert_eq!(popup(&state), None, "a second click closes it");
+        let _ = update(&mut state, Message::DiffMarkerClicked(1));
+        let _ = update(&mut state, Message::KeyPressed(keyboard::Key::Named(keyboard::key::Named::Escape), keyboard::Modifiers::default()));
+        assert_eq!(popup(&state), None, "Escape closes it");
+        let _ = update(&mut state, Message::DiffMarkerClicked(1));
+        let _ = update(&mut state, Message::EditorAction(cosmic_text::Action::Click { x: 0, y: 0 }));
+        assert_eq!(popup(&state), None, "a click in the text closes it");
+
+        let _ = update(&mut state, Message::DiffMarkerClicked(1));
+        let _ = update(&mut state, Message::DiffRestore);
+        assert_eq!(popup(&state), None);
+        assert_eq!(state.ws.tabs[0].content.text(), "a\nb\nc");
+        assert!(state.ws.tabs[0].dirty, "restored in the buffer, not saved");
+        state.ws.tabs[0].content.undo();
+        assert_eq!(state.ws.tabs[0].content.text(), "a\nB\nc");
     }
 
     fn loaded(state: &State, index: usize) -> bool {
@@ -5746,7 +5962,7 @@ mod saved_state_tests {
             dirty: false,
             search: Default::default(),
             line_ending: LineEnding::Lf,
-            diff: Default::default(),
+            diff: Default::default(), hunks: Vec::new(), diff_popup: None,
             diagnostics: Vec::new(), blame: Vec::new(), hover: None, preview: None, image: None,
         };
         assert!(tab_for(Some("docs/README.md"), "").is_markdown());
@@ -5775,7 +5991,7 @@ mod saved_state_tests {
             path: Some(PathBuf::from("photo.png")),
             content: code_editor::Buffer::new("", code_editor::metrics_for_zoom(1.0)),
             saved_text: Some(String::new()), dirty: false, search: Default::default(),
-            line_ending: LineEnding::Lf, diff: Default::default(), diagnostics: Vec::new(),
+            line_ending: LineEnding::Lf, diff: Default::default(), hunks: Vec::new(), diff_popup: None, diagnostics: Vec::new(),
             blame: Vec::new(), hover: None, preview: None, image: Some(image_preview::Preview::new()),
         };
         tab.content.perform(cosmic_text::Action::Insert('x'));
@@ -5794,7 +6010,7 @@ mod saved_state_tests {
             dirty: false,
             search: Default::default(),
             line_ending: LineEnding::Lf,
-            diff: Default::default(),
+            diff: Default::default(), hunks: Vec::new(), diff_popup: None,
             diagnostics: Vec::new(), blame: Vec::new(), hover: None, preview: None, image: None,
         };
         tab.content.goto(0, 2);

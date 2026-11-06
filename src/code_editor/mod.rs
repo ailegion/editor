@@ -42,6 +42,8 @@ pub struct CodeEditor<'a, Message> {
     blame: &'a [String],
     style: Style,
     on_fold: Option<Box<dyn Fn(usize) -> Message + 'a>>,
+    /// Told the line whose diff marker was clicked.
+    on_diff: Option<Box<dyn Fn(usize) -> Message + 'a>>,
     on_action: Option<Box<dyn Fn(cosmic_text::Action) -> Message + 'a>>,
     on_probe: Option<Box<dyn Fn(Probe) -> Message + 'a>>,
     /// Told `(text width, height)` when the widget's size no longer matches what the buffer
@@ -82,6 +84,28 @@ pub fn caret_anchor(content: &Buffer, colors: &EditorColors, zoom: f32) -> Optio
     Some(iced::Point::new(style.gutter_width(content.line_count()) - scroll_x + x, (row as f32 + 1.0) * style.line_height - scroll))
 }
 
+/// Canvas point at the gutter's right edge, just below `line`'s last row (`below`) or at the
+/// top of its first row; `None` when the line is folded away. Anchors the diff popup.
+pub fn line_anchor(content: &Buffer, colors: &EditorColors, zoom: f32, line: usize, below: bool) -> Option<iced::Point> {
+    let style = Style::new(colors, zoom);
+    let rows = content.rows_of(line);
+    if rows.is_empty() { return None; }
+    let (scroll, _) = content.view_scroll();
+    let row = if below { rows.end } else { rows.start };
+    Some(iced::Point::new(style.gutter_width(content.line_count()), row as f32 * style.line_height - scroll))
+}
+
+/// Width of the strip at the gutter's left edge where a click opens the diff popup of the
+/// line's change (the bar is 3px wide, a removal's notch 6px).
+const DIFF_HIT: f32 = 8.0;
+
+/// The line whose diff marker is at `x` on screen row `row`, if there is one.
+fn diff_marker_at(content: &Buffer, diff: &HashMap<usize, LineStatus>, row: usize, x: f32) -> Option<usize> {
+    if x < 0.0 || x >= DIFF_HIT || row >= content.visible_count() { return None; }
+    let line = content.source_line(row);
+    diff.contains_key(&line).then_some(line)
+}
+
 /// How long the mouse must rest on a word before hover information is requested.
 const HOVER_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 
@@ -101,6 +125,7 @@ impl<'a, Message> CodeEditor<'a, Message> {
             style: Style::new(colors, zoom),
             on_action: None,
             on_fold: None,
+            on_diff: None,
             on_probe: None,
             on_viewport: None,
         }
@@ -425,6 +450,9 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
                 }
                 let on_action = self.on_action.as_ref()?;
                 let row = ((position.y + state.scroll) / self.style.line_height).max(0.0) as usize;
+                if let (Some(line), Some(on_diff)) = (diff_marker_at(self.content, self.diff, row, position.x), self.on_diff.as_ref()) {
+                    return Some(canvas::Action::publish(on_diff(line)).and_capture());
+                }
                 let line = self.content.source_line(row);
                 if position.x >= gutter_width - 18.0 && position.x < gutter_width {
                     // The fold arrow is on the line's first row.
@@ -526,6 +554,9 @@ impl<'a, Message> canvas::Program<Message> for CodeEditor<'a, Message> {
         // Same hit area as the fold toggle in `update`.
         let gutter_width = self.style.gutter_width(self.content.line_count());
         let row = ((position.y + state.scroll) / self.style.line_height).max(0.0) as usize;
+        if self.on_diff.is_some() && diff_marker_at(self.content, self.diff, row, position.x).is_some() {
+            return mouse::Interaction::Pointer;
+        }
         let line = self.content.source_line(row);
         if position.x >= gutter_width - 18.0
             && position.x < gutter_width
@@ -548,6 +579,7 @@ pub fn code_editor<'a, Message>(
     zoom: f32,
     on_action: impl Fn(cosmic_text::Action) -> Message + 'a,
     on_fold: impl Fn(usize) -> Message + 'a,
+    on_diff: impl Fn(usize) -> Message + 'a,
     on_probe: impl Fn(Probe) -> Message + 'a,
     on_viewport: impl Fn(f32, f32) -> Message + 'a,
 ) -> Element<'a, Message>
@@ -557,6 +589,7 @@ where
     let mut editor = CodeEditor::new(content, diff, diagnostics, colors, zoom).on_action(on_action).on_viewport(on_viewport);
     editor.blame = blame;
     editor.on_fold = Some(Box::new(on_fold));
+    editor.on_diff = Some(Box::new(on_diff));
     editor.on_probe = Some(Box::new(on_probe));
     Canvas::new(editor)
         .width(Length::Fill)
@@ -585,6 +618,18 @@ mod tests {
         // A line above the view scrolls up to it; one already in view leaves the scroll alone.
         assert_eq!(reveal_row(400.0, 100.0, line_height, view), Some(100.0));
         assert_eq!(reveal_row(400.0, 440.0, line_height, view), None);
+    }
+
+    #[test]
+    fn diff_markers_are_hit_only_on_marked_lines_at_the_gutter_edge() {
+        let content = Buffer::new("a\nb\nc", metrics_for_zoom(1.0));
+        let diff: HashMap<usize, LineStatus> = [(1, LineStatus::Modified), (2, LineStatus::Removed)].into();
+        assert_eq!(diff_marker_at(&content, &diff, 1, 1.0), Some(1));
+        assert_eq!(diff_marker_at(&content, &diff, 2, 7.5), Some(2));
+        assert_eq!(diff_marker_at(&content, &diff, 0, 1.0), None, "unchanged line");
+        assert_eq!(diff_marker_at(&content, &diff, 1, DIFF_HIT), None, "past the marker strip");
+        assert_eq!(diff_marker_at(&content, &diff, 1, -1.0), None);
+        assert_eq!(diff_marker_at(&content, &diff, 3, 1.0), None, "below the last row");
     }
 
     #[test]

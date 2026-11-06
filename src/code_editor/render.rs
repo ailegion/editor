@@ -114,7 +114,7 @@ pub fn draw(
                         position: Point::new(x, y),
                         color: iced::Color { a: 0.65, ..style.gutter_text_color },
                         size: iced::Pixels(style.font_size),
-                        font: iced::Font::MONOSPACE,
+                        font: crate::fonts::FONT,
                         ..Text::default()
                     });
                 }
@@ -125,7 +125,7 @@ pub fn draw(
                 frame.fill_text(Text {
                     content: format!("  ⋯ {} lines", end - row.line),
                     position: Point::new(end_x, y),
-                    color: style.gutter_text_color, size: iced::Pixels(style.font_size), ..Default::default()
+                    color: style.gutter_text_color, size: iced::Pixels(style.font_size), font: crate::fonts::FONT, ..Default::default()
                 });
             }
         }
@@ -259,7 +259,7 @@ pub fn draw(
             frame.fill_text(Text {
                 content: if buffer.collapsed.contains(&row.line) { "▸" } else { "▾" }.into(),
                 position: Point::new(gutter_width - 16.0, y),
-                color: style.gutter_text_color, size: iced::Pixels(style.font_size), ..Default::default()
+                color: style.gutter_text_color, size: iced::Pixels(style.font_size), font: crate::fonts::FONT, ..Default::default()
             });
         }
     }
@@ -294,6 +294,7 @@ fn draw_line_number(frame: &mut Frame, number: usize, y: f32, gutter_width: f32,
         position: Point::new(gutter_width - 20.0, y),
         color: style.gutter_text_color,
         size: iced::Pixels(style.font_size),
+        font: crate::fonts::FONT,
         align_x: iced::advanced::text::Alignment::Right,
         ..Text::default()
     });
@@ -345,6 +346,7 @@ fn draw_glyph_runs(
             position: Point::new(x_offset + glyph.x, y),
             color,
             size: iced::Pixels(style.font_size),
+            font: crate::fonts::FONT,
             ..Text::default()
         });
     }
@@ -368,6 +370,7 @@ fn fill_run(
         position: Point::new(x, y),
         color,
         size: iced::Pixels(font_size),
+        font: crate::fonts::FONT,
         ..Text::default()
     });
 }

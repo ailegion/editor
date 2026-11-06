@@ -4,6 +4,7 @@
 //! signing and filters apply. Status is one `git status` per settled file-system change while
 //! the panel is visible ([`watch`]); file versions for diffs are read in-process ([`repo`]).
 
+pub mod askpass;
 pub mod cli;
 pub mod blame;
 pub mod branches;
@@ -421,7 +422,7 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
     // Keyed, so the message box keeps its widget state (focus) when the error above it comes or goes.
     let mut bottom = iced::widget::keyed::Column::new().spacing(4);
     if let Some(err) = &state.error {
-        bottom = bottom.push("error", scrollable(text(err.clone()).size(12).font(iced::Font::MONOSPACE).style(iced::widget::text::danger)).height(Length::Shrink));
+        bottom = bottom.push("error", scrollable(text(err.clone()).size(12).font(crate::fonts::FONT).style(iced::widget::text::danger)).height(Length::Shrink));
     }
     let has_staged = state.status.files.iter().any(ChangedFile::staged);
     bottom = bottom.push(

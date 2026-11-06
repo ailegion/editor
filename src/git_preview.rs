@@ -217,9 +217,9 @@ fn cell<Message: 'static>(line: &Option<(usize, String)>, other: &Option<(usize,
         span(content[..range.start].to_owned()),
         span(content[range.clone()].to_owned()).background(highlight),
         span(content[range.end..].to_owned()),
-    ]).font(iced::Font::MONOSPACE).size(13).wrapping(iced::widget::text::Wrapping::None);
+    ]).font(crate::fonts::FONT).size(13).wrapping(iced::widget::text::Wrapping::None);
     container(row![
-        container(text(number).font(iced::Font::MONOSPACE).size(12)
+        container(text(number).font(crate::fonts::FONT).size(12)
             .style(iced::widget::text::secondary)).width(42),
         code,
     ].spacing(8))

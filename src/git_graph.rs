@@ -338,7 +338,7 @@ pub fn view<'a>(graph: &'a Graph) -> Element<'a, Message> {
                 .width(Length::Fill).clip(true),
             container(text(commit.author.clone()).size(12).style(secondary).wrapping(iced::widget::text::Wrapping::None)).width(140).clip(true),
             container(text(crate::ai_history::ago(now, commit.date)).size(12).style(secondary)).width(44),
-            text(commit.short().to_owned()).size(12).font(iced::Font::MONOSPACE).style(secondary),
+            text(commit.short().to_owned()).size(12).font(crate::fonts::FONT).style(secondary),
         ].spacing(10).align_y(iced::Alignment::Center).height(ROW_HEIGHT);
         list = list.push(button(line).padding([0, 8]).width(Length::Fill)
             .style(move |theme, status| {
@@ -398,7 +398,7 @@ fn details_view(graph: &Graph) -> Element<'_, Message> {
             None => file.path.clone(),
         };
         files = files.push(button(row![
-            text(file.status.clone()).size(12).font(iced::Font::MONOSPACE).width(16),
+            text(file.status.clone()).size(12).font(crate::fonts::FONT).width(16),
             text(label).size(12),
         ].spacing(8)).padding([2, 6]).width(Length::Fill).style(crate::flat_button_style)
             .on_press(Message::OpenFile(details.hash.clone(), file.clone())));

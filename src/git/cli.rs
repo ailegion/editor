@@ -17,9 +17,15 @@ pub enum Access {
 /// Runs `git <args>` in `cwd` and returns its stdout, or the command's diagnostics on failure.
 /// `stdin` is piped to the process when given (e.g. a commit message for `commit -F -`).
 pub fn run(cwd: &Path, args: &[&str], stdin: Option<&[u8]>, access: Access) -> Result<Vec<u8>, String> {
+    run_with_env(cwd, args, stdin, access, &[])
+}
+
+/// [`run`] with `env` added to git's environment (e.g. the passphrase prompt for ssh).
+pub fn run_with_env(cwd: &Path, args: &[&str], stdin: Option<&[u8]>, access: Access, env: &[(&str, std::ffi::OsString)]) -> Result<Vec<u8>, String> {
     let mut command = Command::new("git");
     command
         .args(args)
+        .envs(env.iter().map(|(key, value)| (key, value)))
         .current_dir(cwd)
         // A GUI process has no terminal to answer credential or pager prompts; fail instead.
         .env("GIT_TERMINAL_PROMPT", "0")

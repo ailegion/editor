@@ -67,7 +67,7 @@ pub fn view<'a, M: Clone + 'a>(card: Card<M>) -> Element<'a, M> {
         let preview = column![
             row![text("REQUEST DETAILS").size(10).style(iced::widget::text::secondary), Space::new().width(Length::Fill),
                 crate::icon_control(lucide_icons::Icon::Copy, "Copy request details", Some(card.copy), false)].align_y(iced::Alignment::Center),
-            scrollable(text(details).size(12).font(iced::Font::MONOSPACE)
+            scrollable(text(details).size(12).font(crate::fonts::FONT)
                 .wrapping(iced::widget::text::Wrapping::None))
                 .direction(scrollable::Direction::Both { vertical: Default::default(), horizontal: Default::default() })
                 .height(height).width(Length::Fill),

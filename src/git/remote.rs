@@ -32,26 +32,27 @@ impl Sync {
     }
 }
 
+/// Runs `sync`; an SSH key's passphrase is asked for in the app (see [`super::askpass`]).
 pub fn run(cwd: &Path, sync: Sync) -> Result<(), String> {
-    match sync {
-        Sync::Fetch => cli::run(cwd, &["fetch"], None, Access::Write).map(|_| ()),
-        Sync::Pull => cli::run(cwd, &["pull"], None, Access::Write).map(|_| ()),
-        Sync::Push => push(cwd),
-    }
+    super::askpass::with_prompts(|env| match sync {
+        Sync::Fetch => cli::run_with_env(cwd, &["fetch"], None, Access::Write, env).map(|_| ()),
+        Sync::Pull => cli::run_with_env(cwd, &["pull"], None, Access::Write, env).map(|_| ()),
+        Sync::Push => push(cwd, env),
+    })
 }
 
 /// `git push`; a branch's first push, when there is exactly one remote, publishes it there
 /// and sets it as upstream (`push -u`), like VS Code's Publish Branch.
-fn push(cwd: &Path) -> Result<(), String> {
+fn push(cwd: &Path, env: &[(&str, std::ffi::OsString)]) -> Result<(), String> {
     let has_upstream = cli::run(cwd, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], None, Access::Read).is_ok();
     if !has_upstream {
         let branch = String::from_utf8_lossy(&cli::run(cwd, &["branch", "--show-current"], None, Access::Read)?).trim().to_owned();
         let remotes = String::from_utf8_lossy(&cli::run(cwd, &["remote"], None, Access::Read)?).into_owned();
         if let ([remote], false) = (remotes.lines().collect::<Vec<_>>().as_slice(), branch.is_empty()) {
-            return cli::run(cwd, &["push", "-u", remote, &branch], None, Access::Write).map(|_| ());
+            return cli::run_with_env(cwd, &["push", "-u", remote, &branch], None, Access::Write, env).map(|_| ());
         }
     }
-    cli::run(cwd, &["push"], None, Access::Write).map(|_| ())
+    cli::run_with_env(cwd, &["push"], None, Access::Write, env).map(|_| ())
 }
 
 #[cfg(test)]

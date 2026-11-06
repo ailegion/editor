@@ -19,6 +19,10 @@ Bundled theme license texts and copyright notices:
 - src/theme/default/LICENSE.txt (copied by build.rs to
   themes/vscode.theme-defaults/LICENSE.txt for distribution)
 
+Bundled font: Monaspace Neon, Copyright (c) 2023, GitHub
+(https://github.com/githubnext/monaspace), SIL Open Font License 1.1:
+- assets/fonts/Monaspace-LICENSE.txt (distributed as licenses/monaspace/LICENSE.txt)
+
 Vendored iced-swdir-tree license and attribution:
 - vendor/iced-swdir-tree/LICENSE
 - vendor/iced-swdir-tree/NOTICE

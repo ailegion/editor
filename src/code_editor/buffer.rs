@@ -101,11 +101,16 @@ pub struct Buffer {
     highlight_cache: Option<HighlightCache>,
 }
 
-/// A `FontSystem` as `FontSystem::new` builds it, except that the system fonts are scanned once
-/// per process and each buffer starts from a copy of that database.
+/// A `FontSystem` as `FontSystem::new` builds it plus the bundled font (see
+/// [`crate::fonts::configure`]), except that the system fonts are scanned once per process and
+/// each buffer starts from a copy of that database.
 fn font_system() -> FontSystem {
     static FONTS: std::sync::OnceLock<(String, cosmic_text::fontdb::Database)> = std::sync::OnceLock::new();
-    let (locale, db) = FONTS.get_or_init(|| FontSystem::new().into_locale_and_db());
+    let (locale, db) = FONTS.get_or_init(|| {
+        let (locale, mut db) = FontSystem::new().into_locale_and_db();
+        crate::fonts::configure(&mut db);
+        (locale, db)
+    });
     FontSystem::new_with_locale_and_db(locale.clone(), db.clone())
 }
 
@@ -902,10 +907,12 @@ mod construction_tests {
         assert_eq!(from_lines, from_text);
     }
 
-    /// The shared font database shapes text exactly as a freshly built `FontSystem` does.
+    /// The shared font database shapes text exactly as a freshly built `FontSystem` with the
+    /// bundled font added does.
     #[test]
     fn shared_font_database_shapes_like_a_fresh_font_system() {
         let mut fresh = FontSystem::new();
+        crate::fonts::configure(fresh.db_mut());
         let mut shared = font_system();
         assert_eq!(shared.locale(), fresh.locale());
         assert_eq!(shared.db().len(), fresh.db().len());
@@ -919,6 +926,23 @@ mod construction_tests {
             buffer.lines.iter().map(glyphs).collect::<Vec<_>>()
         };
         assert_eq!(shape(&mut shared), shape(&mut fresh));
+    }
+
+    /// Plain and highlighted text is laid out in the bundled font, which the editor also draws with.
+    #[test]
+    fn editor_text_is_laid_out_in_monaspace_neon() {
+        let highlighter = Highlighter::new();
+        let theme = crate::theme::EditorTheme::default_dark();
+        let plain = Buffer::new("fn main() { let x = 1; }", Metrics::new(14.0, 20.0));
+        let coloured = Buffer::highlighted("fn main() { let x = 1; }", Metrics::new(14.0, 20.0), &highlighter, "rs", &theme.syntax);
+        for buffer in [&plain, &coloured] {
+            let glyphs = buffer.glyphs(0);
+            assert!(!glyphs.is_empty());
+            for glyph in glyphs {
+                let face = buffer.font_system.db().face(glyph.font_id).unwrap();
+                assert!(face.families.iter().any(|(family, _)| family == crate::fonts::NAME), "{:?}", face.families);
+            }
+        }
     }
 
 }

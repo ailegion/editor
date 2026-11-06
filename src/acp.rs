@@ -1381,7 +1381,7 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
                         .on_press(Message::ViewDiff(i, index)));
                 }
                 if expanded && !details.is_empty() {
-                    card = card.push(container(text(details.clone()).size(12).font(iced::Font::MONOSPACE)).padding(8).width(Length::Fill).style(container::dark));
+                    card = card.push(container(text(details.clone()).size(12).font(crate::fonts::FONT)).padding(8).width(Length::Fill).style(container::dark));
                 }
                 container(card).padding(10).width(Length::Fill).style(|theme: &iced::Theme| {
                     let palette = theme.extended_palette();

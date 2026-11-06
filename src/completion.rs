@@ -143,7 +143,7 @@ pub fn view<'a, M: Clone + 'a>(session: &'a Session, anchor: iced::Point, on_pic
         let selected = offset == session.selected;
         let line = row![
             text(kind_label(item.kind)).size(11).width(48).style(secondary),
-            text(item.label.clone()).size(13).font(iced::Font::MONOSPACE).wrapping(iced::widget::text::Wrapping::None),
+            text(item.label.clone()).size(13).font(crate::fonts::FONT).wrapping(iced::widget::text::Wrapping::None),
             Space::new().width(Length::Fill),
             text(item.detail.clone().unwrap_or_default()).size(11).style(secondary).wrapping(iced::widget::text::Wrapping::None),
         ].spacing(8).align_y(iced::Alignment::Center);
