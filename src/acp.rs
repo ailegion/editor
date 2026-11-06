@@ -22,14 +22,50 @@ enum ToolStatus {
     Failed,
 }
 
-impl ToolStatus {
-    fn icon(self) -> &'static str {
+/// What a tool call does, for its card's icon.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+enum ToolKind {
+    Read,
+    Edit,
+    Delete,
+    Move,
+    Search,
+    Execute,
+    Think,
+    Fetch,
+    #[default]
+    Other,
+}
+
+impl ToolKind {
+    fn icon(self) -> lucide_icons::Icon {
+        use lucide_icons::Icon;
         match self {
-            ToolStatus::Pending => "Queued",
-            ToolStatus::InProgress => "Running",
-            ToolStatus::Completed => "Done",
-            ToolStatus::Failed => "Failed",
+            ToolKind::Read => Icon::Eye,
+            ToolKind::Edit => Icon::Pencil,
+            ToolKind::Delete => Icon::Trash2,
+            ToolKind::Move => Icon::ArrowRightLeft,
+            ToolKind::Search => Icon::Search,
+            ToolKind::Execute => Icon::SquareTerminal,
+            ToolKind::Think => Icon::Brain,
+            ToolKind::Fetch => Icon::Globe,
+            ToolKind::Other => Icon::Wrench,
         }
+    }
+}
+
+fn convert_kind(kind: agent_client_protocol::schema::v1::ToolKind) -> ToolKind {
+    use agent_client_protocol::schema::v1::ToolKind as Kind;
+    match kind {
+        Kind::Read => ToolKind::Read,
+        Kind::Edit => ToolKind::Edit,
+        Kind::Delete => ToolKind::Delete,
+        Kind::Move => ToolKind::Move,
+        Kind::Search => ToolKind::Search,
+        Kind::Execute => ToolKind::Execute,
+        Kind::Think => ToolKind::Think,
+        Kind::Fetch => ToolKind::Fetch,
+        _ => ToolKind::Other,
     }
 }
 
@@ -57,6 +93,8 @@ enum Entry {
         /// File edits the tool made, for "View diff".
         #[serde(default)]
         diffs: Vec<crate::ai_diff::FileDiff>,
+        #[serde(default)]
+        kind: ToolKind,
     },
 }
 
@@ -181,6 +219,8 @@ enum Event {
         title: Option<String>,
         status: Option<ToolStatus>,
     },
+    /// What the tool call with this id does.
+    ToolKind(String, ToolKind),
     ToolDetails(String, String, Vec<crate::ai_diff::FileDiff>),
     Done,
     Error(String),
@@ -434,7 +474,7 @@ impl AcpState {
         let mut new_session_id = None;
         let mut transcript_changed = false;
         while let Ok(event) = rx.try_recv() {
-            transcript_changed |= matches!(&event, Event::Delta(_) | Event::ThoughtDelta(_) | Event::ToolCall { .. } | Event::ToolCallUpdate { .. } | Event::ToolDetails(..) | Event::Error(_));
+            transcript_changed |= matches!(&event, Event::Delta(_) | Event::ThoughtDelta(_) | Event::ToolCall { .. } | Event::ToolCallUpdate { .. } | Event::ToolKind(..) | Event::ToolDetails(..) | Event::Error(_));
             match event {
                 Event::Startup(status) => self.startup_status = Some(status),
                 Event::Delta(text) => Self::append_chunk(&mut self.entries, text, false),
@@ -486,6 +526,11 @@ impl AcpState {
                 }
                 Event::ToolCallUpdate { id, title, status } => {
                     Self::upsert_tool_call(&mut self.entries, id, title, status);
+                }
+                Event::ToolKind(id, kind) => {
+                    if let Some(Entry::ToolCall { kind: current, .. }) = self.entries.iter_mut().find(|entry| matches!(entry, Entry::ToolCall { id: existing, .. } if existing == &id)) {
+                        *current = kind;
+                    }
                 }
                 Event::ToolDetails(id, details, diffs) => {
                     if let Some(Entry::ToolCall { details: current, diffs: current_diffs, .. }) = self.entries.iter_mut().find(|entry| matches!(entry, Entry::ToolCall { id: existing, .. } if existing == &id)) {
@@ -582,6 +627,7 @@ impl AcpState {
             status: status.unwrap_or(ToolStatus::Pending),
             details: String::new(),
             diffs: Vec::new(),
+            kind: ToolKind::Other,
         });
     }
 
@@ -786,6 +832,7 @@ impl AcpState {
                                         title: tool_call.title,
                                         status: convert_status(tool_call.status),
                                     });
+                                    let _ = notify_tx.send(Event::ToolKind(id.clone(), convert_kind(tool_call.kind)));
                                     let _ = notify_tx.send(Event::ToolDetails(id, details, diffs));
                                 }
                                 SessionUpdate::ToolCallUpdate(update) => {
@@ -798,6 +845,9 @@ impl AcpState {
                                         title: update.fields.title,
                                         status: update.fields.status.map(convert_status),
                                     });
+                                    if let Some(kind) = update.fields.kind {
+                                        let _ = notify_tx.send(Event::ToolKind(id.clone(), convert_kind(kind)));
+                                    }
                                     let _ = notify_tx.send(Event::ToolDetails(id, details, diffs));
                                 }
                                 _ => {}
@@ -1344,30 +1394,21 @@ pub fn view<'a>(state: &'a AcpState, cwd: PathBuf, composer: crate::ai_composer:
             }
         }
         let card: Element<'_, Message> = match entry {
-            Entry::ToolCall { title, status, details, diffs, .. } => {
+            Entry::ToolCall { title, status, details, diffs, kind, .. } => {
                 let expanded = state.expanded_thinking.contains(&i);
-                let status = *status;
-                let badge = container(text(status.icon()).size(10))
-                    .padding([3, 7])
-                    .style(move |theme: &iced::Theme| {
-                        let palette = theme.extended_palette();
-                        let pair = match status {
-                            ToolStatus::Completed => palette.success.weak,
-                            ToolStatus::Failed => palette.danger.weak,
-                            ToolStatus::InProgress => palette.primary.weak,
-                            ToolStatus::Pending => palette.secondary.weak,
-                        };
-                        iced::widget::container::Style {
-                            background: Some(pair.color.into()), text_color: Some(pair.text),
-                            border: iced::Border::default().rounded(4), ..Default::default()
-                        }
-                    });
-                let heading = row![
-                    text("Tool activity").size(11).style(iced::widget::text::secondary),
-                    Space::new().width(Length::Fill), badge,
-                    text(if details.is_empty() { "" } else if expanded { "Hide" } else { "Details" }).size(11),
+                let lucide = iced::Font::with_name("lucide");
+                let icon = |glyph: lucide_icons::Icon| text(char::from(glyph)).font(lucide).size(13);
+                // A spinner until the tool has finished, then a check or a red error mark.
+                let indicator: Element<'_, Message> = match *status {
+                    ToolStatus::Pending | ToolStatus::InProgress => iced::widget::canvas(crate::workspaces::Spinner).width(12).height(12).into(),
+                    ToolStatus::Completed => icon(lucide_icons::Icon::Check).style(iced::widget::text::success).into(),
+                    ToolStatus::Failed => icon(lucide_icons::Icon::CircleX).style(iced::widget::text::danger).into(),
+                };
+                let summary = row![
+                    icon(kind.icon()),
+                    text(title.clone()).size(12).width(Length::Fill),
+                    indicator,
                 ].spacing(8).align_y(iced::Alignment::Center);
-                let summary = column![heading, text(title.clone()).size(12).width(Length::Fill)].spacing(6);
                 let mut card = column![button(summary).padding(0).width(Length::Fill)
                     .style(crate::flat_button_style)
                     .on_press_maybe((!details.is_empty()).then_some(Message::ToggleThinking(i)))].spacing(10);
@@ -2390,6 +2431,33 @@ mod tests {
         state.poll();
         assert_eq!(state.diff(0, 0), diffs.first());
         assert_eq!(state.diff(0, 1), None);
+    }
+
+    #[test]
+    fn tool_calls_keep_their_kind_for_the_card_icon() {
+        use agent_client_protocol::schema::v1::ToolKind as Kind;
+        assert_eq!(convert_kind(Kind::Execute), ToolKind::Execute);
+        assert_eq!(convert_kind(Kind::Search), ToolKind::Search);
+        assert_eq!(convert_kind(Kind::Read), ToolKind::Read);
+        assert_eq!(convert_kind(Kind::Edit), ToolKind::Edit);
+        assert_eq!(convert_kind(Kind::SwitchMode), ToolKind::Other);
+
+        let mut state = AcpState::default();
+        let (tx, rx) = mpsc::channel();
+        state.rx = Some(rx);
+        tx.send(Event::ToolCall { id: "run".into(), title: "npm install".into(), status: ToolStatus::InProgress }).unwrap();
+        tx.send(Event::ToolKind("run".into(), ToolKind::Execute)).unwrap();
+        tx.send(Event::ToolCall { id: "other".into(), title: "Something".into(), status: ToolStatus::Pending }).unwrap();
+        // An update that names a kind changes it; an unknown id changes nothing.
+        tx.send(Event::ToolKind("missing".into(), ToolKind::Read)).unwrap();
+        state.poll();
+        assert!(matches!(&state.entries[0], Entry::ToolCall { kind: ToolKind::Execute, .. }));
+        assert!(matches!(&state.entries[1], Entry::ToolCall { kind: ToolKind::Other, .. }));
+        assert_eq!(state.entries.len(), 2);
+
+        // Conversations saved before kinds existed load with the generic icon.
+        let saved: Entry = serde_json::from_str(r#"{"ToolCall":{"id":"x","title":"Read a.rs","status":"Completed"}}"#).unwrap();
+        assert!(matches!(saved, Entry::ToolCall { kind: ToolKind::Other, .. }));
     }
 
     #[test]
