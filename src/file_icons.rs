@@ -61,7 +61,7 @@ impl IconTheme for FileIcons {
                 let glyph: char = icon.into();
                 IconSpec::new(glyph.to_string()).with_size(14.0).with_font(iced::Font::with_name("lucide"))
             }
-            None => IconSpec::new(label).with_size(11.0).with_font(crate::fonts::FONT),
+            None => IconSpec::new(label).with_size(11.0).with_font(iced::Font::MONOSPACE),
         }
     }
     fn file_color(&self, path: &Path) -> Option<Color> { badge(path).map(|(_, color)| color) }

@@ -1,5 +1,6 @@
-//! The bundled Monaspace Neon font (https://github.com/githubnext/monaspace), the font of the
-//! whole app: iced's default, the code editor and the terminal. The files are the unmodified
+//! The bundled Monaspace Neon font (https://github.com/githubnext/monaspace), the font of code:
+//! the code editor, diff and search previews, completions, hover, AI code blocks and the
+//! terminal's fallback. The rest of the UI keeps iced's default font. The files are the unmodified
 //! v1.400 static OTFs, under the SIL Open Font License 1.1 (`assets/fonts/Monaspace-LICENSE.txt`).
 
 pub const NAME: &str = "Monaspace Neon";

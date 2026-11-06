@@ -4489,7 +4489,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         let spec = file_icons::FileIcons.file_glyph(path);
         let color = file_icons::FileIcons.file_color(path);
         let icon = text(spec.glyph.into_owned())
-            .font(spec.font.unwrap_or(fonts::FONT))
+            .font(spec.font.unwrap_or_default())
             .size(spec.size.unwrap_or(14.0))
             .style(move |theme: &iced::Theme| iced::widget::text::Style {
                 color: Some(color.unwrap_or(theme.extended_palette().background.base.text)),
@@ -4546,7 +4546,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         let spec = file_icons::FileIcons.file_glyph(path);
         let color = file_icons::FileIcons.file_color(path);
         let icon = text(spec.glyph.into_owned())
-            .font(spec.font.unwrap_or(fonts::FONT)).size(spec.size.unwrap_or(14.0))
+            .font(spec.font.unwrap_or_default()).size(spec.size.unwrap_or(14.0))
             .style(move |theme: &iced::Theme| iced::widget::text::Style {
                 color: Some(color.unwrap_or(theme.extended_palette().background.base.text)),
             });
@@ -5396,7 +5396,6 @@ pub fn main() -> iced::Result {
         .font(fonts::FILES[1])
         .font(fonts::FILES[2])
         .font(fonts::FILES[3])
-        .default_font(fonts::FONT)
         .window(iced::window::Settings {
             icon,
             size: load_window_size(),

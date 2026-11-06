@@ -72,7 +72,6 @@ fn render<'a, M: 'a>(content: &'a markdown::Content, theme: &iced::Theme, text_s
         border: iced::Border::default().rounded(3),
     };
     style.inline_code_color = palette.background.base.text;
-    style.inline_code_font = crate::fonts::FONT;
     style.code_block_font = crate::fonts::FONT;
     let settings = markdown::Settings::with_text_size(text_size, style);
     Element::from(markdown::view_with(content.items(), settings, &viewer)).map(on_action)
