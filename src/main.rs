@@ -3571,7 +3571,7 @@ fn view(state: &State) -> Element<'_, Message> {
     .on_resize(10, Message::PaneResized)
     .height(Length::Fill);
 
-    let base: Element<'_, Message> = column![top_bar, view_workspace_strip(state), panes, status_bar].into();
+    let base: Element<'_, Message> = column![top_bar, view_workspace_strip(state), tab_content_frame(panes), status_bar].into();
     let toast: Option<Element<'_, Message>> = state.notice.as_ref().map(|(message, _)| {
         let toast = container(row![text(message).size(13),
             button("×").style(flat_button_style).on_press(Message::DismissNotice),
@@ -3637,7 +3637,7 @@ fn view_workspace_strip(state: &State) -> Element<'_, Message> {
     let strip = iced::widget::responsive(move |size| {
         // Room for the tabs: the strip minus the "+" button after them.
         let width = workspaces::tab_width(size.width - 34.0, count);
-        let mut tabs = row![].spacing(0);
+        let mut tabs = row![].spacing(1);
         for (index, entry) in state.workspaces.iter().enumerate() {
             tabs = tabs.push(view_workspace_tab(state, index, entry.id, labels[index].clone(), width));
         }
@@ -3651,8 +3651,9 @@ fn view_workspace_strip(state: &State) -> Element<'_, Message> {
             .width(Length::Fill)
             .into()
     });
-    let bar = container(strip).width(Length::Fill).padding([2, 6]).height(34);
-    column![container(bar).width(Length::Fill).style(chrome_style), iced::widget::rule::horizontal(1).style(panel_divider_style)].into()
+    let bar = container(strip).width(Length::Fill)
+        .padding(iced::Padding { top: 2.0, right: 1.0, bottom: 0.0, left: 1.0 }).height(32);
+    connected_tab_strip(bar)
 }
 
 fn view_workspace_tab(state: &State, index: usize, id: WorkspaceId, label: String, width: f32) -> Element<'_, Message> {
@@ -3665,8 +3666,8 @@ fn view_workspace_tab(state: &State, index: usize, id: WorkspaceId, label: Strin
 
     let glyph: char = if root.is_some() { lucide_icons::Icon::Folder } else { lucide_icons::Icon::File }.into();
     let mut title = row![
-        text(glyph).font(iced::Font::with_name("lucide")).size(13),
-        text(label).size(13).wrapping(iced::widget::text::Wrapping::None).width(Length::Fill),
+        text(glyph).font(iced::Font::with_name("lucide")).size(13).line_height(tab_line_height()),
+        text(label).size(13).line_height(tab_line_height()).wrapping(iced::widget::text::Wrapping::None).width(Length::Fill),
     ].spacing(6).align_y(iced::Alignment::Center);
     if busy {
         title = title.push(iced::widget::tooltip(
@@ -3705,21 +3706,9 @@ fn view_workspace_tab(state: &State, index: usize, id: WorkspaceId, label: Strin
         tab_close_control(close_label, Message::WorkspaceClose(id)),
     ].spacing(4).align_y(iced::Alignment::Center).padding([0, 4]).height(Length::Fill);
 
-    let underline = container(Space::new().width(Length::Fill).height(2))
-        .style(move |theme: &iced::Theme| iced::widget::container::Style {
-            background: Some(if is_active { theme.extended_palette().primary.base.color } else { iced::Color::TRANSPARENT }.into()),
-            ..Default::default()
-        });
-    let body = container(column![content, underline])
-        .width(width).height(30)
-        .style(move |theme: &iced::Theme| iced::widget::container::Style {
-            background: is_active.then(|| theme.extended_palette().background.base.color.into()),
-            text_color: Some(if is_active { theme.extended_palette().background.base.text } else {
-                let text = theme.extended_palette().background.base.text;
-                iced::Color { a: text.a * 0.7, ..text }
-            }),
-            ..Default::default()
-        });
+    let body = joined_tab(container(content)
+        .width(width).height(30).padding(1)
+        .style(move |theme| tab_surface_style(theme, is_active)), is_active);
     let has_root = root.is_some();
     let count = state.workspaces.len();
     ContextMenu::new(body, move || {
@@ -4032,7 +4021,7 @@ pub(crate) fn secondary_button<'a, M: 'a>(label: impl Into<String>) -> iced::wid
 /// A quiet close glyph with the same comfortable target as toolbar controls.
 pub(crate) fn tab_close_control<'a, M: Clone + 'a>(label: &'a str, message: M) -> Element<'a, M> {
     let control = button(container(text(char::from(lucide_icons::Icon::X))
-        .font(iced::Font::with_name("lucide")).size(11))
+        .font(iced::Font::with_name("lucide")).size(11).line_height(tab_line_height()))
         .center_x(Length::Fill).center_y(Length::Fill))
         .width(26).height(26).padding(0)
         .style(tab_close_style).on_press(message);
@@ -4089,16 +4078,82 @@ fn tab_button_style(
     };
     let base = Style {
         text_color,
-        border: iced::Border::default(),
+        border: iced::Border {
+            radius: iced::border::Radius { top_left: 7.0, top_right: 7.0, ..Default::default() },
+            width: 1.0,
+            color: if is_active {
+                iced::Color { a: 0.45, ..palette.primary.base.color }
+            } else {
+                iced::Color { a: if matches!(status, Status::Hovered | Status::Pressed) { 0.25 } else { 0.10 }, ..palette.background.base.text }
+            },
+        },
         ..Style::default()
     };
     match status {
         Status::Disabled => Style { text_color: iced::Color { a: 0.35, ..base.text_color }, ..base }
             .with_background(iced::Color::TRANSPARENT),
         Status::Active => base.with_background(if is_active { palette.background.base.color } else { iced::Color::TRANSPARENT }),
-        Status::Hovered => base.with_background(palette.background.strong.color),
-        Status::Pressed => base.with_background(palette.background.strong.color),
+        Status::Hovered => base.with_background(if is_active { palette.background.base.color } else { palette.background.strong.color }),
+        Status::Pressed => base.with_background(if is_active { palette.background.base.color } else { palette.background.strong.color }),
     }
+}
+
+fn tab_line_height() -> iced::widget::text::LineHeight {
+    iced::widget::text::LineHeight::Absolute(iced::Pixels(18.0))
+}
+
+fn tab_surface_style(theme: &iced::Theme, selected: bool) -> iced::widget::container::Style {
+    let style = tab_button_style(theme, iced::widget::button::Status::Active, selected);
+    iced::widget::container::Style {
+        background: style.background,
+        text_color: Some(style.text_color),
+        border: style.border,
+        ..Default::default()
+    }
+}
+
+/// Cover only the selected tab's bottom stroke, preserving both side strokes.
+fn joined_tab<'a, M: 'a>(content: impl Into<Element<'a, M>>, selected: bool) -> Element<'a, M> {
+    let content = content.into();
+    if !selected { return content; }
+    iced::widget::stack![content, container(
+        container(Space::new().width(Length::Fill).height(1))
+            .style(|theme: &iced::Theme| iced::widget::container::Style {
+                background: Some(theme.extended_palette().background.base.color.into()),
+                ..Default::default()
+            })
+    ).padding(iced::Padding { left: 1.0, right: 1.0, ..Default::default() })
+        .width(Length::Fill).height(Length::Fill).align_y(iced::Alignment::End)].into()
+}
+
+fn tab_frame_style(theme: &iced::Theme) -> iced::widget::container::Style {
+    let mut style = tab_surface_style(theme, true);
+    style.border.radius = iced::border::Radius { bottom_left: 6.0, bottom_right: 6.0, ..Default::default() };
+    style
+}
+
+/// The strip supplies the top edge; this frame supplies the sides and bottom.
+fn tab_content_frame<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Element<'a, M> {
+    iced::widget::stack![
+        container(content).padding(1).width(Length::Fill).height(Length::Fill).style(tab_frame_style),
+        container(container(Space::new().width(Length::Fill).height(1))
+            .style(|theme: &iced::Theme| iced::widget::container::Style {
+                background: Some(theme.extended_palette().background.base.color.into()),
+                ..Default::default()
+            }))
+            .padding(iced::Padding { left: 1.0, right: 1.0, ..Default::default() })
+            .width(Length::Fill)
+    ].into()
+}
+
+fn connected_tab_strip<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Element<'a, M> {
+    iced::widget::stack![content.into()].push_under(
+        container(container(Space::new().width(Length::Fill).height(1))
+            .style(|theme: &iced::Theme| iced::widget::container::Style {
+                background: Some(tab_frame_style(theme).border.color.into()),
+                ..Default::default()
+            })).width(Length::Fill).height(Length::Fill).align_y(iced::Alignment::End)
+    ).push_under(container(Space::new().width(Length::Fill).height(Length::Fill)).style(chrome_style)).into()
 }
 
 fn menu_button<'a>(label: String, msg: Message) -> iced::widget::button::Button<'a, Message> {
@@ -4525,7 +4580,7 @@ fn view_tree(state: &State) -> Element<'_, Message> {
 
 fn view_editor(state: &State) -> Element<'_, Message> {
     use iced_swdir_tree::IconTheme;
-    let mut tab_row = row![].spacing(1).padding([2, 4]);
+    let mut tab_row = row![].spacing(1).padding(iced::Padding { top: 2.0, right: 1.0, bottom: 0.0, left: 1.0 });
     for (i, tab) in state.ws.tabs.iter().enumerate() {
         let is_active = state.ws.git_preview.is_none() && state.ws.git_graph.is_none() && i == state.ws.active_tab;
         let path = tab.path.as_deref().unwrap_or_else(|| Path::new("Untitled"));
@@ -4533,36 +4588,21 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         let color = file_icons::FileIcons.file_color(path);
         let icon = text(spec.glyph.into_owned())
             .font(spec.font.unwrap_or_default())
-            .size(spec.size.unwrap_or(14.0))
+            .size(spec.size.unwrap_or(14.0)).line_height(tab_line_height())
             .style(move |theme: &iced::Theme| iced::widget::text::Style {
                 color: Some(color.unwrap_or(theme.extended_palette().background.base.text)),
             });
         let tab_title = row![
-            container(row![icon, text(tab.title()).size(13)].spacing(6).align_y(iced::Alignment::Center))
+            container(row![icon, text(tab.title()).size(13).line_height(tab_line_height())].spacing(6).align_y(iced::Alignment::Center))
                 .padding([0, 8]),
             tab_close_control("Close tab", Message::TabClosed(i)),
         ]
         .spacing(2)
         .align_y(iced::Alignment::Center);
 
-        // A thin underline (rather than a filled pill) marks the active tab, so tabs read
-        // as flat text labels instead of buttons.
-        let underline = container(Space::new().width(Length::Fill).height(2))
-            .style(move |theme: &iced::Theme| iced::widget::container::Style {
-                background: Some(
-                    if is_active {
-                        theme.extended_palette().primary.base.color
-                    } else {
-                        iced::Color::TRANSPARENT
-                    }
-                    .into(),
-                ),
-                ..iced::widget::container::Style::default()
-            });
-
-        let tab_content = button(column![tab_title, underline].spacing(2)).padding(0)
+        let tab_content = joined_tab(button(tab_title).padding(1).height(30)
             .on_press(Message::TabSelected(i))
-            .style(move |theme, status| tab_button_style(theme, status, is_active));
+            .style(move |theme, status| tab_button_style(theme, status, is_active)), is_active);
         let tab_content = iced::widget::mouse_area(tab_content)
             .on_middle_press(Message::TabClosed(i));
         tab_row = tab_row.push(ContextMenu::new(tab_content, move || {
@@ -4585,48 +4625,35 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         let spec = file_icons::FileIcons.file_glyph(path);
         let color = file_icons::FileIcons.file_color(path);
         let icon = text(spec.glyph.into_owned())
-            .font(spec.font.unwrap_or_default()).size(spec.size.unwrap_or(14.0))
+            .font(spec.font.unwrap_or_default()).size(spec.size.unwrap_or(14.0)).line_height(tab_line_height())
             .style(move |theme: &iced::Theme| iced::widget::text::Style {
                 color: Some(color.unwrap_or(theme.extended_palette().background.base.text)),
             });
         let title = row![
-            container(row![icon, text(&preview.path).size(13)].spacing(6).align_y(iced::Alignment::Center))
-                .padding([4, 8]),
+            container(row![icon, text(&preview.path).size(13).line_height(tab_line_height())].spacing(6).align_y(iced::Alignment::Center))
+                .padding([0, 8]),
             tab_close_control("Close diff", Message::CloseGitPreview),
         ].spacing(2).align_y(iced::Alignment::Center);
-        let underline = container(Space::new().width(Length::Fill).height(2))
-            .style(|theme: &iced::Theme| iced::widget::container::Style {
-                background: Some(theme.extended_palette().primary.base.color.into()),
-                ..Default::default()
-            });
-        let tab = container(column![title, underline].spacing(2))
-            .style(|theme: &iced::Theme| iced::widget::container::Style {
-                background: Some(theme.extended_palette().background.weak.color.into()),
-                ..Default::default()
-            });
+        let tab = joined_tab(container(title).padding(1).height(30)
+            .style(|theme| tab_surface_style(theme, true)), true);
         let mut header = row![
             tab,
             text(git_preview::summary(preview)).size(12).style(iced::widget::text::secondary),
             Space::new().width(Length::Fill),
-        ].spacing(8).padding([2, 4]).align_y(iced::Alignment::Center);
+        ].spacing(8).padding(iced::Padding { top: 2.0, left: 1.0, right: 1.0, bottom: 0.0 }).align_y(iced::Alignment::Center);
         if state.ws.inline_edit.as_ref().is_some_and(|edit| matches!(edit.stage, inline_edit::Stage::Review(_))) {
             header = header
                 .push(button(text("Accept").size(13)).padding([6, 14]).style(iced::widget::button::success).on_press(Message::InlineEditAccept))
                 .push(secondary_button("Reject").on_press(Message::InlineEditCancel));
         }
         let header = header.push(secondary_button(if state.ws.ai_visible { "Hide AI panel" } else { "Show AI panel" }).on_press(Message::AiToggle));
-        return column![
-            crate::scrollbar::scrollable(tab_row).direction(iced::widget::scrollable::Direction::Horizontal(crate::scrollbar::rail())),
-            container(header).style(chrome_style),
-
-            git_preview::view(preview, &state.app_theme.iced, Message::GitPreviewScrolled),
-        ].width(Length::Fill).height(Length::Fill).into();
+        return editor_frame(tab_row, column![
+            connected_tab_strip(header),
+            tab_content_frame(git_preview::view(preview, &state.app_theme.iced, Message::GitPreviewScrolled)),
+        ]);
     }
     if let Some(graph) = &state.ws.git_graph {
-        return column![
-            crate::scrollbar::scrollable(tab_row).direction(iced::widget::scrollable::Direction::Horizontal(crate::scrollbar::rail())),
-            git_graph::view(graph).map(Message::GitGraph),
-        ].width(Length::Fill).height(Length::Fill).into();
+        return editor_frame(tab_row, column![git_graph::view(graph).map(Message::GitGraph)]);
     }
     let mut editor_column = column![];
 
@@ -4814,7 +4841,7 @@ fn editor_frame<'a>(tab_row: iced::widget::Row<'a, Message>, editor_column: iced
         ))
         .width(Length::Fill);
 
-    column![container(tab_strip).style(chrome_style), iced::widget::rule::horizontal(1).style(panel_divider_style), editor_column.height(Length::Fill)]
+    column![connected_tab_strip(tab_strip), tab_content_frame(editor_column.height(Length::Fill))]
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -5653,6 +5680,69 @@ mod workspace_tests {
     }
 
     #[test]
+    fn selected_tabs_open_into_a_matching_content_frame() {
+        use iced::widget::button::Status;
+        for theme in [iced::Theme::Dark, iced::Theme::Light] {
+            let frame = tab_frame_style(&theme);
+            for status in [Status::Active, Status::Hovered, Status::Pressed] {
+                let tab = tab_button_style(&theme, status, true);
+                assert_eq!(tab.background, frame.background);
+                assert_eq!(tab.border.color, frame.border.color);
+                assert_eq!(tab.border.width, frame.border.width);
+            }
+            assert_eq!(frame.border.radius.top_left, 0.0);
+            assert_eq!(frame.border.radius.top_right, 0.0);
+            assert_eq!(frame.border.radius.bottom_left, 6.0);
+            assert_eq!(frame.border.radius.bottom_right, 6.0);
+        }
+        // Only the selected tab gets a layer covering its bottom border.
+        for selected in [false, true] {
+            let tab: Element<'_, Message> = joined_tab(button(text("tab")), selected);
+            let tree = iced::advanced::widget::Tree::new(tab.as_widget());
+            assert_eq!(tree.children.len(), if selected { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn workspace_and_diff_tab_surfaces_match_editor_and_terminal_tabs() {
+        for theme in [iced::Theme::Dark, iced::Theme::Light] {
+            for selected in [false, true] {
+                let surface = tab_surface_style(&theme, selected);
+                let button = tab_button_style(&theme, iced::widget::button::Status::Active, selected);
+                assert_eq!(surface.border, button.border);
+                assert_eq!(surface.background, button.background);
+                assert_eq!(surface.text_color, Some(button.text_color));
+            }
+        }
+    }
+
+    #[test]
+    fn tab_glyphs_and_labels_use_the_same_absolute_line_height() {
+        // Relative line height gives the 11 px close glyph, 13 px label, and 14 px
+        // file icon different line boxes even when their rows are centered.
+        for font_size in [11.0, 13.0, 14.0] {
+            assert_eq!(tab_line_height().to_absolute(iced::Pixels(font_size)), iced::Pixels(18.0));
+        }
+    }
+
+    #[test]
+    fn tabs_have_rounded_tops_and_theme_accented_selection_borders() {
+        use iced::widget::button::Status;
+        for theme in [iced::Theme::Dark, iced::Theme::Light] {
+            let active = tab_button_style(&theme, Status::Active, true);
+            let inactive = tab_button_style(&theme, Status::Active, false);
+            assert_eq!(active.border.width, 1.0);
+            assert_eq!(active.border.radius.top_left, 7.0);
+            assert_eq!(active.border.radius.top_right, 7.0);
+            assert_eq!(active.border.radius.bottom_left, 0.0);
+            assert_eq!(active.border.radius.bottom_right, 0.0);
+            assert_eq!(active.border.color, iced::Color { a: 0.45, ..theme.extended_palette().primary.base.color });
+            assert!(active.border.color.a > inactive.border.color.a);
+            assert!(tab_button_style(&theme, Status::Hovered, false).border.color.a > inactive.border.color.a);
+        }
+    }
+
+    #[test]
     fn tab_surfaces_and_close_controls_keep_a_quiet_visual_hierarchy() {
         use iced::widget::button::Status;
         for theme in [iced::Theme::Dark, iced::Theme::Light] {
@@ -5664,8 +5754,8 @@ mod workspace_tests {
             assert!(active.text_color.a > inactive.text_color.a);
             for selected in [false, true] {
                 let hovered = tab_button_style(&theme, Status::Hovered, selected);
-                assert_eq!(hovered.background, Some(palette.background.strong.color.into()));
-                assert_eq!(hovered.border.radius, iced::border::Radius::default());
+                assert_eq!(hovered.background, Some(if selected { palette.background.base.color } else { palette.background.strong.color }.into()));
+                assert_eq!(hovered.border.radius, iced::border::Radius { top_left: 7.0, top_right: 7.0, ..Default::default() });
             }
             let resting = tab_close_style(&theme, Status::Active);
             let hovered = tab_close_style(&theme, Status::Hovered);

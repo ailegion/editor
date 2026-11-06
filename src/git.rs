@@ -317,8 +317,10 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
     if ahead > 0 || behind > 0 {
         branch = branch.push(text(format!("↑{ahead} ↓{behind}")).size(12).style(crate::metadata_text_style));
     }
-    let branch_button = button(branch.push(Space::new().width(Length::Fill)))
-        .padding([2, 4]).width(Length::Fill).style(crate::flat_button_style)
+    let chevron: char = lucide_icons::Icon::ChevronDown.into();
+    let branch_button = button(branch.push(Space::new().width(Length::Fill))
+        .push(text(chevron).font(iced::Font::with_name("lucide")).size(12).style(crate::metadata_text_style)))
+        .padding([6, 8]).width(Length::Fill).style(move |theme, status| branch_selector_style(theme, status, state.picker.open))
         .on_press_maybe((!state.committing).then_some(Message::ToggleBranches));
     let branch = iced_aw::DropDown::new(branch_button, branch_picker(&state.picker, &label), state.picker.open)
         .alignment(iced_aw::drop_down::Alignment::Bottom).on_dismiss(Message::CloseBranches);
@@ -475,6 +477,18 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
 /// Leave the overlay scrollbar its own gutter beside the discard buttons.
 fn files_list_padding() -> iced::Padding {
     iced::Padding { right: 16.0, ..iced::Padding::default() }
+}
+
+fn branch_selector_style(theme: &iced::Theme, status: button::Status, open: bool) -> button::Style {
+    let mut style = crate::flat_button_style(theme, status);
+    let palette = theme.extended_palette();
+    let highlighted = open || matches!(status, button::Status::Hovered | button::Status::Pressed);
+    style.background = Some(iced::Color { a: if highlighted { 0.07 } else { 0.03 }, ..palette.background.base.text }.into());
+    style.border = iced::Border::default().rounded(6).width(1).color(iced::Color {
+        a: if highlighted { 0.25 } else { 0.12 },
+        ..palette.background.base.text
+    });
+    style
 }
 
 /// Search box, filter menu, the matching branches and a "Create Branch" row for the typed name.
@@ -696,6 +710,22 @@ fn stage_files(cwd: &Path, files: &[ChangedFile], stage: bool, unborn: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branch_selector_is_outlined_and_highlights_when_hovered_or_open() {
+        for theme in [iced::Theme::Dark, iced::Theme::Light] {
+            let resting = branch_selector_style(&theme, button::Status::Active, false);
+            let hovered = branch_selector_style(&theme, button::Status::Hovered, false);
+            let open = branch_selector_style(&theme, button::Status::Active, true);
+            assert_eq!(resting.border.width, 1.0);
+            assert_eq!(resting.border.radius, iced::border::Radius::from(6.0));
+            assert!(resting.border.color.a > 0.0);
+            assert!(hovered.border.color.a > resting.border.color.a);
+            assert_eq!(open.border, hovered.border);
+            assert_eq!(open.background, hovered.background);
+            assert_eq!(resting.background, Some(iced::Color { a: 0.03, ..theme.extended_palette().background.base.text }.into()));
+        }
+    }
 
     #[test]
     fn file_actions_leave_room_for_the_overlay_scrollbar() {

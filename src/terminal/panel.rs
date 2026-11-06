@@ -404,15 +404,15 @@ impl Panel {
 
     pub fn view(&self, enabled: bool) -> Element<'_, Message> {
         use lucide_icons::Icon;
-        let mut tabs = row![].spacing(1).padding([2, 4]);
+        let mut tabs = row![].spacing(1).padding(iced::Padding { top: 2.0, right: 1.0, bottom: 0.0, left: 1.0 });
         for tab in &self.tabs {
             let selected = Some(tab.id) == self.active;
             let glyph: char = Icon::Terminal.into();
             let title = row![
                 container(
                     row![
-                        text(glyph).font(iced::Font::with_name("lucide")).size(14),
-                        text(format!("{} {}", tab.name, tab.id)).size(13),
+                        text(glyph).font(iced::Font::with_name("lucide")).size(14).line_height(crate::tab_line_height()),
+                        text(format!("{} {}", tab.name, tab.id)).size(13).line_height(crate::tab_line_height()),
                     ]
                     .spacing(6)
                     .align_y(iced::Alignment::Center)
@@ -425,22 +425,9 @@ impl Panel {
             ]
             .spacing(2)
             .align_y(iced::Alignment::Center);
-            let underline = container(Space::new().width(Length::Fill).height(2)).style(
-                move |theme: &iced::Theme| container::Style {
-                    background: Some(
-                        if selected {
-                            theme.extended_palette().primary.base.color
-                        } else {
-                            iced::Color::TRANSPARENT
-                        }
-                        .into(),
-                    ),
-                    ..Default::default()
-                },
-            );
-            let tab_content = button(column![title, underline].spacing(2)).padding(0)
+            let tab_content = crate::joined_tab(button(title).padding(1).height(30)
                 .on_press(Message::Select(tab.id))
-                .style(move |theme, status| crate::tab_button_style(theme, status, selected));
+                .style(move |theme, status| crate::tab_button_style(theme, status, selected)), selected);
             tabs = tabs.push(
                 iced::widget::mouse_area(tab_content).on_middle_press(Message::Close(tab.id)),
             );
@@ -492,20 +479,20 @@ impl Panel {
         .padding([0, 4])
         .align_y(iced::Alignment::Center);
         let mut content = column![
-            container(header).style(crate::chrome_style),
-            iced::widget::rule::horizontal(1).style(crate::panel_divider_style),
+            crate::connected_tab_strip(header),
+
         ];
         if let Some(tab) = self.tabs.iter().find(|tab| Some(tab.id) == self.active) {
             let id = tab.id;
             content = content.push(
-                super::view(&tab.terminal, enabled && !self.menu_open)
-                    .map(move |msg| Message::Session(id, msg)),
+                crate::tab_content_frame(super::view(&tab.terminal, enabled && !self.menu_open)
+                    .map(move |msg| Message::Session(id, msg))),
             );
         } else {
             content = content.push(
-                container(text("Press + to open a terminal"))
+                crate::tab_content_frame(container(text("Press + to open a terminal"))
                     .padding(16)
-                    .height(Length::Fill),
+                    .height(Length::Fill)),
             );
         }
         content.height(Length::Fill).into()
