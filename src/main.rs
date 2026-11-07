@@ -3544,18 +3544,16 @@ fn view(state: &State) -> Element<'_, Message> {
                 !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible
                     && !state.theme_install.visible && !state.about.visible).map(Message::Terminal),
             PaneKind::Sidebar => container(view_sidebar(state))
-                .padding(0)
+                .padding(if state.ws.sidebar_mode == SidebarMode::Tree { 1 } else { 0 })
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(|theme: &iced::Theme| iced::widget::container::Style {
-                    background: Some(theme.extended_palette().background.weak.color.into()),
-                    ..iced::widget::container::Style::default()
-                })
+                .style(move |theme| sidebar_panel_style(theme, state.ws.sidebar_mode))
                 .into(),
             PaneKind::Main => view_editor(state),
             PaneKind::Ai => container(view_ai_sidebar(state))
+                .padding(1)
                 .height(Length::Fill)
-                .style(chrome_style)
+                .style(workspace_panel_style)
                 .into(),
         };
         pane_grid::Content::new(content)
@@ -4187,6 +4185,21 @@ fn tab_strip_style(theme: &iced::Theme) -> iced::widget::container::Style {
     iced::widget::container::Style {
         background: Some(theme.extended_palette().background.base.color.into()),
         ..Default::default()
+    }
+}
+
+fn workspace_panel_style(theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(theme.extended_palette().background.base.color.into()),
+        border: tab_frame_style(theme).border.rounded(6),
+        ..Default::default()
+    }
+}
+
+fn sidebar_panel_style(theme: &iced::Theme, mode: SidebarMode) -> iced::widget::container::Style {
+    match mode {
+        SidebarMode::Tree => workspace_panel_style(theme),
+        SidebarMode::ProjectSearch | SidebarMode::Git => chrome_style(theme),
     }
 }
 
@@ -5787,6 +5800,35 @@ mod workspace_tests {
             let tip = overlay_style(&theme);
             assert_eq!(tip.background, Some(theme.extended_palette().background.base.color.into()));
             assert!(tip.border.width > 0.0);
+        }
+    }
+
+    #[test]
+    fn explorer_and_ai_backgrounds_match_workspace_without_changing_other_sidebar_modes() {
+        for theme in [iced::Theme::Light, iced::Theme::Dark] {
+            let workspace = Some(theme.extended_palette().background.base.color.into());
+            let ai = workspace_panel_style(&theme);
+            let explorer = sidebar_panel_style(&theme, SidebarMode::Tree);
+            assert_eq!(ai.background, workspace);
+            assert_eq!(explorer.background, workspace);
+            assert_eq!(ai.border, tab_frame_style(&theme).border.rounded(6));
+            assert_eq!(explorer.border, ai.border);
+            for mode in [SidebarMode::Git, SidebarMode::ProjectSearch] {
+                assert_eq!(sidebar_panel_style(&theme, mode), chrome_style(&theme));
+            }
+        }
+    }
+
+    #[test]
+    fn explorer_and_ai_panel_borders_match_content_frame_color_and_width() {
+        for theme in [iced::Theme::Light, iced::Theme::Dark] {
+            let frame = tab_frame_style(&theme).border;
+            for border in [workspace_panel_style(&theme).border, sidebar_panel_style(&theme, SidebarMode::Tree).border] {
+                assert_eq!(border.color, frame.color);
+                assert_eq!(border.width, frame.width);
+                assert_eq!(border.width, 1.0);
+                assert_eq!(border.radius, iced::border::Radius::from(6.0));
+            }
         }
     }
 
