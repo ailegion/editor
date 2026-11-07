@@ -5768,14 +5768,17 @@ mod workspace_tests {
         assert_eq!(header.as_widget().size().height, Length::Fixed(PANEL_HEADER_HEIGHT));
     }
 
-    #[test]
-    fn tab_close_tooltip_waits_on_first_hover_instead_of_covering_the_button() {
+    #[tokio::test]
+    async fn tab_close_tooltip_waits_on_first_hover_instead_of_covering_the_button() {
         use iced::advanced::{layout, widget::Tree, Layout, Shell};
-        let mut tooltip: Element<'_, (), iced::Theme, ()> = tab_close_tooltip(
+        use iced_core::renderer::Headless;
+        let renderer = iced::Renderer::new(iced::Font::DEFAULT, iced::Pixels(16.0), Some("tiny-skia"))
+            .await.expect("iced's built-in software renderer");
+        let mut tooltip: Element<'_, ()> = tab_close_tooltip(
             Space::new().width(26).height(26), Space::new().width(120).height(20),
         ).into();
         let mut tree = Tree::new(tooltip.as_widget());
-        let node = tooltip.as_widget_mut().layout(&mut tree, &(),
+        let node = tooltip.as_widget_mut().layout(&mut tree, &renderer,
             &layout::Limits::new(iced::Size::ZERO, iced::Size::new(200.0, 200.0)));
         let viewport = iced::Rectangle::with_size(iced::Size::new(200.0, 200.0));
         let cursor = iced::mouse::Cursor::Available(iced::Point::new(13.0, 13.0));
@@ -5784,12 +5787,12 @@ mod workspace_tests {
         let before = iced_core::time::Instant::now();
         tooltip.as_widget_mut().update(&mut tree,
             &iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: iced::Point::new(13.0, 13.0) }),
-            Layout::new(&node), cursor, &(), &mut iced_core::clipboard::Null, &mut shell, &viewport);
+            Layout::new(&node), cursor, &renderer, &mut iced_core::clipboard::Null, &mut shell, &viewport);
         let iced::window::RedrawRequest::At(at) = shell.redraw_request() else {
             panic!("hover must schedule the delayed tooltip");
         };
         assert!(at >= before + std::time::Duration::from_millis(600));
-        assert!(tooltip.as_widget_mut().overlay(&mut tree, Layout::new(&node), &(), &viewport, iced::Vector::ZERO).is_none());
+        assert!(tooltip.as_widget_mut().overlay(&mut tree, Layout::new(&node), &renderer, &viewport, iced::Vector::ZERO).is_none());
     }
 
     #[test]
