@@ -4128,6 +4128,17 @@ fn menu_bar_style(theme: &iced::Theme, status: iced_aw::style::Status) -> iced_a
     style
 }
 
+fn tab_context_menu_style(theme: &iced::Theme) -> iced::widget::container::Style {
+    let menu = menu_bar_style(theme, iced_aw::style::Status::Active);
+    iced::widget::container::Style {
+        background: Some(menu.menu_background),
+        border: menu.menu_border,
+        shadow: menu.menu_shadow,
+        text_color: Some(theme.extended_palette().background.base.text),
+        ..Default::default()
+    }
+}
+
 fn tab_surface_style(theme: &iced::Theme, selected: bool) -> iced::widget::container::Style {
     let style = tab_button_style(theme, iced::widget::button::Status::Active, selected);
     iced::widget::container::Style {
@@ -4656,7 +4667,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
                 menu_button("Close All Tabs".into(), Message::CloseTabs(i, TabCloseScope::All)),
                 menu_button_maybe("Reopen Closed Tab".into(), (!state.ws.closed_tabs.is_empty()).then_some(Message::ReopenClosedTab)),
             ].spacing(2).width(220))
-            .padding(6).style(iced::widget::container::rounded_box).into()
+            .padding(6).style(tab_context_menu_style).into()
         }));
     }
 
@@ -5740,6 +5751,18 @@ mod workspace_tests {
         assert_eq!(top_padding + TAB_HEIGHT, PANEL_HEADER_HEIGHT);
         let header: Element<'_, Message> = panel_header(text("Files"));
         assert_eq!(header.as_widget().size().height, Length::Fixed(PANEL_HEADER_HEIGHT));
+    }
+
+    #[test]
+    fn tab_context_menus_match_the_top_menu_popup_surface() {
+        for theme in [iced::Theme::Light, iced::Theme::Dark] {
+            let popup = menu_bar_style(&theme, iced_aw::style::Status::Active);
+            let context = tab_context_menu_style(&theme);
+            assert_eq!(context.background, Some(popup.menu_background));
+            assert_eq!(context.border, popup.menu_border);
+            assert_eq!(context.shadow, popup.menu_shadow);
+            assert_eq!(context.text_color, Some(theme.extended_palette().background.base.text));
+        }
     }
 
     #[test]
