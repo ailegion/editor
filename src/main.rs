@@ -4606,7 +4606,10 @@ fn view_tree(state: &State) -> Element<'_, Message> {
             icon_control(lucide_icons::Icon::X, "Cancel rename", Some(Message::RenameCancel), false),
         ].spacing(4).into()))
     } else { None };
-    let content = ContextMenu::new(tree.view_with_entry_and_scrollbar(Message::Tree, entry, scrollbar::rail(), scrollbar::style), || {
+    let refresh = icon_control(lucide_icons::Icon::RefreshCw, "Refresh files", Some(Message::RefreshTree), false);
+    let content = ContextMenu::new(tree.view_with_entry_scrollbar_and_root_action(
+        Message::Tree, entry, scrollbar::rail(), scrollbar::style, Some(refresh),
+    ), || {
         container(
             column![
                 menu_button("New File".to_string(), Message::ContextNewFile),
@@ -4632,14 +4635,7 @@ fn view_tree(state: &State) -> Element<'_, Message> {
         .into()
     });
 
-    let project = state.ws.root.as_ref().and_then(|path| path.file_name())
-        .map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Files".into());
-    column![
-        panel_header(row![panel_heading(project).width(Length::Fill).wrapping(iced::widget::text::Wrapping::None),
-            icon_control(lucide_icons::Icon::RefreshCw, "Refresh files", Some(Message::RefreshTree), false),
-        ].align_y(iced::Alignment::Center)),
-        container(content).padding([0, 8]).height(Length::Fill),
-    ].height(Length::Fill).into()
+    container(content).padding([0, 8]).height(Length::Fill).into()
 }
 
 fn view_editor(state: &State) -> Element<'_, Message> {
@@ -5971,6 +5967,27 @@ mod workspace_tests {
 
     fn ids(state: &State) -> Vec<WorkspaceId> {
         state.workspaces.iter().map(|entry| entry.id).collect()
+    }
+
+    #[test]
+    fn explorer_has_one_root_row_with_refresh_and_no_duplicate_heading() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(vec![tab(&[])], 0);
+        state.ws.tree = Some(DirectoryTree::new(root.path().to_path_buf()));
+        let explorer = view_tree(&state);
+        let tree = iced::advanced::widget::Tree::new(explorer.as_widget());
+        // Containers delegate their widget tree: context menu -> scrollable -> rows.
+        assert_eq!(tree.children.len(), 2, "context menu underlay and overlay only");
+        let rows = &tree.children[0].children[0];
+        assert_eq!(rows.children.len(), 1);
+        assert_eq!(rows.children[0].children.len(), 2, "root folder and refresh control share one row");
+
+        // The existing tree API continues to render its original root row.
+        let plain = state.ws.tree.as_ref().unwrap().view_with_entry_and_scrollbar(
+            Message::Tree, None, scrollbar::rail(), scrollbar::style,
+        );
+        let plain = iced::advanced::widget::Tree::new(plain.as_widget());
+        assert_eq!(rows.children[0].children[0].tag, plain.children[0].children[0].tag);
     }
 
     #[test]

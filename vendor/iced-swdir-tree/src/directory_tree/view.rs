@@ -62,9 +62,21 @@ impl DirectoryTree {
 
     /// Render with application-provided scrollbar geometry and appearance.
     pub fn view_with_entry_and_scrollbar<'a, Message, F>(
+        &'a self, on_event: F, entry: Option<(&'a Path, bool, Element<'a, Message>)>,
+        scrollbar: scrollable::Scrollbar,
+        style: fn(&Theme, scrollable::Status) -> scrollable::Style,
+    ) -> Element<'a, Message>
+    where Message: Clone + 'a, F: Fn(DirectoryTreeEvent) -> Message + Copy + 'a,
+    {
+        self.view_with_entry_scrollbar_and_root_action(on_event, entry, scrollbar, style, None)
+    }
+
+    /// Render an application action beside the root row, outside its selection/drag area.
+    pub fn view_with_entry_scrollbar_and_root_action<'a, Message, F>(
         &'a self, on_event: F, mut entry: Option<(&'a Path, bool, Element<'a, Message>)>,
         scrollbar: scrollable::Scrollbar,
         style: fn(&Theme, scrollable::Status) -> scrollable::Style,
+        root_action: Option<Element<'a, Message>>,
     ) -> Element<'a, Message>
     where Message: Clone + 'a, F: Fn(DirectoryTreeEvent) -> Message + Copy + 'a,
     {
@@ -94,6 +106,11 @@ impl DirectoryTree {
             &mut rows,
             &mut entry,
         );
+
+        if let (Some(action), Some(root_row)) = (root_action, rows.first_mut()) {
+            let root = std::mem::replace(root_row, Space::new().into());
+            *root_row = row![root, action].align_y(Alignment::Center).into();
+        }
 
         let list = column(rows).spacing(2).padding(4).width(Length::Fill);
 
