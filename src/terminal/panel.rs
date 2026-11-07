@@ -425,7 +425,7 @@ impl Panel {
             ]
             .spacing(2)
             .align_y(iced::Alignment::Center);
-            let tab_content = crate::joined_tab(button(title).padding(1).height(30)
+            let tab_content = crate::joined_tab(button(title).padding(1).height(crate::TAB_HEIGHT)
                 .on_press(Message::Select(tab.id))
                 .style(move |theme, status| crate::tab_button_style(theme, status, selected)), selected);
             tabs = tabs.push(
@@ -463,7 +463,7 @@ impl Panel {
         let header = row![
             crate::scrollbar::scrollable(tabs)
                 .direction(iced::widget::scrollable::Direction::Horizontal(
-                    crate::scrollbar::rail()
+                    crate::tab_rail()
                 ))
                 .width(Length::Shrink),
             new_terminal,

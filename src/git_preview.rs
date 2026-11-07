@@ -248,6 +248,11 @@ fn cell<Message: 'static>(line: &Option<(usize, String)>, other: &Option<(usize,
 pub const LEFT_SCROLL: &str = "git-diff-before";
 pub const RIGHT_SCROLL: &str = "git-diff-after";
 
+fn pane_width(viewport_width: f32) -> f32 {
+    // The row has two panes and a single 1 px divider, with no other spacing.
+    ((viewport_width - 1.0) / 2.0).max(0.0)
+}
+
 pub fn view<'a, Message: 'static>(
     preview: &'a Preview,
     theme: &'a iced::Theme,
@@ -266,7 +271,7 @@ pub fn view<'a, Message: 'static>(
                 .map(|(_, text)| text.replace('\t', "    ").chars().count()).max().unwrap_or(0)),
             _ => None,
         }).max().unwrap_or(0);
-        let viewport_half = ((size.width - 16.0) / 2.0).max(80.0);
+        let viewport_half = pane_width(size.width);
         let content_width = viewport_half.max(longest as f32 * 8.0 + 84.0);
         let mut left = column![container(text("Before").size(13)).padding(8).height(34)];
         let mut right = column![container(text("After").size(13)).padding(8).height(34)];
@@ -307,6 +312,16 @@ pub fn view<'a, Message: 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_panes_fill_the_available_width_without_a_gap_on_the_right() {
+        for width in [1.0, 80.0, 160.0, 423.0, 1031.0, 1920.0] {
+            let pane = pane_width(width);
+            assert_eq!(pane * 2.0 + 1.0, width);
+            assert!(pane >= 0.0);
+        }
+    }
+
     #[test]
     fn character_highlights_respect_unicode_and_insertions() {
         assert_eq!(changed_range("news_intelx", "news_intel"), 10..11);

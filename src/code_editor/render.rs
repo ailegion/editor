@@ -112,7 +112,7 @@ pub fn draw(
                     frame.fill_text(Text {
                         content: format!("⑂ {annotation}"),
                         position: Point::new(x, y),
-                        color: iced::Color { a: 0.65, ..style.gutter_text_color },
+                        color: blame_color(style.text_color),
                         size: iced::Pixels(style.font_size),
                         font: crate::fonts::FONT,
                         ..Text::default()
@@ -385,4 +385,21 @@ fn blink_on() -> bool {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     (elapsed.as_millis() / 500) % 2 == 0
+}
+
+/// Blame is secondary text, independent of the theme's often very faint line numbers.
+fn blame_color(foreground: iced::Color) -> iced::Color {
+    iced::Color { a: foreground.a * 0.6, ..foreground }
+}
+
+#[cfg(test)]
+mod blame_contrast_tests {
+    #[test]
+    fn blame_uses_readable_editor_foreground_in_light_and_dark_themes() {
+        for color in [iced::Color::BLACK, iced::Color::WHITE] {
+            let blame = super::blame_color(color);
+            assert_eq!((blame.r, blame.g, blame.b), (color.r, color.g, color.b));
+            assert_eq!(blame.a, 0.6);
+        }
+    }
 }

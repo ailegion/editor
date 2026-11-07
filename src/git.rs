@@ -468,10 +468,12 @@ pub fn view<'a>(state: &'a GitState, selected: Option<&str>) -> Element<'a, Mess
         crate::icon_control(lucide_icons::Icon::ListTree, if state.tree_view { "Show as flat list" } else { "Show as tree" }, Some(Message::ToggleTreeView), state.tree_view),
     ].spacing(6).align_y(iced::Alignment::Center);
 
-    container(column![header, bottom, iced::widget::rule::horizontal(1).style(crate::panel_divider_style), changes, files_list].spacing(8))
-        .padding(8)
-        .height(Length::Fill)
-        .into()
+    column![
+        crate::panel_header(header),
+        container(column![bottom, iced::widget::rule::horizontal(1).style(crate::panel_divider_style), changes, files_list].spacing(8))
+            .padding(iced::Padding { left: 8.0, right: 8.0, bottom: 8.0, top: 0.0 })
+            .height(Length::Fill),
+    ].height(Length::Fill).into()
 }
 
 /// Leave the overlay scrollbar its own gutter beside the discard buttons.

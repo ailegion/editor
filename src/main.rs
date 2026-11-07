@@ -3647,12 +3647,12 @@ fn view_workspace_strip(state: &State) -> Element<'_, Message> {
         let new_tab = icon_control(lucide_icons::Icon::Plus, if cfg!(target_os = "macos") { "New tab (⌘T)" } else { "New tab (Ctrl+T)" },
             Some(Message::WorkspaceNew), false);
         crate::scrollbar::scrollable(row![tabs, new_tab].spacing(4).align_y(iced::Alignment::Center))
-            .direction(iced::widget::scrollable::Direction::Horizontal(crate::scrollbar::rail()))
+            .direction(iced::widget::scrollable::Direction::Horizontal(tab_rail()))
             .width(Length::Fill)
             .into()
     });
     let bar = container(strip).width(Length::Fill)
-        .padding(iced::Padding { top: 2.0, right: 1.0, bottom: 0.0, left: 1.0 }).height(32);
+        .padding(iced::Padding { top: 2.0, right: 1.0, bottom: 0.0, left: 1.0 }).height(PANEL_HEADER_HEIGHT);
     connected_tab_strip(bar)
 }
 
@@ -3698,16 +3698,16 @@ fn view_workspace_tab(state: &State, index: usize, id: WorkspaceId, label: Strin
             .on_press(Message::WorkspaceDragStart(id))
             .on_middle_press(Message::WorkspaceClose(id))
             .interaction(iced::mouse::Interaction::Pointer),
-        container(text(tip).size(12)).padding([4, 8]).style(iced::widget::container::rounded_box),
+        container(text(tip).size(12)).padding([6, 10]).style(overlay_style),
         iced::widget::tooltip::Position::Bottom,
-    );
+    ).gap(8).delay(std::time::Duration::from_millis(600)).snap_within_viewport(true);
     let content = row![
         name,
         tab_close_control(close_label, Message::WorkspaceClose(id)),
     ].spacing(4).align_y(iced::Alignment::Center).padding([0, 4]).height(Length::Fill);
 
     let body = joined_tab(container(content)
-        .width(width).height(30).padding(1)
+        .width(width).height(TAB_HEIGHT).padding(1)
         .style(move |theme| tab_surface_style(theme, is_active)), is_active);
     let has_root = root.is_some();
     let count = state.workspaces.len();
@@ -3961,9 +3961,9 @@ fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
     };
     let mode_row = row![
         iced::widget::pick_list([AiMode::Http, AiMode::Acp, AiMode::Codex, AiMode::Grok, AiMode::Cursor], Some(state.ws.ai_mode), Message::AiModeSelected).text_size(12).padding([4, 8]),
+        controls,
         Space::new().width(Length::Fill),
-        controls
-    ].spacing(6).padding([4, 8]).align_y(iced::Alignment::Center);
+    ].spacing(8).align_y(iced::Alignment::Center);
     let composer = ai_composer::Context {
         sources: state.ws.tree.as_ref().map(|tree| tree.drag_sources()).unwrap_or_default(),
         can_reference: state.ws.tabs.get(state.ws.active_tab).is_some(),
@@ -3978,7 +3978,7 @@ fn view_ai_sidebar(state: &State) -> Element<'_, Message> {
         AiMode::Acp => acp::view(&state.ws.acp, state.root_or_cwd(), composer).map(Message::Acp),
     };
 
-    column![mode_row, panel].height(Length::Fill).into()
+    column![panel_header(mode_row), panel].height(Length::Fill).into()
 }
 
 /// Shared 26px target; utility glyphs stay quieter than send/stop actions.
@@ -4100,6 +4100,32 @@ fn tab_button_style(
 
 fn tab_line_height() -> iced::widget::text::LineHeight {
     iced::widget::text::LineHeight::Absolute(iced::Pixels(18.0))
+}
+
+// Tab geometry matches the approved connected-tab layout; only the rail is thinner.
+const TAB_HEIGHT: f32 = 30.0;
+const PANEL_HEADER_HEIGHT: f32 = 32.0;
+
+const TAB_RAIL_WIDTH: f32 = 2.0;
+const TAB_RAIL_MARGIN: f32 = 1.0;
+
+fn tab_rail() -> iced::widget::scrollable::Scrollbar {
+    iced::widget::scrollable::Scrollbar::new()
+        .width(TAB_RAIL_WIDTH).scroller_width(TAB_RAIL_WIDTH).margin(TAB_RAIL_MARGIN)
+}
+
+pub(crate) fn panel_header<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Element<'a, M> {
+    container(content).width(Length::Fill).height(PANEL_HEADER_HEIGHT)
+        .padding(iced::Padding { top: 0.0, right: 8.0, bottom: 0.0, left: 8.0 })
+        .align_y(iced::Alignment::Center).into()
+}
+
+fn menu_bar_style(theme: &iced::Theme, status: iced_aw::style::Status) -> iced_aw::style::menu_bar::Style {
+    let mut style = iced_aw::style::menu_bar::primary(theme, status);
+    style.bar_background = iced::Color::TRANSPARENT.into();
+    style.bar_border = iced::Border::default();
+    style.bar_shadow = iced::Shadow::default();
+    style
 }
 
 fn tab_surface_style(theme: &iced::Theme, selected: bool) -> iced::widget::container::Style {
@@ -4383,7 +4409,7 @@ fn view_top_bar(state: &State) -> Element<'_, Message> {
         help_items.push(Item::new(menu_button("About".into(), Message::About(about::Message::Open))));
     }
     menus.push(Item::with_menu(help_menu_button, menu_tpl(help_items)));
-    let mb = MenuBar::new(menus)
+    let mb = MenuBar::new(menus).style(menu_bar_style)
     .close_on_item_click_global(true)
     .close_on_background_click(true)
     .close_on_background_click_global(true);
@@ -4571,9 +4597,9 @@ fn view_tree(state: &State) -> Element<'_, Message> {
     let project = state.ws.root.as_ref().and_then(|path| path.file_name())
         .map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Files".into());
     column![
-        row![panel_heading(project), Space::new().width(Length::Fill),
+        panel_header(row![panel_heading(project).width(Length::Fill).wrapping(iced::widget::text::Wrapping::None),
             icon_control(lucide_icons::Icon::RefreshCw, "Refresh files", Some(Message::RefreshTree), false),
-        ].padding([2, 8]).align_y(iced::Alignment::Center),
+        ].align_y(iced::Alignment::Center)),
         container(content).padding([0, 8]).height(Length::Fill),
     ].height(Length::Fill).into()
 }
@@ -4600,7 +4626,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         .spacing(2)
         .align_y(iced::Alignment::Center);
 
-        let tab_content = joined_tab(button(tab_title).padding(1).height(30)
+        let tab_content = joined_tab(button(tab_title).padding(1).height(TAB_HEIGHT)
             .on_press(Message::TabSelected(i))
             .style(move |theme, status| tab_button_style(theme, status, is_active)), is_active);
         let tab_content = iced::widget::mouse_area(tab_content)
@@ -4634,7 +4660,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
                 .padding([0, 8]),
             tab_close_control("Close diff", Message::CloseGitPreview),
         ].spacing(2).align_y(iced::Alignment::Center);
-        let tab = joined_tab(container(title).padding(1).height(30)
+        let tab = joined_tab(container(title).padding(1).height(TAB_HEIGHT)
             .style(|theme| tab_surface_style(theme, true)), true);
         let mut header = row![
             tab,
@@ -4829,6 +4855,9 @@ fn view_editor(state: &State) -> Element<'_, Message> {
         };
         editor_column = editor_column.push(container(crate::scrollbar::scrollable(container(welcome).padding(32)))
             .center_x(Length::Fill).center_y(Length::Fill));
+        // `view` keeps the outer workspace frame (`tab_content_frame(panes)`).
+        // With no editor tabs, don't add a second frame around the welcome screen.
+        return editor_column.height(Length::Fill).into();
     }
 
     editor_frame(tab_row, editor_column)
@@ -4837,7 +4866,7 @@ fn view_editor(state: &State) -> Element<'_, Message> {
 fn editor_frame<'a>(tab_row: iced::widget::Row<'a, Message>, editor_column: iced::widget::Column<'a, Message>) -> Element<'a, Message> {
     let tab_strip = crate::scrollbar::scrollable(tab_row)
         .direction(iced::widget::scrollable::Direction::Horizontal(
-            crate::scrollbar::rail(),
+            tab_rail(),
         ))
         .width(Length::Fill);
 
@@ -5680,6 +5709,51 @@ mod workspace_tests {
     }
 
     #[test]
+    fn tab_scrollbars_have_a_lane_clear_of_titles_and_the_join() {
+        let top_padding = 2.0;
+        let border = 1.0;
+        let title_height = 26.0;
+        let rail_width = TAB_RAIL_WIDTH;
+        let rail_margin = TAB_RAIL_MARGIN;
+        let title_bottom = top_padding + border + title_height;
+        let thumb_top = PANEL_HEADER_HEIGHT - rail_margin - rail_width;
+        let thumb_bottom = PANEL_HEADER_HEIGHT - rail_margin;
+        assert!(title_bottom <= thumb_top, "the scrollbar must not overlap the title");
+        assert!(thumb_bottom <= top_padding + TAB_HEIGHT - border, "the scrollbar must leave the bottom join clear");
+        assert!(title_height + 2.0 * border <= TAB_HEIGHT);
+        assert_eq!(TAB_HEIGHT, 30.0, "tabs must stay compact");
+        assert_eq!(PANEL_HEADER_HEIGHT, 32.0);
+        assert_eq!(top_padding + TAB_HEIGHT, PANEL_HEADER_HEIGHT);
+        let header: Element<'_, Message> = panel_header(text("Files"));
+        assert_eq!(header.as_widget().size().height, Length::Fixed(PANEL_HEADER_HEIGHT));
+    }
+
+    #[test]
+    fn menu_bar_blends_with_chrome_without_changing_popup_surfaces() {
+        for theme in [iced::Theme::Dark, iced::Theme::Light] {
+            let status = iced_aw::style::Status::Active;
+            let style = menu_bar_style(&theme, status);
+            let original = iced_aw::style::menu_bar::primary(&theme, status);
+            assert_eq!(style.bar_background, iced::Color::TRANSPARENT.into());
+            assert_eq!(style.bar_border, iced::Border::default());
+            assert_eq!(style.bar_shadow, iced::Shadow::default());
+            assert_eq!(style.menu_background, original.menu_background);
+            assert_eq!(style.menu_border, original.menu_border);
+        }
+    }
+
+    #[test]
+    fn inactive_tabs_remain_readable_and_workspace_tooltips_are_opaque() {
+        for theme in [iced::Theme::Dark, iced::Theme::Light] {
+            let inactive = tab_button_style(&theme, iced::widget::button::Status::Active, false);
+            assert_eq!(inactive.text_color.a, theme.extended_palette().background.base.text.a * 0.6);
+            let tip = overlay_style(&theme);
+            assert_eq!(tip.background, Some(theme.extended_palette().background.base.color.into()));
+            assert!(tip.border.width > 0.0);
+        }
+    }
+
+    #[test]
     fn selected_tabs_open_into_a_matching_content_frame() {
         use iced::widget::button::Status;
         for theme in [iced::Theme::Dark, iced::Theme::Light] {
@@ -5805,6 +5879,15 @@ mod workspace_tests {
 
     fn ids(state: &State) -> Vec<WorkspaceId> {
         state.workspaces.iter().map(|entry| entry.id).collect()
+    }
+
+    #[test]
+    fn welcome_screen_does_not_add_an_inner_frame_to_the_workspace_frame() {
+        let state = state(vec![tab(&[])], 0);
+        assert!(state.ws.tabs.is_empty());
+        let welcome = view_editor(&state);
+        let tree = iced::advanced::widget::Tree::new(welcome.as_widget());
+        assert_eq!(tree.children.len(), 1, "only welcome content, without an inner tab frame");
     }
 
     #[test]
