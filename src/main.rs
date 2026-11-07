@@ -4172,14 +4172,28 @@ fn tab_content_frame<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Element<'
     ].into()
 }
 
+fn tab_strip_style(theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(theme.extended_palette().background.base.color.into()),
+        ..Default::default()
+    }
+}
+
 fn connected_tab_strip<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Element<'a, M> {
+    connected_tab_strip_with_style(content, chrome_style)
+}
+
+fn connected_tab_strip_with_style<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    style: fn(&iced::Theme) -> iced::widget::container::Style,
+) -> Element<'a, M> {
     iced::widget::stack![content.into()].push_under(
         container(container(Space::new().width(Length::Fill).height(1))
             .style(|theme: &iced::Theme| iced::widget::container::Style {
                 background: Some(tab_frame_style(theme).border.color.into()),
                 ..Default::default()
             })).width(Length::Fill).height(Length::Fill).align_y(iced::Alignment::End)
-    ).push_under(container(Space::new().width(Length::Fill).height(Length::Fill)).style(chrome_style)).into()
+    ).push_under(container(Space::new().width(Length::Fill).height(Length::Fill)).style(style)).into()
 }
 
 fn menu_button<'a>(label: String, msg: Message) -> iced::widget::button::Button<'a, Message> {
@@ -4870,7 +4884,7 @@ fn editor_frame<'a>(tab_row: iced::widget::Row<'a, Message>, editor_column: iced
         ))
         .width(Length::Fill);
 
-    column![connected_tab_strip(tab_strip), tab_content_frame(editor_column.height(Length::Fill))]
+    column![connected_tab_strip_with_style(tab_strip, tab_strip_style), tab_content_frame(editor_column.height(Length::Fill))]
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -5750,6 +5764,19 @@ mod workspace_tests {
             let tip = overlay_style(&theme);
             assert_eq!(tip.background, Some(theme.extended_palette().background.base.color.into()));
             assert!(tip.border.width > 0.0);
+        }
+    }
+
+    #[test]
+    fn tab_strip_background_matches_the_workspace_in_each_theme() {
+        for theme in [iced::Theme::Dark, iced::Theme::Light] {
+            let strip = tab_strip_style(&theme);
+            assert_eq!(strip.background, Some(theme.extended_palette().background.base.color.into()));
+            assert_eq!(strip.background, tab_frame_style(&theme).background);
+            assert_eq!(strip.border, iced::Border::default());
+            let other_strips = chrome_style(&theme);
+            assert_eq!(other_strips.background, Some(theme.extended_palette().background.weak.color.into()));
+            assert_ne!(strip.background, other_strips.background);
         }
     }
 
