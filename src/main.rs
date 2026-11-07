@@ -4017,15 +4017,22 @@ pub(crate) fn secondary_button<'a, M: 'a>(label: impl Into<String>) -> iced::wid
 }
 
 /// A quiet close glyph with the same comfortable target as toolbar controls.
+fn tab_close_tooltip<'a, M: 'a, R: iced::advanced::text::Renderer + 'a>(
+    control: impl Into<Element<'a, M, iced::Theme, R>>,
+    tip: impl Into<Element<'a, M, iced::Theme, R>>,
+) -> iced::widget::Tooltip<'a, M, iced::Theme, R> {
+    iced::widget::tooltip(control, tip, iced::widget::tooltip::Position::Bottom)
+        .delay(std::time::Duration::from_millis(600)).gap(8)
+}
+
 pub(crate) fn tab_close_control<'a, M: Clone + 'a>(label: &'a str, message: M) -> Element<'a, M> {
     let control = button(container(text(char::from(lucide_icons::Icon::X))
         .font(iced::Font::with_name("lucide")).size(11).line_height(tab_line_height()))
         .center_x(Length::Fill).center_y(Length::Fill))
         .width(26).height(26).padding(0)
         .style(tab_close_style).on_press(message);
-    iced::widget::tooltip(control,
-        container(text(label).size(12)).padding([4, 8]).style(iced::widget::container::rounded_box),
-        iced::widget::tooltip::Position::FollowCursor).into()
+    tab_close_tooltip(control,
+        container(text(label).size(12)).padding([4, 8]).style(iced::widget::container::rounded_box)).into()
 }
 
 fn tab_close_style(theme: &iced::Theme, status: iced::widget::button::Status) -> iced::widget::button::Style {
@@ -5759,6 +5766,30 @@ mod workspace_tests {
         assert_eq!(top_padding + TAB_HEIGHT, PANEL_HEADER_HEIGHT);
         let header: Element<'_, Message> = panel_header(text("Files"));
         assert_eq!(header.as_widget().size().height, Length::Fixed(PANEL_HEADER_HEIGHT));
+    }
+
+    #[test]
+    fn tab_close_tooltip_waits_on_first_hover_instead_of_covering_the_button() {
+        use iced::advanced::{layout, widget::Tree, Layout, Shell};
+        let mut tooltip: Element<'_, (), iced::Theme, ()> = tab_close_tooltip(
+            Space::new().width(26).height(26), Space::new().width(120).height(20),
+        ).into();
+        let mut tree = Tree::new(tooltip.as_widget());
+        let node = tooltip.as_widget_mut().layout(&mut tree, &(),
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(200.0, 200.0)));
+        let viewport = iced::Rectangle::with_size(iced::Size::new(200.0, 200.0));
+        let cursor = iced::mouse::Cursor::Available(iced::Point::new(13.0, 13.0));
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        let before = iced_core::time::Instant::now();
+        tooltip.as_widget_mut().update(&mut tree,
+            &iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: iced::Point::new(13.0, 13.0) }),
+            Layout::new(&node), cursor, &(), &mut iced_core::clipboard::Null, &mut shell, &viewport);
+        let iced::window::RedrawRequest::At(at) = shell.redraw_request() else {
+            panic!("hover must schedule the delayed tooltip");
+        };
+        assert!(at >= before + std::time::Duration::from_millis(600));
+        assert!(tooltip.as_widget_mut().overlay(&mut tree, Layout::new(&node), &(), &viewport, iced::Vector::ZERO).is_none());
     }
 
     #[test]
