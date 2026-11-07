@@ -3544,7 +3544,7 @@ fn view(state: &State) -> Element<'_, Message> {
                 !state.quick_open.visible && !state.command_palette.visible && !state.goto_line.visible
                     && !state.theme_install.visible && !state.about.visible).map(Message::Terminal),
             PaneKind::Sidebar => container(view_sidebar(state))
-                .padding(if state.ws.sidebar_mode == SidebarMode::Tree { 1 } else { 0 })
+                .padding(1)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .style(move |theme| sidebar_panel_style(theme, state.ws.sidebar_mode))
@@ -4198,8 +4198,7 @@ fn workspace_panel_style(theme: &iced::Theme) -> iced::widget::container::Style 
 
 fn sidebar_panel_style(theme: &iced::Theme, mode: SidebarMode) -> iced::widget::container::Style {
     match mode {
-        SidebarMode::Tree => workspace_panel_style(theme),
-        SidebarMode::ProjectSearch | SidebarMode::Git => chrome_style(theme),
+        SidebarMode::Tree | SidebarMode::ProjectSearch | SidebarMode::Git => workspace_panel_style(theme),
     }
 }
 
@@ -5800,7 +5799,7 @@ mod workspace_tests {
     }
 
     #[test]
-    fn explorer_and_ai_backgrounds_match_workspace_without_changing_other_sidebar_modes() {
+    fn sidebar_and_ai_backgrounds_match_workspace() {
         for theme in [iced::Theme::Light, iced::Theme::Dark] {
             let workspace = Some(theme.extended_palette().background.base.color.into());
             let ai = workspace_panel_style(&theme);
@@ -5810,7 +5809,21 @@ mod workspace_tests {
             assert_eq!(ai.border, tab_frame_style(&theme).border.rounded(6));
             assert_eq!(explorer.border, ai.border);
             for mode in [SidebarMode::Git, SidebarMode::ProjectSearch] {
-                assert_eq!(sidebar_panel_style(&theme, mode), chrome_style(&theme));
+                assert_eq!(sidebar_panel_style(&theme, mode), ai);
+            }
+        }
+    }
+
+    #[test]
+    fn git_and_search_panels_match_explorer_background_and_border() {
+        for theme in [iced::Theme::Light, iced::Theme::Dark] {
+            let explorer = sidebar_panel_style(&theme, SidebarMode::Tree);
+            for mode in [SidebarMode::Git, SidebarMode::ProjectSearch] {
+                let panel = sidebar_panel_style(&theme, mode);
+                assert_eq!(panel.background, explorer.background);
+                assert_eq!(panel.border, explorer.border);
+                assert_eq!(panel.border.width, 1.0);
+                assert_eq!(panel.border.radius, iced::border::Radius::from(6.0));
             }
         }
     }
